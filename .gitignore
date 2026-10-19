@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# per-character data: made from your own character, never committed
+pianist/hand_calibration.json
+pianist/performer/rig_cache/
+output/
+*.blend
+*.blend1
