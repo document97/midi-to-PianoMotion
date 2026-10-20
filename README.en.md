@@ -11,7 +11,7 @@ Give it a MIDI file and a 3D character plays it on a piano in Blender:
 
 No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything runs on the CPU in parallel processes (8 or 16). For a 160-second piece, planning takes a dozen seconds or so, and the motion about 13 minutes on 16 cores.
 
-> **Demo video:** coming later.
+> **Demo video:** [Olivia Lin plays Daylight (Seredris), on bilibili](https://www.bilibili.com/video/BV1QEnc6rECK/)
 
 ## Why
 
