@@ -11,7 +11,7 @@
 
 不用训练数据，也没有神经网络，我做的是较轻量化的纯粹算法。规划是束搜索，动作是用角色自己的骨架和皮肤做反向运动学求解。全程在 CPU 上多进程运行（8 或 16 个进程）。一首 160 秒的曲子，规划十几秒，动作在 16 核上大约 13 分钟解完。
 
-> **演示视频：** [bilibili：林离弹 Daylight（Seredris）](https://www.bilibili.com/video/BV1QEnc6rECK/)
+> **演示视频：** [](https://www.bilibili.com/video/BV1QEnc6rECK/)
 
 ## 初衷
 
