@@ -11,6 +11,7 @@ import math
 import numpy as np
 
 from .arm import closest_elbow
+from .kinematics import FLOAT
 
 HAND_FOLLOW = .3                # share of the forearm's inward angle the palm follows
 LITTLE_SIDE_DOWN = 6.           # deg: the little-finger side of the palm lower than the thumb side
@@ -21,8 +22,8 @@ def _palm_angles(solver, yaw, roll):
     from .motion import Spacing
     if not hasattr(solver, '_spacing_lateral'):
         solver._spacing_lateral = Spacing(solver).lateral
-    palm = solver.palm(np.zeros(3), yaw, roll)[:3, :3]
-    forward, across = palm @ np.array([0., 1., 0.]), palm @ solver._spacing_lateral
+    palm = solver.palm(np.zeros(3, dtype=FLOAT), yaw, roll)[:3, :3]
+    forward, across = palm @ np.array([0., 1., 0.], dtype=FLOAT), palm @ solver._spacing_lateral
     return (math.degrees(math.atan2(forward[0], forward[1])),
             math.degrees(math.asin(across[2] / np.linalg.norm(across))))
 
@@ -43,11 +44,11 @@ def natural_orientation(solver, wrist):
     arm = solver.arm
     shoulder = arm.pre_upper_world[:3, 3]
     try:
-        elbow = closest_elbow(shoulder, np.asarray(wrist, float), arm.l1, arm.l2, arm.side)
-        forearm = np.asarray(wrist, float) - elbow
+        elbow = closest_elbow(shoulder, np.asarray(wrist, FLOAT), arm.l1, arm.l2, arm.side)
+        forearm = np.asarray(wrist, FLOAT) - elbow
         forearm_yaw = math.degrees(math.atan2(forearm[0], forearm[1]))
     except ValueError:
         forearm_yaw = 0.
     yaw = (HAND_FOLLOW * forearm_yaw - y0) / dy
     roll = (-LITTLE_SIDE_DOWN - t0) / dt
-    return np.array([yaw, roll])
+    return np.array([yaw, roll], dtype=FLOAT)

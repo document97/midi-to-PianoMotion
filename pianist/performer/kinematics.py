@@ -16,6 +16,9 @@ from pathlib import Path
 
 import numpy as np
 
+# Every array of the solve is float32 (Blender stores poses and keys as float32 too). Steps, tolerances
+# and the Jacobians are chosen for it (pose.PoseSolver._levenberg_marquardt, batch_pose).
+FLOAT = np.float32
 CALIBRATION = Path(__file__).resolve().parents[1] / 'hand_calibration.json'
 DIGITS = (1, 2, 3, 4, 5)
 VALUE_NAMES = ('swing_lateral', 'swing_lift', 'mcp_delta', 'ip_delta')
@@ -30,40 +33,40 @@ def q_mul(a, b):
     w1, x1, y1, z1 = a
     w2, x2, y2, z2 = b
     return np.array([w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-                     w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
+                     w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2], dtype=FLOAT)
 
 
 def q_axis(axis, degrees):
-    axis = np.asarray(axis, float)
+    axis = np.asarray(axis, FLOAT)
     axis = axis / np.linalg.norm(axis)
     half = math.radians(degrees) / 2
-    return np.r_[math.cos(half), math.sin(half) * axis]
+    return np.r_[np.float32(math.cos(half)), np.float32(math.sin(half)) * axis]
 
 
 def q_mat3(q):
-    w, x, y, z = np.asarray(q, float) / np.linalg.norm(q)
+    w, x, y, z = np.asarray(q, FLOAT) / np.linalg.norm(q)
     return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
                      [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], dtype=FLOAT)
 
 
 def mat3_q(m):
     """Rotation of a (possibly scaled) 3x3 as a unit quaternion with w >= 0."""
-    m = np.asarray(m, float)[:3, :3]
+    m = np.asarray(m, FLOAT)[:3, :3]
     m = m / np.linalg.norm(m, axis=0)
     trace = m[0, 0] + m[1, 1] + m[2, 2]
     if trace > 0:
         s = math.sqrt(trace + 1.) * 2
-        q = np.array([.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s])
+        q = np.array([.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s], dtype=FLOAT)
     elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
         s = math.sqrt(1. + m[0, 0] - m[1, 1] - m[2, 2]) * 2
-        q = np.array([(m[2, 1] - m[1, 2]) / s, .25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s])
+        q = np.array([(m[2, 1] - m[1, 2]) / s, .25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s], dtype=FLOAT)
     elif m[1, 1] > m[2, 2]:
         s = math.sqrt(1. + m[1, 1] - m[0, 0] - m[2, 2]) * 2
-        q = np.array([(m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, .25 * s, (m[1, 2] + m[2, 1]) / s])
+        q = np.array([(m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, .25 * s, (m[1, 2] + m[2, 1]) / s], dtype=FLOAT)
     else:
         s = math.sqrt(1. + m[2, 2] - m[0, 0] - m[1, 1]) * 2
-        q = np.array([(m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, .25 * s])
+        q = np.array([(m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, .25 * s], dtype=FLOAT)
     q /= np.linalg.norm(q)
     return q if q[0] >= 0 else -q
 
@@ -75,7 +78,7 @@ def axis_matrix(axis, radians):
     t = 1 - c
     return np.array([[t * x * x + c, t * x * y - s * z, t * x * z + s * y],
                      [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
-                     [t * x * z - s * y, t * y * z + s * x, t * z * z + c]])
+                     [t * x * z - s * y, t * y * z + s * x, t * z * z + c]], dtype=FLOAT)
 
 
 def euler_xyz_matrix(euler):
@@ -83,19 +86,19 @@ def euler_xyz_matrix(euler):
     cx, sx, cy, sy, cz, sz = math.cos(x), math.sin(x), math.cos(y), math.sin(y), math.cos(z), math.sin(z)
     return np.array([[cy * cz, sx * sy * cz - cx * sz, cx * sy * cz + sx * sz],
                      [cy * sz, sx * sy * sz + cx * cz, cx * sy * sz - sx * cz],
-                     [-sy, sx * cy, cx * cy]])
+                     [-sy, sx * cy, cx * cy]], dtype=FLOAT)
 
 
 def compose(loc, rotation, scale):
-    m = np.eye(4)
+    m = np.eye(4, dtype=FLOAT)
     m[:3, :3] = rotation * scale
     m[:3, 3] = loc
     return m
 
 
 def loc_rot_scale(loc, q, scale):
-    m = np.eye(4)
-    m[:3, :3] = q_mat3(q) * np.asarray(scale, float)
+    m = np.eye(4, dtype=FLOAT)
+    m[:3, :3] = q_mat3(q) * np.asarray(scale, FLOAT)
     m[:3, 3] = loc
     return m
 
@@ -113,8 +116,8 @@ def child_euler(row, index, bend_degrees):
 
 
 def basis(axis, forward):
-    y = np.asarray(forward, float) / np.linalg.norm(forward)
-    x = np.asarray(axis, float) - y * (np.asarray(axis, float) @ y)
+    y = np.asarray(forward, FLOAT) / np.linalg.norm(forward)
+    x = np.asarray(axis, FLOAT) - y * (np.asarray(axis, FLOAT) @ y)
     x /= np.linalg.norm(x)
     z = np.cross(x, y)
     z /= np.linalg.norm(z)
@@ -132,8 +135,8 @@ class SkinSet:
     @classmethod
     def from_rows(cls, rows):
         bones = tuple(sorted({b for r in rows for b in r['bones']}))
-        weights = np.zeros((len(rows), len(bones)))
-        local = np.zeros((len(bones), len(rows), 4))
+        weights = np.zeros((len(rows), len(bones)), dtype=FLOAT)
+        local = np.zeros((len(bones), len(rows), 4), dtype=FLOAT)
         local[:, :, 3] = 1.
         for i, r in enumerate(rows):
             for name, (w, *point) in r['bones'].items():
@@ -144,7 +147,7 @@ class SkinSet:
 
     def points(self, matrices, arm_world):
         """World positions given {bone: pose matrix (armature space)}."""
-        acc = np.zeros((self.weights.shape[0], 4))
+        acc = np.zeros((self.weights.shape[0], 4), dtype=FLOAT)
         for k, name in enumerate(self.bones):
             acc += self.weights[:, k:k + 1] * (self.local[k] @ matrices[name].T)
         return (acc @ arm_world.T)[:, :3]
@@ -155,15 +158,15 @@ class Finger:
     def __init__(self, data, row):
         self.row = row
         self.names = data['names']
-        self.pre = np.array(data['pre_in_wrist'])
-        self.root_loc, self.root_scale = np.array(data['root_loc']), np.array(data['root_scale'])
-        self.child_loc = [np.array(v) for v in data['child_loc']]
-        self.child_scale = [np.array(v) for v in data['child_scale']]
-        self.links = [np.array(m) for m in data['links']]
-        self.neutral_q = np.array(data['neutral_root_q'])
-        self.normal = np.array(data['palm_normal_local'])
+        self.pre = np.array(data['pre_in_wrist'], dtype=FLOAT)
+        self.root_loc, self.root_scale = np.array(data['root_loc'], dtype=FLOAT), np.array(data['root_scale'], dtype=FLOAT)
+        self.child_loc = [np.array(v, dtype=FLOAT) for v in data['child_loc']]
+        self.child_scale = [np.array(v, dtype=FLOAT) for v in data['child_scale']]
+        self.links = [np.array(m, dtype=FLOAT) for m in data['links']]
+        self.neutral_q = np.array(data['neutral_root_q'], dtype=FLOAT)
+        self.normal = np.array(data['palm_normal_local'], dtype=FLOAT)
         self.neutral_matrix = q_mat3(self.neutral_q)
-        self.base = self.neutral_matrix @ np.array([0., 1., 0.])
+        self.base = self.neutral_matrix @ np.array([0., 1., 0.], dtype=FLOAT)
         lift = np.cross(self.base, self.normal)
         self.lift = lift / np.linalg.norm(lift)
         self.pad = SkinSet.from_rows(data['pad'])
@@ -171,8 +174,8 @@ class Finger:
         self.pad_ids = [r['id'] for r in data['pad']]
         self.clearance_ids = [r['id'] for r in data['clearance']]
         b = data['bounds']
-        self.lower = np.array([b[k][0] for k in VALUE_NAMES], float)
-        self.upper = np.array([b[k][1] for k in VALUE_NAMES], float)
+        self.lower = np.array([b[k][0] for k in VALUE_NAMES], FLOAT)
+        self.upper = np.array([b[k][1] for k in VALUE_NAMES], FLOAT)
 
     def root_matrix(self, lateral, lift):
         """Root bone rotation (3x3) for the swing values: arc(base -> swung axis) @ neutral."""
@@ -204,17 +207,17 @@ class Rig:
         data = json.loads(Path(path).read_text(encoding='utf-8'))
         self.data = data
         cal = json.loads(CALIBRATION.read_text(encoding='utf-8'))
-        self.arm_world = np.array(data['arm_world'])
+        self.arm_world = np.array(data['arm_world'], dtype=FLOAT)
         from .arm import Arm        # arm posture lives apart: the pair table's code digest does not cover it
         self.arms = {h: Arm(data['hands'][h], self.arm_world) for h in 'LR'}
         self.fingers = {h: {int(d): Finger(f, cal['hands'][h]['fingers'][d]) for d, f in data['hands'][h]['fingers'].items()}
                         for h in 'LR'}
-        self.neutral_wrist = {h: np.array(data['hands'][h]['neutral_wrist']) for h in 'LR'}
+        self.neutral_wrist = {h: np.array(data['hands'][h]['neutral_wrist'], dtype=FLOAT) for h in 'LR'}
         self.keyboard = data['keyboard']
         self.fps = data['fps']
-        self.neutral_bones = {k: np.array(m) for k, m in data['neutral_bones'].items()}
+        self.neutral_bones = {k: np.array(m, dtype=FLOAT) for k, m in data['neutral_bones'].items()}
         self.wrist_bone = {h: data['hands'][h]['bones']['wrist'] for h in 'LR'}
-        self.neutral_wrist_inverse = {h: np.linalg.inv(np.array(data['hands'][h]['neutral_wrist_matrix'])) for h in 'LR'}
+        self.neutral_wrist_inverse = {h: np.linalg.inv(np.array(data['hands'][h]['neutral_wrist_matrix'], dtype=FLOAT)) for h in 'LR'}
         self.bone_owner = {h: {name: d for d, f in self.fingers[h].items() for name in f.names} for h in 'LR'}
         for h in 'LR':
             for d, swing in SWING_LATERAL.items():

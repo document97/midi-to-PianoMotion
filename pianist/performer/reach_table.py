@@ -3,7 +3,8 @@
 For every hand, finger pair and pitch interval, the pose solver (pose.py) decides
 whether both pads can rest on their keys at once. The wrist is free, so the
 answer depends only on the keyboard pattern: the lower key's pitch class and the
-interval. Computed in parallel once per rig and cached next to it.
+interval. Computed once per rig and cached next to it: batched on the GPU when there is one
+(batch_pose), else on worker processes.
 """
 from concurrent.futures import ProcessPoolExecutor
 from itertools import combinations
@@ -48,11 +49,39 @@ def cases():
                         yield hand, f1, base + pc, f2, base + pc + interval
 
 
+def _store(table, errors, case, ok, error):
+    hand, f1, p1, f2, p2 = case
+    h = 'LR'.index(hand)
+    for a, pa, b, pb in ((f1, p1, f2, p2), (f2, p2, f1, p1)):
+        index = (h, a - 1, b - 1, pa % 12, pb - pa + MAX_INTERVAL)
+        table[index], errors[index] = ok, error
+
+
+def compute_batched(rig_path, table, errors, jobs):
+    """Every case at once on the GPU (batch_pose)."""
+    from .anchors import KEY_TRAVEL
+    from .batch_pose import BatchPoseSolver
+    from .kinematics import Rig
+    from .pose import WIDE_SEEDS, Contact
+    solver = BatchPoseSolver(hand_solvers(Rig(rig_path)))
+    for k, hand in enumerate('LR', 1):
+        part = [case for case in jobs if case[0] == hand]
+        poses = solver.solve([(hand, [Contact(f1, p1, KEY_TRAVEL), Contact(f2, p2, KEY_TRAVEL)], None, None)
+                              for hand, f1, p1, f2, p2 in part], seeds=WIDE_SEEDS, clearance=False)
+        for case, pose in zip(part, poses):
+            _store(table, errors, case, pose.ok, pose.contact_error)
+        print(f'pair table {50 * k}% (gpu)', flush=True)
+    return table, errors, True
+
+
 def compute(rig_path, workers, partial=None, stop_fraction=1.):
     """Solve every case; progress is saved to ``partial`` after each block so a stopped run resumes."""
+    from .batch_pose import device
     table = np.zeros((2, 5, 5, 12, 2 * MAX_INTERVAL + 1), dtype=bool)
     errors = np.full(table.shape, np.inf)
     jobs = list(cases())
+    if device() is not None and stop_fraction >= 1.:
+        return compute_batched(rig_path, table, errors, jobs)
     done = np.zeros(len(jobs), dtype=bool)
     if partial is not None and Path(partial).exists():
         saved = np.load(partial)
@@ -61,11 +90,8 @@ def compute(rig_path, workers, partial=None, stop_fraction=1.):
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(str(rig_path),)) as pool:
         for start in range(0, len(jobs), block):
             todo = [i for i in range(start, min(start + block, len(jobs))) if not done[i]]
-            for i, ((hand, f1, p1, f2, p2), ok, error) in zip(todo, pool.map(_solve, [jobs[i] for i in todo], chunksize=16)):
-                h = 'LR'.index(hand)
-                for a, pa, b, pb in ((f1, p1, f2, p2), (f2, p2, f1, p1)):
-                    index = (h, a - 1, b - 1, pa % 12, pb - pa + MAX_INTERVAL)
-                    table[index], errors[index] = ok, error
+            for i, (case, ok, error) in zip(todo, pool.map(_solve, [jobs[i] for i in todo], chunksize=16)):
+                _store(table, errors, case, ok, error)
                 done[i] = True
             if partial is not None:
                 np.savez_compressed(partial, table=table, errors=errors, done=done)
@@ -102,7 +128,7 @@ def fingerprint(rig_path):
     from .anchors import KEY_TRAVEL        # the pairs are solved with the keys fully down
     parts.append(np.array([KEY_TRAVEL]))
     code = hashlib.sha256()
-    for name in ('kinematics.py', 'pose.py', 'reach_table.py'):
+    for name in ('kinematics.py', 'pose.py', 'reach_table.py', 'batch_pose.py'):
         code.update((Path(__file__).parent / name).read_bytes())
     return np.concatenate(parts), code.hexdigest()[:16]
 

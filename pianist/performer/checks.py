@@ -14,6 +14,8 @@ The pushed keys are animated (pipeline.brushed_keys) and checked.
 """
 import numpy as np
 
+from .kinematics import FLOAT
+
 CELL = .001
 OWN_KEY_TOLERANCE = .0008
 BRUSH_DEPTH = .003               # deepest silent push of an unplayed key by a finger resting on it (m)
@@ -35,11 +37,11 @@ def brushed(pen, brushable):
 
 class Heightfield:
     def __init__(self, key_meshes):
-        tris = {int(p): np.array(m['triangles']) for p, m in key_meshes.items()}
+        tris = {int(p): np.array(m['triangles'], dtype=FLOAT) for p, m in key_meshes.items()}
         allpts = np.concatenate([t.reshape(-1, 3) for t in tris.values()])
         self.origin = allpts[:, :2].min(axis=0) - CELL
         size = np.ceil((allpts[:, :2].max(axis=0) + CELL - self.origin) / CELL).astype(int) + 1
-        self.top = np.full(size, -np.inf)
+        self.top = np.full(size, -np.inf, dtype=FLOAT)
         self.pitch = np.zeros(size, dtype=np.int16)
         for pitch, t in tris.items():
             n = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
@@ -68,11 +70,11 @@ class Heightfield:
         ``brush``: unplayed keys other than ``own`` may be pushed down silently (``brushed``)."""
         idx = np.floor((points[:, :2] - self.origin) / CELL).astype(int)
         ok = (idx[:, 0] >= 0) & (idx[:, 1] >= 0) & (idx[:, 0] < self.top.shape[0]) & (idx[:, 1] < self.top.shape[1])
-        out = np.zeros(len(points))
+        out = np.zeros(len(points), dtype=FLOAT)
         ix, iy = idx[ok, 0], idx[ok, 1]
         top = self.top[ix, iy]
         pitch = self.pitch[ix, iy]
-        lowered = top - np.array([depths.get(int(p), 0.) for p in pitch])
+        lowered = top - np.array([depths.get(int(p), 0.) for p in pitch], dtype=FLOAT)
         pen = np.where(np.isfinite(top), lowered - points[ok, 2], 0.)
         if own is not None:
             own_pitch, mask = own
@@ -92,11 +94,11 @@ class Heightfield:
         {pitch: deepest push wanted of each brushable key})."""
         idx = np.floor((points[:, :2] - self.origin) / CELL).astype(int)
         ok = (idx[:, 0] >= 0) & (idx[:, 1] >= 0) & (idx[:, 0] < self.top.shape[0]) & (idx[:, 1] < self.top.shape[1])
-        hard = np.zeros(len(points))
+        hard = np.zeros(len(points), dtype=FLOAT)
         wanted = {}
         ix, iy = idx[ok, 0], idx[ok, 1]
         top, pitch = self.top[ix, iy], self.pitch[ix, iy]
-        lowered = top - np.array([depths.get(int(p), 0.) for p in pitch])
+        lowered = top - np.array([depths.get(int(p), 0.) for p in pitch], dtype=FLOAT)
         pen = np.where(np.isfinite(top), lowered - points[ok, 2], 0.)
         pen = np.where(pitch == own_pitch, pen - OWN_KEY_TOLERANCE, pen)
         pen = np.maximum(pen, 0.)

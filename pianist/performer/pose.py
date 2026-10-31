@@ -13,7 +13,7 @@ import math
 import numpy as np
 
 from .checks import Heightfield, stretched
-from .kinematics import DIGITS, SkinSet, q_mat3
+from .kinematics import DIGITS, FLOAT, SkinSet, q_mat3
 
 PAD_SOFTMIN_METRES = .0005      # temperature of the pad's lowest-point soft minimum
 X_MARGIN = .001                  # pad centre kept this far inside a key's side edges (neighbour contact is checked separately)
@@ -25,19 +25,28 @@ CONTACT_TOLERANCE = .0002        # accepted pad-to-surface error (m)
 CLEARANCE_SCALE = .0005          # skin penetration into other keys, metres per residual unit
 
 # Relaxed hand (contact_solver.HandModel.idle): thumb and the long fingers.
-RELAXED = {1: np.array([0., 8., 8., 16.]), 2: np.array([0., 9., 34., 18.])}
+RELAXED = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 9., 34., 18.], dtype=FLOAT)}
 for _d in (3, 4, 5):
     RELAXED[_d] = RELAXED[2]
-VALUE_SCALE = np.array([18., 18., 30., 25.])   # degrees per unit of preference residual
-WRIST_SCALE = np.array([.04, .03, .025, 12., 10.])   # x, y, z (m), yaw, roll (deg)
-WRIST_TRAVEL = np.array([.08, .07, .05])
-FOLLOW_WRIST_SCALE = np.array([.004, .004, .004, 2., 2.])   # frame correction: m and deg per unit
+VALUE_SCALE = np.array([18., 18., 30., 25.], dtype=FLOAT)   # degrees per unit of preference residual
+WRIST_SCALE = np.array([.04, .03, .025, 12., 10.], dtype=FLOAT)   # x, y, z (m), yaw, roll (deg)
+WRIST_TRAVEL = np.array([.08, .07, .05], dtype=FLOAT)
+FOLLOW_WRIST_SCALE = np.array([.004, .004, .004, 2., 2.], dtype=FLOAT)   # frame correction: m and deg per unit
 FOLLOW_VALUE_SCALE = 40.   # metres the wrist may leave its hint / neutral y, z
 YAW_BOUNDS = (-25., 25.)   # wrist side bend; real hands ~-25 (thumb side) .. +35. +-15 stopped black-key octaves
 SEEDS = ((0., 0., 0.), (0., 0., -.03), (-12., -.02, 0.), (12., .02, 0.))   # (yaw deg, wrist dx, dy m) starts
 SEED_ITERATIONS = 12
 WIDE_SEEDS = tuple((y, dx, dy) for y in (-12., 0., 12.) for dx in (-.03, 0., .03) for dy in (0., -.03))   # offline tables
 ROLL_BOUNDS = (-20., 20.)
+# Forward-difference steps: float32 resolves ~6e-8 m at the wrist's ~0.8 m, so a 10 um step (enough in float64)
+# leaves the derivative ~1% noise; 50 um keeps it under 0.2%. Finger values (deg) keep their 0.01 deg.
+POSITION_STEP = 5e-5
+STEP_TOLERANCE = 1e-6    # LM stops when no variable moves more than this (float32 cannot resolve 1e-7 at 0.8 m)
+
+
+def wrist_steps(fingers):
+    """Difference steps for (x, y, z, yaw, roll) and four values per finger."""
+    return np.r_[np.full(3, POSITION_STEP), 1e-2, 1e-2, np.full(4 * fingers, 1e-2)].astype(FLOAT)
 
 
 @dataclass(frozen=True)
@@ -99,11 +108,11 @@ class KeyRegions:
         hi = (1 - s) * r['wide'][1] + s * r['narrow'][1]
         rx = max(0., lo - x) - max(0., x - hi)
         ry = max(0., r['y'][0] - y) - max(0., y - r['y'][1])
-        return np.array([rx, ry, z - (r['top'] - depth)])
+        return np.array([rx, ry, z - (r['top'] - depth)], dtype=FLOAT)
 
     def centre(self, pitch):
         r = self.rows[pitch]
-        return np.array([(r['wide'][0] + r['wide'][1]) / 2, (r['y'][0] + r['split']) / 2, r['top']])
+        return np.array([(r['wide'][0] + r['wide'][1]) / 2, (r['y'][0] + r['split']) / 2, r['top']], dtype=FLOAT)
 
 
 class PoseSolver:
@@ -114,7 +123,7 @@ class PoseSolver:
         self.heightfield = heightfield     # checks.Heightfield: contact fingers keep clear of other keys
         self.arm = rig.arms[hand]
         self.regions = regions or KeyRegions(rig.keyboard)
-        self.identity = np.eye(4)
+        self.identity = np.eye(4, dtype=FLOAT)
         self.neutral = rig.neutral_wrist[hand]
         self._pad_cache = {}
         owner = rig.bone_owner[hand]
@@ -130,7 +139,7 @@ class PoseSolver:
 
     # ----- geometry -----
     def palm(self, wrist, yaw, roll):
-        m = np.eye(4)
+        m = np.eye(4, dtype=FLOAT)
         m[:3, :3] = q_mat3(self.arm.palm_q(yaw, roll)) * self.arm.scale['wrist']
         m[:3, 3] = wrist
         return m
@@ -151,7 +160,7 @@ class PoseSolver:
         finger = self.rig.fingers[self.hand][digit]
         skin = finger.pad if kind == 'pad' else self.clearance_skin[digit]
         mats = self.rig.bone_matrices(self.hand, self.identity, values, skin.bones)
-        acc = np.zeros((skin.weights.shape[0], 4))
+        acc = np.zeros((skin.weights.shape[0], 4), dtype=FLOAT)
         for k, name in enumerate(skin.bones):
             acc += skin.weights[:, k:k + 1] * (skin.local[k] @ mats[name].T)
         local = acc.T     # wrist-bone frame: world = arm_world @ W @ p = palm @ p, since palm = arm_world @ W
@@ -163,7 +172,7 @@ class PoseSolver:
     def clearance_residual(self, digit, values, palm, depths, own_pitch, brush=False):
         """Penetration of the finger's skin into keys other than its own (scaled), fixed length."""
         if self.heightfield is None:
-            return np.zeros(0)
+            return np.zeros(0, dtype=FLOAT)
         points = (palm @ self.local_clearance(digit, values))[:3].T
         own = None if own_pitch is None else (own_pitch, np.ones(len(points), bool))
         return self.heightfield.penetration(points, depths, own, brush=brush) / CLEARANCE_SCALE
@@ -187,7 +196,7 @@ class PoseSolver:
         Feasibility (``ok``) is the contacts alone. Key clearance of the contact fingers is minimised
         (``clearance=True``) and reported, not a gate: the key tops are piecewise flat and as a hard
         screen they make the search call reachable chords impossible."""
-        values = {d: np.array(v, float) for d, v in (values or {d: RELAXED[d] for d in DIGITS}).items()}
+        values = {d: np.array(v, FLOAT) for d, v in (values or {d: RELAXED[d] for d in DIGITS}).items()}
         for d in DIGITS:
             values.setdefault(d, RELAXED[d].copy())
         contacts = sorted(contacts, key=lambda c: c.digit)
@@ -200,7 +209,7 @@ class PoseSolver:
         if x_hint is None:
             x_hint = wrist[0]
         fingers = self.rig.fingers[self.hand]
-        centre = np.array([x_hint, self.neutral[1], self.neutral[2]])
+        centre = np.array([x_hint, self.neutral[1], self.neutral[2]], dtype=FLOAT)
         lower = np.r_[centre - WRIST_TRAVEL, YAW_BOUNDS[0], ROLL_BOUNDS[0],
                       np.concatenate([fingers[d].lower for d in digits]) if digits else []]
         upper = np.r_[centre + WRIST_TRAVEL, YAW_BOUNDS[1], ROLL_BOUNDS[1],
@@ -233,7 +242,7 @@ class PoseSolver:
                 out.append(prior * (vals[d] - RELAXED[d]) / VALUE_SCALE)
             return np.concatenate(out)
 
-        steps = np.r_[1e-5, 1e-5, 1e-5, 1e-2, 1e-2, np.full(4 * len(digits), 1e-2)]
+        steps = wrist_steps(len(digits))
 
         def touch(v):
             return residuals(v, .03, False)
@@ -273,7 +282,7 @@ class PoseSolver:
             error = max(error, float(np.max(np.abs(self.regions.residual(c.pitch, c.depth, point)))))
             pen = self.clearance_residual(c.digit, vals, palm, depths, c.pitch)
             worst_clearance = max(worst_clearance, float(pen.max()) * CLEARANCE_SCALE if len(pen) else 0.)
-        return HandPose(np.array(w), float(ya), float(ro), {d: np.array(v) for d, v in vals.items()},
+        return HandPose(np.array(w, dtype=FLOAT), float(ya), float(ro), {d: np.array(v, dtype=FLOAT) for d, v in vals.items()},
                         error, error <= CONTACT_TOLERANCE * 2.5, it, targets, worst_clearance)
 
     def follow(self, points, vector, values, iterations=20, depths=None, pitches=None):
@@ -284,8 +293,8 @@ class PoseSolver:
         """
         digits = sorted(points)
         fingers = self.rig.fingers[self.hand]
-        base = np.asarray(vector, float)
-        seed = {d: np.asarray(values[d], float) for d in digits}
+        base = np.asarray(vector, FLOAT)
+        seed = {d: np.asarray(values[d], FLOAT) for d in digits}
         lower = np.r_[base[:3] - WRIST_TRAVEL, YAW_BOUNDS[0], ROLL_BOUNDS[0], np.concatenate([fingers[d].lower for d in digits])]
         upper = np.r_[base[:3] + WRIST_TRAVEL, YAW_BOUNDS[1], ROLL_BOUNDS[1], np.concatenate([fingers[d].upper for d in digits])]
         x = np.clip(np.r_[base, np.concatenate([seed[d] for d in digits])], lower, upper)
@@ -303,19 +312,20 @@ class PoseSolver:
                     out.append(self.clearance_residual(d, vals, palm, depths, pitches[d]))
             return np.concatenate(out)
 
-        steps = np.r_[1e-5, 1e-5, 1e-5, 1e-2, 1e-2, np.full(4 * len(digits), 1e-2)]
+        steps = wrist_steps(len(digits))
         x, _ = self._levenberg_marquardt(residuals, x, lower, upper, steps, iterations)
         residuals(x)
         palm = self.palm(x[:3], x[3], x[4])
         error = max(float(np.linalg.norm(self.contact_point(self.pad_world(d, vals, palm)) - points[d])) for d in digits)
-        return x[:5], {d: np.array(v) for d, v in vals.items()}, error
+        return x[:5], {d: np.array(v, dtype=FLOAT) for d, v in vals.items()}, error
 
     @staticmethod
     def _levenberg_marquardt(residuals, x, lower, upper, steps, iterations):
-        lam, r = 1e-2, residuals(x)
+        x, lower, upper, steps = (np.asarray(a, FLOAT) for a in (x, lower, upper, steps))
+        lam, r = 1e-2, np.asarray(residuals(x), FLOAT)
         cost = r @ r
         for it in range(1, iterations + 1):
-            jac = np.empty((len(r), len(x)))
+            jac = np.empty((len(r), len(x)), dtype=FLOAT)
             for j in range(len(x)):
                 trial = x.copy()
                 trial[j] += steps[j]
@@ -325,12 +335,12 @@ class PoseSolver:
             for _ in range(10):
                 delta = np.linalg.solve(h + lam * np.diag(np.diag(h) + 1e-9), -g)
                 trial = np.clip(x + delta, lower, upper)
-                tr = residuals(trial)
+                tr = np.asarray(residuals(trial), FLOAT)
                 if tr @ tr < cost:
                     x, r, cost, lam, improved = trial, tr, tr @ tr, max(lam / 3, 1e-7), True
                     break
                 lam *= 4
-            if not improved or np.max(np.abs(trial - x if not improved else delta)) < 1e-7 or cost < 1e-6:
+            if not improved or np.max(np.abs(trial - x if not improved else delta)) < STEP_TOLERANCE or cost < 1e-6:
                 return x, it
         return x, iterations
 

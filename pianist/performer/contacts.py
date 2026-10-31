@@ -9,7 +9,7 @@ ring finger cannot rise far while the middle and little fingers press their keys
 """
 import numpy as np
 
-from .kinematics import DIGITS
+from .kinematics import DIGITS, FLOAT
 from .pose import RELAXED
 
 PAIRS = ((1, 2), (2, 3), (3, 4), (4, 5))
@@ -65,21 +65,21 @@ class HandCapsules:
                     radius.append(.006)
                     continue
                 radius.append(float(np.median(point_distances(own, starts[k], ends[k]))))
-            self.radius[d] = np.array(radius)
+            self.radius[d] = np.array(radius, dtype=FLOAT)
 
     def _heads(self, values, armature):
         world = self.rig.arm_world
         out = {}
         for d in DIGITS:
             mats = [world @ armature @ m for m in self.fingers[d].local_matrices(values[d])]
-            heads = np.array([m[:3, 3] for m in mats])
+            heads = np.array([m[:3, 3] for m in mats], dtype=FLOAT)
             axis = mats[2][:3, 1] / np.linalg.norm(mats[2][:3, 1])      # a bone points along its local y
             out[d] = (heads, axis)
         return out
 
     def _segments(self, d, heads, axis):
         starts = heads
-        ends = np.array([heads[1], heads[2], heads[2] + axis * self.tip_length[d]])
+        ends = np.array([heads[1], heads[2], heads[2] + axis * self.tip_length[d]], dtype=FLOAT)
         return starts, ends
 
     def segments(self, values, armature):
@@ -98,7 +98,7 @@ def finger_pairs(caps, segs):
             i, j = i[keep], j[keep]
         dist = segment_distances(sa[i], ea[i], sb[j], eb[j])
         out.append(float(np.max(caps.radius[a][i] + caps.radius[b][j] - dist)))
-    return np.array(out)
+    return np.array(out, dtype=FLOAT)
 
 
 def hands_gap(caps, segs):
@@ -106,10 +106,10 @@ def hands_gap(caps, segs):
     left = [(d, k) for d in DIGITS for k in range(3)]
     i, j = np.meshgrid(np.arange(len(left)), np.arange(len(left)), indexing='ij')
     i, j = i.ravel(), j.ravel()
-    ls = np.array([segs['L'][d][0][k] for d, k in left]), np.array([segs['L'][d][1][k] for d, k in left])
-    rs = np.array([segs['R'][d][0][k] for d, k in left]), np.array([segs['R'][d][1][k] for d, k in left])
-    lr = np.array([caps['L'].radius[d][k] for d, k in left])
-    rr = np.array([caps['R'].radius[d][k] for d, k in left])
+    ls = np.array([segs['L'][d][0][k] for d, k in left], dtype=FLOAT), np.array([segs['L'][d][1][k] for d, k in left], dtype=FLOAT)
+    rs = np.array([segs['R'][d][0][k] for d, k in left], dtype=FLOAT), np.array([segs['R'][d][1][k] for d, k in left], dtype=FLOAT)
+    lr = np.array([caps['L'].radius[d][k] for d, k in left], dtype=FLOAT)
+    rr = np.array([caps['R'].radius[d][k] for d, k in left], dtype=FLOAT)
     dist = segment_distances(ls[0][i], ls[1][i], rs[0][j], rs[1][j])
     return float(np.min(dist - lr[i] - rr[j]))
 
@@ -117,7 +117,7 @@ def hands_gap(caps, segs):
 def pointing(segs):
     """Per digit: the finger's direction seen from above (knuckle to fingertip) against the keys' length, in
     degrees (+ toward the high keys). Wrist turn and the finger's own sideways swing together."""
-    out = np.zeros(5)
+    out = np.zeros(5, dtype=FLOAT)
     for d in DIGITS:
         heads, tails = segs[d]
         v = tails[2] - heads[0]

@@ -15,21 +15,21 @@ import numpy as np
 
 from .checks import stretched
 from .anchors import KEY_TRAVEL
-from .kinematics import DIGITS
+from .kinematics import DIGITS, FLOAT
 from .posture import natural_orientation
 from .motion import SIDEWAYS_FREE, PLAYING_SHAPE, pad_residual, DEPART_DELAY, FLOOR_SCALE, MOVE_BASE_SECONDS, MOVE_SPEED, UNHURRIED, KeyFloor, KeySurface
-from .pose import CONTACT_TOLERANCE, RELAXED, ROLL_BOUNDS, VALUE_SCALE, YAW_BOUNDS, HandPose, PoseSolver
+from .pose import CONTACT_TOLERANCE, RELAXED, ROLL_BOUNDS, VALUE_SCALE, YAW_BOUNDS, HandPose, PoseSolver, wrist_steps
 
 NEIGHBOUR_SECONDS = .6          # gaussian width of the orientation smoothing over anchors
 COHERENCE_ROUNDS = 2
-ORIENTATION_PULLS = (np.array([.08, .03, .015, 1., 1.]),   # x, y, z (m), yaw, roll (deg) per unit, toward the
-                     np.array([.08, .03, .015, 4., 4.]))   # target: tight first, looser if a key would be lost
+ORIENTATION_PULLS = (np.array([.08, .03, .015, 1., 1.], dtype=FLOAT),   # x, y, z (m), yaw, roll (deg) per unit, toward the
+                     np.array([.08, .03, .015, 4., 4.], dtype=FLOAT))   # target: tight first, looser if a key would be lost
 LATERAL_SCALE = 6.              # deg per unit: a playing finger stays square to the hand; the hand moves over its key
 THUMB_LATERAL_SCALE = 25.       # ... the thumb reaches sideways under the hand by technique
 LATERAL_FREE = SIDEWAYS_FREE    # deg a finger swings sideways on its key without strain (motion.SIDEWAYS_FREE) ...
 LATERAL_HINGE = 4.              # ... beyond it, deg per unit: the hand moves over the key instead. Soft against the
                                 # contact (1 mm off the key = 5 units), and a settle that loses a key is not taken
-NEUTRAL_ORIENTATION = np.array([15., 12.])               # weak pull of yaw, roll toward the hand's natural
+NEUTRAL_ORIENTATION = np.array([15., 12.], dtype=FLOAT)               # weak pull of yaw, roll toward the hand's natural
                                                          # orientation on its forearm (posture.natural_orientation)
 POSITION_TRAVEL = .05
 PALM_HEIGHT = .045              # the wrist at least this far above the white key tops while playing (m): the palm
@@ -48,9 +48,9 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25):
     surface = solver.key_surface
     if not hasattr(solver, 'white_top'):
         solver.white_top = KeyFloor(solver.regions).white_top
-    vector = np.asarray(vector, float)
-    target = np.asarray(target, float)
-    values = {d: np.array(v, float) for d, v in values.items()}
+    vector = np.asarray(vector, FLOAT)
+    target = np.asarray(target, FLOAT)
+    values = {d: np.array(v, FLOAT) for d, v in values.items()}
     digits = sorted({c.digit for c in contacts})
     fingers = solver.rig.fingers[solver.hand]
     lower = np.r_[vector[:3] - POSITION_TRAVEL, YAW_BOUNDS[0], ROLL_BOUNDS[0],
@@ -91,7 +91,7 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25):
                 skin = (palm @ solver.local_clearance(d, {**vals, d: FREE_LIFTED}))[:3].T
                 out.append(np.maximum(0., surface(skin, depths, None) - skin[:, 2]) / FREE_CLEAR_SCALE)
         out.append(_order(solver, contacts, vals))
-        out.append(np.array([vals[c.digit][0] / (THUMB_LATERAL_SCALE if c.digit == 1 else LATERAL_SCALE) for c in contacts]))
+        out.append(np.array([vals[c.digit][0] / (THUMB_LATERAL_SCALE if c.digit == 1 else LATERAL_SCALE) for c in contacts], dtype=FLOAT))
         out.append(lateral_hinge(digits, vals))
         out.append((v[:5] - target) / pull)
         out.append([max(0., solver.white_top + PALM_HEIGHT - v[2]) / PALM_SCALE])
@@ -100,7 +100,7 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25):
             out.append((vals[d] - PLAYING_SHAPE[d]) / VALUE_SCALE)
         return np.concatenate(out)
 
-    steps = np.r_[1e-5, 1e-5, 1e-5, 1e-2, 1e-2, np.full(4 * len(digits), 1e-2)]
+    steps = wrist_steps(len(digits))
     x, used = PoseSolver._levenberg_marquardt(residuals, x, lower, upper, steps, iterations)
     palm = unpack(x)
     error, targets, clearance = 0., {}, 0.
@@ -110,11 +110,11 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25):
         error = max(error, float(np.max(np.abs(solver.regions.residual(c.pitch, c.depth, point)))))
         pen = solver.clearance_residual(c.digit, vals, palm, depths, c.pitch)
         clearance = max(clearance, float(pen.max()) * .0005 if len(pen) else 0.)
-    return HandPose(np.array(x[:3]), float(x[3]), float(x[4]), {d: np.array(v) for d, v in vals.items()},
+    return HandPose(np.array(x[:3], dtype=FLOAT), float(x[3]), float(x[4]), {d: np.array(v, dtype=FLOAT) for d, v in vals.items()},
                     error, error <= CONTACT_TOLERANCE * 2.5, used, targets, clearance)
 
 
-FREE_LIFTED = np.array([0., 20., 20., 10.])   # a free finger lifted clear of the keys (lateral, lift, PIP, DIP)
+FREE_LIFTED = np.array([0., 20., 20., 10.], dtype=FLOAT)   # a free finger lifted clear of the keys (lateral, lift, PIP, DIP)
 FREE_CLEAR_SCALE = .002         # m per unit: its skin below the key tops
 WHITE_FRONT_CLEAR = .012        # white-key pads preferably this far in front of the black keys ...
 WHITE_FRONT_SCALE = .002        # ... m per unit (soft: a chord may still need them further in)
@@ -124,7 +124,7 @@ ORDER_SCALE = .002              # m per unit: chord fingers 2..5 keep their orde
 def lateral_hinge(digits, values):
     """Sideways swing of the contact fingers beyond ``LATERAL_FREE`` (scaled): an octave's spread is shared by the
     thumb and the little finger instead of one of them going to its limit."""
-    return np.array([max(0., abs(values[d][0]) - LATERAL_FREE[d]) / LATERAL_HINGE for d in digits])
+    return np.array([max(0., abs(values[d][0]) - LATERAL_FREE[d]) / LATERAL_HINGE for d in digits], dtype=FLOAT)
 
 
 def _order(solver, contacts, vals):
@@ -139,7 +139,7 @@ def _order(solver, contacts, vals):
     for a, b in zip(digits, digits[1:]):
         need = sum(sp.whole_gaps[d] for d in range(a, b)) / .85 * .6
         out.append(np.maximum(0., need - (sp.positions(b, vals) - sp.positions(a, vals))) / ORDER_SCALE)
-    return np.concatenate(out) if out else np.zeros(0)
+    return np.concatenate(out) if out else np.zeros(0, dtype=FLOAT)
 
 
 def vector_of(pose):
@@ -152,9 +152,9 @@ def neighbour_targets(anchors, offsets=None):
     anchors still solved square to the keys."""
     out = []
     times = np.array([a.time for a in anchors])
-    vectors = np.array([vector_of(a.pose) for a in anchors])
+    vectors = np.array([vector_of(a.pose) for a in anchors], dtype=FLOAT)
     if offsets is not None:
-        vectors[:, 3:] += np.asarray(offsets, float)
+        vectors[:, 3:] += np.asarray(offsets, FLOAT)
     for i, a in enumerate(anchors):
         w = np.exp(-.5 * ((times - a.time) / NEIGHBOUR_SECONDS) ** 2)
         target = vectors[i].copy()

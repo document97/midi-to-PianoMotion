@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from .kinematics import axis_matrix, mat3_q
+from .kinematics import FLOAT, axis_matrix, mat3_q
 
 FORWARD_LEAN_DEGREES = 10.      # sitting back (thighs clear of the keybed), the player leans in from the hips
 
@@ -14,10 +14,10 @@ class Torso:
     def __init__(self, data, arms):
         self.data = data
         self.bone = data['bone']
-        self.pivot = np.array(data['pivot'])
-        self.pre_inverse = np.linalg.inv(np.array(data['pre']))
-        self.world = np.array(data['world'])
-        self.reference = {h: np.array(m) for h, m in data['reference'].items()}
+        self.pivot = np.array(data['pivot'], dtype=FLOAT)
+        self.pre_inverse = np.linalg.inv(np.array(data['pre'], dtype=FLOAT))
+        self.world = np.array(data['world'], dtype=FLOAT)
+        self.reference = {h: np.array(m, dtype=FLOAT) for h, m in data['reference'].items()}
         self.height = np.mean([m[2, 3] for m in self.reference.values()]) - self.pivot[2]
         self.rows = np.zeros((0, 3))
         self.first = self.last = 0.
@@ -42,7 +42,7 @@ class Torso:
         limit = math.radians(16)
         raw = math.asin(float(np.clip(shift / max(.05, self.height), -1, 1)))
         angle = limit * math.tanh(raw / limit)
-        transform = np.eye(4)
+        transform = np.eye(4, dtype=FLOAT)
         transform[:3, :3] = axis_matrix((0., 1., 0.), angle) @ axis_matrix((1., 0., 0.), -math.radians(FORWARD_LEAN_DEGREES))
         transform[:3, 3] = self.pivot - transform[:3, :3] @ self.pivot
         pre = {h: transform @ m for h, m in self.reference.items()}

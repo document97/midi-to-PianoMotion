@@ -9,7 +9,7 @@
 1. **规划**：决定每个音由哪只手、哪根手指弹，每根手指什么时候抬起，以及哪些音因为手够不着只能省略。左右手由规划器自己分配，不需要分好手的谱子。
 2. **动作**：生成手臂、手腕、手指、上身倾斜、右脚踩延音踏板和每个琴键的动画，写进带预览音频的 `.blend`。
 
-不用训练数据，也没有神经网络，我做的是较轻量化的纯粹算法。规划是束搜索，动作是用角色自己的骨架和皮肤做反向运动学求解。全程在 CPU 上多进程运行（8 或 16 个进程）。一首 160 秒的曲子，规划十几秒，动作在 16 核上大约 13 分钟解完。
+不用训练数据，也没有神经网络，我做的是较轻量化的纯粹算法。规划是束搜索，动作是用角色自己的骨架和皮肤做反向运动学求解。全程以 32 位浮点（fp32）计算。规划和动作在 CPU 上多进程运行（8 或 16 个进程）；第一次运行时要算的手指配对表，在有 GPU 时用 GPU 批量求解。一首 160 秒的曲子，规划十几秒，动作在 16 核上大约 13 分钟解完。
 
 > **演示视频：** https://www.bilibili.com/video/BV1QEnc6rECK/
 
@@ -38,6 +38,7 @@
 ## 依赖
 
 - Python（需要 `numpy`、`scipy`、`mido`）和 Blender。
+- 可选：支持 GPU 的 PyTorch（NVIDIA 用 CUDA 版，AMD 用 ROCm 版），用来加速手指配对表。没有装、或检测不到 GPU 时，自动用 CPU 多进程计算，结果的用法不变。
 - 开发环境是 Windows 11、Python 3.12、Blender 5.2，其他环境没有测试过。
 
 ## 开发用的角色模型
@@ -75,7 +76,18 @@ blender -b your_scene.blend --python-exit-code 1 --python performer/blender_main
     --inputs inputs/your_piece --output ../output/your_piece --workers 16
 ```
 
-第一次运行时会为这个骨架计算手指配对表（`performer/reach_table.py`，16 线程约 10 分钟），缓存在 `performer/rig_cache/`。`blender_main.py` 会用 `PATH` 上找到的 Python 求解，也可以用环境变量 `PIANOMOTION_PYTHON` 指定。
+第一次运行时会为这个骨架计算手指配对表（`performer/reach_table.py`），缓存在 `performer/rig_cache/`。CPU 16 进程约 10 分钟；有 GPU 时用 `performer/batch_pose.py` 把 7680 个求解放进同一批次计算，Radeon 780M 核显上约 2.5 分钟，GPU 占用基本保持满载。`blender_main.py` 会用 `PATH` 上找到的 Python 求解，也可以用环境变量 `PIANOMOTION_PYTHON` 指定（要用 GPU，就指定装了 PyTorch 的那个 Python）。
+
+GPU 相关的环境变量：
+
+| 变量 | 作用 |
+|---|---|
+| `PIANOMOTION_DEVICE=cpu` | 不用 GPU，配对表也用 CPU 多进程 |
+| `PIANOMOTION_GPU_MEMORY_SHARE` | 最多使用开始时空闲显存的多少比例，默认 `0.4`（核显和 CPU 共用内存，可调小） |
+| `PIANOMOTION_GPU_MEMORY_GB` | 直接指定可用显存（GB），优先于上一项 |
+| `PIANOMOTION_GPU_GRAPHS=0` | 关闭 CUDA/HIP Graph 重放（默认开启；重放结果与不重放一致，录制失败时会自动关闭） |
+
+GPU 版只在 Radeon 780M（Windows、ROCm）上实测过；NVIDIA 和 AMD 独显上按显存自动放大批次，但没有实测。
 
 预览音频（`planner/audio.py`）用的是 Windows 自带的 General MIDI 音色库（`gm.dls`）。
 

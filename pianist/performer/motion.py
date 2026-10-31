@@ -27,7 +27,7 @@ from planner.music import KEY_RETURN_SECONDS
 
 from .anchors import KEY_TRAVEL, ease, lift_profile
 from .checks import CELL, OWN_KEY_TOLERANCE, Heightfield, brushed, stretched
-from .kinematics import DIGITS
+from .kinematics import DIGITS, FLOAT
 from .pose import RELAXED, PoseSolver
 
 MOVE_BASE_SECONDS = .10          # natural wrist move: base duration ...
@@ -92,7 +92,7 @@ TRANSITION_SPEED = 400.          # deg/s: a finger's lifted shape and its next h
 # onto the key (the calibrated relaxed hand is flatter: MCP 34, IP 18). The thumb keeps its relaxed shape.
 # Geometric bends as measured on a reference pianist (FurElise dataset, performance 060: PIP ~27, DIP ~12 deg median): the last
 # joint stays open, so the finger meets the key with its pad rather than its tip.
-PLAYING_SHAPE = {1: RELAXED[1], **{d: np.array([0., 14., 42., 22.]) for d in (2, 3, 4, 5)}}   # arched: the palm stays off the keys
+PLAYING_SHAPE = {1: RELAXED[1], **{d: np.array([0., 14., 42., 22.], dtype=FLOAT) for d in (2, 3, 4, 5)}}   # arched: the palm stays off the keys
 PAD_PITCH_MAX = 50.              # deg: a last phalanx steeper than this meets the key with the fingertip (slips);
                                  # measured on the rig: the pad's lowest point is mid-pad below ~30, the tip above ~40;
                                  # an arched hand plays on the front of the pad, between the two
@@ -108,7 +108,7 @@ def held(deltas, k=HOLD_SAMPLES):
     """Free-time corrections are solved per sample, and a finger skimming a key edge (the wrist drifting slowly)
     is lifted at one sample and not the next: a curve through them trembles. Each sample takes
     the largest correction within +-k samples, then a gaussian of k/2: the finger lifts once and stays up."""
-    deltas = np.asarray(deltas, float)
+    deltas = np.asarray(deltas, FLOAT)
     n = len(deltas)
     if n < 3 or k < 1:
         return deltas
@@ -143,12 +143,12 @@ class WristPath:
         for t, v, arc in sorted(knots, key=lambda k: k[0]):
             arc = tuple(arc) if isinstance(arc, tuple) else (arc, np.nan, np.nan)
             if times and t <= times[-1] + 1e-6:
-                values[-1], arcs[-1] = np.asarray(v, float), arc
+                values[-1], arcs[-1] = np.asarray(v, FLOAT), arc
                 continue
             times.append(t)
-            values.append(np.asarray(v, float))
+            values.append(np.asarray(v, FLOAT))
             arcs.append(arc)
-        self.times, self.values, self.arcs = np.array(times), np.array(values), np.array(arcs)
+        self.times, self.values, self.arcs = np.array(times, float), np.array(values, dtype=FLOAT), np.array(arcs, dtype=FLOAT)
         self.slopes = pchip_slopes(self.times, self.values) if len(times) > 1 else np.zeros_like(self.values)
         self.resting = np.all(np.abs(self.slopes) < 1e-12, axis=1)
         self.accents = np.zeros((0, 3))          # (start, onset, depth): the wrist sinks into loud chords
@@ -166,7 +166,7 @@ class WristPath:
             if loud > 0:
                 depth = ACCENT_DEPTH * loud * (1. if len(ns) > 1 else ACCENT_SINGLE)
                 rows.append((min(n.touch for n in ns) - ACCENT_LEAD, onset, depth))
-        self.accents = np.array(rows) if rows else np.zeros((0, 3))
+        self.accents = np.array(rows, float) if rows else np.zeros((0, 3))
 
     def dip(self, t):
         if not len(self.accents):
@@ -287,8 +287,8 @@ def contact_waypoints(anchors, notes):
         for k in a.incoming + a.held:
             digit = notes[k].digit
             depth = KEY_TRAVEL if k in a.incoming else notes[k].depth(a.time)
-            out.setdefault(k, []).append((a.time, a.pose.targets[digit] + np.array([0., 0., depth]),
-                                          np.array(a.pose.values[digit], float), np.array(a.pose.wrist, float)))
+            out.setdefault(k, []).append((a.time, a.pose.targets[digit] + np.array([0., 0., depth], dtype=FLOAT),
+                                          np.array(a.pose.values[digit], FLOAT), np.array(a.pose.wrist, FLOAT)))
     return out
 
 
@@ -342,7 +342,7 @@ class Stroke:
         if self.clearance is None:
             return v
         times, deltas = self.clearance
-        return v + np.array([np.interp(t, times, deltas[:, k]) for k in range(4)])
+        return v + np.array([np.interp(t, times, deltas[:, k]) for k in range(4)], dtype=FLOAT)
 
 
 def strokes(notes):
@@ -399,7 +399,7 @@ def stroke_target(stroke, note, points, t, path=None):
         d0 = note.depth(stroke.release)
         x = (t - stroke.release) / max(stroke.lift_end - stroke.release, 1e-6)
         z = -d0 + (d0 + stroke.lift_height) * lift_profile(x)
-    return top + np.array([0., 0., z]), seed
+    return top + np.array([0., 0., z], dtype=FLOAT), seed
 
 
 @dataclass
@@ -525,7 +525,7 @@ class KeySurface:
                                (0, 1, (1 - w[:, 0]) * w[:, 1]), (1, 1, w[:, 0] * w[:, 1])):
             ix, iy = i[:, 0] + dx, i[:, 1] + dy
             pitch = f.pitch[ix, iy]
-            z = self.top[ix, iy] - np.array([depths.get(int(p), 0.) for p in pitch])
+            z = self.top[ix, iy] - np.array([depths.get(int(p), 0.) for p in pitch], dtype=FLOAT)
             z = np.where(pitch == own_pitch, z - OWN_KEY_TOLERANCE, z)
             out = out + weight * z
             soft = soft + weight * (Heightfield.brushable(pitch, depths, own_pitch) & np.isfinite(f.top[ix, iy]))
@@ -585,7 +585,7 @@ class Spacing:
         """Lateral position of the finger's proximal and distal half (its own skin, palm frame)."""
         lateral = self.lateral @ self.solver.local_clearance(digit, values)[:3]
         proximal = self.proximal[digit]
-        return np.array([lateral[proximal].mean(), lateral[~proximal].mean()])
+        return np.array([lateral[proximal].mean(), lateral[~proximal].mean()], dtype=FLOAT)
 
     def make_room(self, values, give):
         """``give``: {digit: 0 (on its key) .. 1 (free)}: the share of its make-room swing a finger takes."""
@@ -611,7 +611,7 @@ class Spacing:
         relaxed = {1: self.thumb_gap, **{d: self.whole_gaps[d] / SPACING_SHARE for d in (2, 3, 4)}}
         pulled = {**want, 1: self.positions(1, values)}          # the thumb pulls, it is not moved
         for _ in range(SPREAD_ROUNDS):             # the fan: follow a neighbour that went further than relaxed
-            pull = {d: np.zeros(2) for d in moves}
+            pull = {d: np.zeros(2, dtype=FLOAT) for d in moves}
             for d in moves:
                 for n, gap, sign in ((d - 1, relaxed.get(d - 1), 1.), (d + 1, relaxed.get(d), -1.)):
                     if n not in pulled or gap is None:
@@ -630,13 +630,13 @@ class Spacing:
             shift = (want[d] - s[d]) * give.get(d, 1.)
             if d not in moves or np.abs(shift).max() < 1e-5:
                 continue
-            probe = np.array(values[d], float)
+            probe = np.array(values[d], FLOAT)
             probe[0] += 1.
             slope = self.positions(d, {**values, d: probe}) - s[d]          # metres per degree of swing
             swings = [shift[k] / slope[k] for k in range(2) if abs(slope[k]) > 1e-6 and abs(shift[k]) >= 1e-5]
             if not swings:
                 continue
-            v = np.array(values[d], float)
+            v = np.array(values[d], FLOAT)
             # the larger of the proximal and distal needs, blended (no flip when they disagree in sign)
             weights = np.abs(swings) ** 4 + 1e-30
             v[0] = np.clip(v[0] + float(np.dot(swings, weights) / weights.sum()), fingers[d].lower[0], fingers[d].upper[0])
@@ -661,8 +661,8 @@ def distal_pitch(solver, digit, values, palm):
 def pad_residual(solver, digit, values, palm):
     """Fingers 2..5 meet their key with the pad: penalise a last phalanx steeper than PAD_PITCH_MAX."""
     if digit == 1:
-        return np.zeros(1)
-    return np.array([max(0., distal_pitch(solver, digit, values, palm) - PAD_PITCH_MAX) / PAD_PITCH_SCALE])
+        return np.zeros(1, dtype=FLOAT)
+    return np.array([max(0., distal_pitch(solver, digit, values, palm) - PAD_PITCH_MAX) / PAD_PITCH_SCALE], dtype=FLOAT)
 
 
 class FingerIK:
@@ -681,20 +681,20 @@ class FingerIK:
             return self.solve(digit, palm, target, seed)
         finger = self.solver.rig.fingers[self.solver.hand][digit]
         values = {d: RELAXED[d] for d in DIGITS}
-        seed = np.asarray(seed, float)
+        seed = np.asarray(seed, FLOAT)
 
         def residual(v):
             values[digit] = v
             point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
             skin = (palm @ self.solver.local_clearance(digit, values))[:3].T
             below = self.surface.clearance(skin, depths, own_pitch, brush=brush) / FLOOR_SCALE
-            steady = (v - start) / RIDE_STEADY if start is not None else np.zeros(0)
+            steady = (v - start) / RIDE_STEADY if start is not None else np.zeros(0, dtype=FLOAT)
             return np.r_[(point - target) / .0002, (v - seed) / IK_VALUE_SCALE, below,
                          pad_residual(self.solver, digit, v, palm), steady]
 
         def run(x0):
             x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, finger.lower, finger.upper),
-                                                   finger.lower, finger.upper, np.full(4, 1e-2), IK_ITERATIONS)
+                                                   finger.lower, finger.upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
             values[digit] = x
             point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
             return x, float(np.linalg.norm(point - target))
@@ -715,7 +715,7 @@ class FingerIK:
     def clear(self, digit, palm, values, lowered=0.):
         """A free finger: the smallest change of its values that keeps its skin above the keys."""
         others = {d: RELAXED[d] for d in DIGITS}
-        start = np.asarray(values, float)
+        start = np.asarray(values, FLOAT)
         if not self.below_floor(digit, {**others, digit: start}, palm, lowered).any():
             return start
         finger = self.solver.rig.fingers[self.solver.hand][digit]
@@ -728,7 +728,7 @@ class FingerIK:
         # here would be undone by it, back onto a black key).
         lower, upper = finger.lower.copy(), finger.upper.copy()
         lower[0] = upper[0] = np.clip(start[0], finger.lower[0], finger.upper[0])
-        x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(start, lower, upper), lower, upper, np.full(4, 1e-2),
+        x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(start, lower, upper), lower, upper, np.full(4, 1e-2, dtype=FLOAT),
                                                IK_ITERATIONS)
         return x
 
@@ -737,7 +737,7 @@ class FingerIK:
         With ``lowered`` (own key depth) the skin also stays above the key floor."""
         finger = self.solver.rig.fingers[self.solver.hand][digit]
         values = {d: RELAXED[d] for d in DIGITS}
-        seed = np.asarray(seed, float)
+        seed = np.asarray(seed, FLOAT)
 
         def residual(v):
             values[digit] = v
@@ -749,7 +749,7 @@ class FingerIK:
             return out
 
         x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(seed, finger.lower, finger.upper),
-                                               finger.lower, finger.upper, np.full(4, 1e-2), IK_ITERATIONS)
+                                               finger.lower, finger.upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
         values[digit] = x
         point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
         return x, float(np.linalg.norm(point - target))
@@ -807,7 +807,7 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
     # Free time: the keyposed values may let the skin dip into the keys under a moving wrist. The
     # smallest lift is solved on a coarse grid and interpolated, so the correction is smooth in time.
     times = np.arange(path.times[0], path.times[-1] + CLEAR_STEP, CLEAR_STEP)
-    deltas = np.zeros((len(times), 4))
+    deltas = np.zeros((len(times), 4), dtype=FLOAT)
     for i, t in enumerate(times):
         if track.stroke(t) is None:
             base = track.keyposed(t)
@@ -838,7 +838,7 @@ def stroke_clearance(s, pitch, digit, path, solver, ik, notes):
     grid = np.r_[np.arange(s.hover, s.touch, STROKE_CLEAR_STEP), s.touch,
                  s.release, np.arange(s.release + STROKE_CLEAR_STEP, s.lift_end, STROKE_CLEAR_STEP), s.lift_end]
     nearby = {k: n for k, n in notes.items() if n.touch - 1. <= s.lift_end and n.returned >= s.hover}
-    deltas, any_fix = np.zeros((len(grid), 4)), False
+    deltas, any_fix = np.zeros((len(grid), 4), dtype=FLOAT), False
     finger = solver.rig.fingers[solver.hand][digit]
     lower, upper = finger.lower.copy(), finger.upper.copy()
     others = {d: RELAXED[d] for d in DIGITS}
@@ -859,7 +859,7 @@ def stroke_clearance(s, pitch, digit, path, solver, ik, notes):
             continue
         lower[0] = upper[0] = np.clip(base[0], finger.lower[0], finger.upper[0])
         x, _ = PoseSolver._levenberg_marquardt(lambda v: np.r_[(v - base) / FREE_VALUE_SCALE, below(v)],
-                                               np.clip(base, lower, upper), lower, upper, np.full(4, 1e-2),
+                                               np.clip(base, lower, upper), lower, upper, np.full(4, 1e-2, dtype=FLOAT),
                                                IK_ITERATIONS)
         deltas[i] = (x - base) * fade
         any_fix = True
@@ -959,7 +959,7 @@ def room_corrections(times, path, tracks, notes, waypoints, solver, ik):
     """On a rolled hand the spacing's sideways swing axis is tilted: a free finger swung aside also
     sinks. Sampled after the spacing, the smallest lift that keeps each free finger over the keys;
     applied smoothly (FingerTrack.set_room), since a per-frame clear reads as a tremor."""
-    deltas = {d: np.zeros((len(times), 4)) for d in DIGITS}
+    deltas = {d: np.zeros((len(times), 4), dtype=FLOAT) for d in DIGITS}
     for i, t in enumerate(times):
         vector, room, _ = frame_hand(t, path, tracks, notes, waypoints, solver, ik, apply_room=False)
         palm = solver.palm(*_split(vector))
@@ -977,7 +977,7 @@ def contact_error(t, path, notes, waypoints, solver, ik):
     for n in notes.values():
         if n.touch <= t <= n.release and n.id in waypoints:
             top, seed = waypoint(waypoints[n.id], t, path)
-            values, e = ik.solve(n.digit, palm, top - np.array([0., 0., n.depth(t)]), seed)
+            values, e = ik.solve(n.digit, palm, top - np.array([0., 0., n.depth(t)], dtype=FLOAT), seed)
             worst = max(worst, e)
             if n.digit != 1:
                 swing = max(swing, abs(float(values[0])) - SIDEWAYS_FREE[n.digit])
@@ -986,7 +986,7 @@ def contact_error(t, path, notes, waypoints, solver, ik):
 
 def refine_score(errors):
     """``contact_error`` samples (n, 2) -> how far past what calls for an intermediate pose (> 1)."""
-    errors = np.asarray(errors, float)
+    errors = np.asarray(errors, FLOAT)
     return np.maximum(errors[:, 0] / REFINE_TOLERANCE, errors[:, 1] / REFINE_LATERAL)
 
 
@@ -1011,7 +1011,7 @@ class YieldingPath:
     """A wrist path moved sideways by ``offset`` (x, metres, on a time grid): an idle hand out of the other's way."""
 
     def __init__(self, base, times, offset):
-        self.base, self.times, self.offset = base, np.asarray(times, float), np.asarray(offset, float)
+        self.base, self.times, self.offset = base, np.asarray(times, float), np.asarray(offset, FLOAT)
 
     def __getattr__(self, name):
         if name in ('base', 'times', 'offset'):
@@ -1029,7 +1029,7 @@ def yield_offsets(paths, notes, duration, apart, speed, busy_margin, rate=60.):
     one moves out (left hand to the left, right to the right) by the shortfall, ramping at ``speed`` and held at
     zero while it plays (``busy_margin``: seconds before an onset / after a release). Both playing: unchanged."""
     times = np.arange(0., duration + 1. / rate, 1. / rate)
-    x = {h: np.array([paths[h](t)[0] for t in times]) for h in 'LR'}
+    x = {h: np.array([paths[h](t)[0] for t in times], dtype=FLOAT) for h in 'LR'}
     busy = {h: np.zeros(len(times), bool) for h in 'LR'}
     for n in notes.values():
         busy[n.hand] |= (times >= n.onset - busy_margin[0]) & (times <= n.release + busy_margin[1])
@@ -1048,7 +1048,7 @@ def yield_offsets(paths, notes, duration, apart, speed, busy_margin, rate=60.):
         if busy[h].any():                       # zero while playing, reached at ``speed``
             env = np.minimum(env, _distance_to(busy[h]) * step)
         k = int(rate * .1) | 1                  # round the corners
-        env = np.convolve(np.pad(env, k // 2, mode='edge'), np.ones(k) / k, mode='valid')
+        env = np.convolve(np.pad(env, k // 2, mode='edge'), np.ones(k, dtype=FLOAT) / k, mode='valid')
         env[busy[h]] = 0.
         out[h] = (times, sign * env)
     return out

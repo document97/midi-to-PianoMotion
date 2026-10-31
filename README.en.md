@@ -9,7 +9,7 @@ Give it a MIDI file and a 3D character plays it on a piano in Blender:
 1. **Planning**: decides which hand and which finger plays each note, when each finger lets go of its key, and which notes have to be left out because the hand cannot reach them. The planner splits the notes between the hands itself; the score does not need to be separated into hands.
 2. **Motion**: animates the arms, wrists, fingers, the lean of the upper body, the right foot on the sustain pedal and every key, and writes it all into a `.blend` with preview audio.
 
-No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything runs on the CPU in parallel processes (8 or 16). For a 160-second piece, planning takes a dozen seconds or so, and the motion about 13 minutes on 16 cores.
+No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything is computed in 32-bit floats (fp32). Planning and motion run on the CPU in parallel processes (8 or 16); the finger pair table computed on the first run is solved in batches on the GPU when there is one. For a 160-second piece, planning takes a dozen seconds or so, and the motion about 13 minutes on 16 cores.
 
 > **Demo video:** https://www.bilibili.com/video/BV1QEnc6rECK/
 
@@ -38,6 +38,7 @@ Only the algorithm. The character, piano and scene models used during developmen
 ## Requirements
 
 - Python (with `numpy`, `scipy`, `mido`) and Blender.
+- Optional: PyTorch with GPU support (the CUDA build for NVIDIA, ROCm for AMD) to speed up the finger pair table. Without it, or without a GPU, the table is computed on CPU processes as before.
 - Developed on Windows 11, Python 3.12 and Blender 5.2; other setups have not been tested.
 
 ## The development character
@@ -75,7 +76,18 @@ blender -b your_scene.blend --python-exit-code 1 --python performer/blender_main
     --inputs inputs/your_piece --output ../output/your_piece --workers 16
 ```
 
-The first run computes the finger pair table for the skeleton (`performer/reach_table.py`, about 10 minutes on 16 threads) and caches it in `performer/rig_cache/`. `blender_main.py` runs the solve with the Python found on `PATH`; the environment variable `PIANOMOTION_PYTHON` can name another one.
+The first run computes the finger pair table for the skeleton (`performer/reach_table.py`) and caches it in `performer/rig_cache/`: about 10 minutes on 16 CPU processes, or, with a GPU, about 2.5 minutes on a Radeon 780M iGPU, where `performer/batch_pose.py` solves all 7680 cases as one batch and keeps the GPU close to fully busy. `blender_main.py` runs the solve with the Python found on `PATH`; the environment variable `PIANOMOTION_PYTHON` can name another one (for the GPU, the Python that has PyTorch).
+
+GPU environment variables:
+
+| Variable | Effect |
+|---|---|
+| `PIANOMOTION_DEVICE=cpu` | no GPU: the pair table on CPU processes too |
+| `PIANOMOTION_GPU_MEMORY_SHARE` | largest share of the GPU memory free at the start to use, default `0.4` (an iGPU shares it with the CPU) |
+| `PIANOMOTION_GPU_MEMORY_GB` | GPU memory to use, in GB; overrides the share |
+| `PIANOMOTION_GPU_GRAPHS=0` | no CUDA/HIP graph replay (on by default; replay gives the same results, and is switched off by itself if a graph cannot be recorded) |
+
+The GPU solver has been measured on a Radeon 780M only (Windows, ROCm); on discrete NVIDIA and AMD cards its batches grow with the memory, untested.
 
 The preview audio (`planner/audio.py`) uses the General MIDI sound bank that comes with Windows (`gm.dls`).
 
