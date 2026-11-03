@@ -28,8 +28,9 @@ from planner.search import Weights
 from planner.validate import validate
 
 from .anchors import REACH_TOLERANCE, Anchor, build_anchors, note_motions, solve_anchors, summary
-from .checks import BRUSH_DEPTH, Heightfield
-from .coherence import COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, neighbour_targets, settle, vector_of
+from .checks import BRUSH_DEPTH, Heightfield, stretched
+from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, inner, least_sunk, neighbour_targets,
+                        settle, sunk, vector_of, wide_settle)
 from .kinematics import DIGITS, SWING_LATERAL, Rig
 from .torso import Torso
 from .contacts import HandCapsules, finger_pairs, hands_gap, pointing, raised_between
@@ -37,6 +38,7 @@ from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contac
                      refine_points, refine_score, strokes, waypoint, wrist_path, YieldingPath, yield_offsets)
 from .pedal import damper_depth, damper_intervals
 from .pose import RELAXED, hand_solvers
+from .progress import progress_map
 from .reach_table import load_or_compute
 from .regions import performer_solvers
 from .posture import natural_orientation
@@ -91,6 +93,10 @@ HANDS_APART = .16                 # m between the wrists: an idle hand moves out
                                   # 20 mm between the hands' bodies)
 YIELD_SPEED = .4                  # m/s: how fast the idle hand moves aside and back
 YIELD_BUSY = (.35, .15)           # s before a note's onset / after its release the hand counts as playing
+SQUEEZE_MM = 6.                   # an inner chord finger sinking deeper than this into the next keys once its chord is
+                                  # settled (swung to its limit across a black key, or wedged between two) is refused
+                                  # to that note and the piece planned again ...
+SHAPE_ROUNDS = 3                  # ... at most this many times
 
 
 def gentle(anchor, pose, path, others):
@@ -100,15 +106,53 @@ def gentle(anchor, pose, path, others):
     return float(np.abs(dev[3:]).max()) / dt <= INTERMEDIATE_TURN and float(np.linalg.norm(dev[:3])) / dt <= INTERMEDIATE_SPEED
 
 
+def _squeeze(job):
+    """Inner contacts (``coherence.inner``) of a chord sinking deeper than ``SQUEEZE_MM`` into the next keys once
+    settled from its anchor pose, as the coherence settles it."""
+    hand, contacts, vector, values = job
+    solver = _ctx['solvers'][hand]
+    if solver.heightfield is None:
+        return []
+    pose = settle(solver, contacts, vector, {d: values.get(d, RELAXED[d]) for d in DIGITS}, vector, ORIENTATION_PULLS[0])
+    mm = sunk(solver, contacts, pose)
+    return [i for i in inner(contacts) if mm[i] > SQUEEZE_MM]
+
+
+def squeezed_fingers(anchors, notes, base, workers):
+    """(note index, hand, finger) of chord fingers the hand cannot place cleanly (``_squeeze``). The pair table
+    judges two fingers at a time; a third between them may then only reach its key swung across the next one."""
+    chords = [a for a in anchors if len(a.incoming) + len(a.held) >= 3]
+    with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
+        found = progress_map(pool, _squeeze, [(a.hand, a.contacts(notes), vector_of(a.pose), a.pose.values) for a in chords], 'chord shapes', 2)
+    out = set()
+    for a, bad in zip(chords, found):
+        ids = a.incoming + a.held
+        out |= {(notes[ids[i]].index, a.hand, notes[ids[i]].digit) for i in bad}
+    return out
+
+
 def _settle(job):
-    """First pose (over the given pulls) whose contact error is within ``limit``; None if none is."""
-    hand, contacts, vector, values, target, pulls, limit = job
-    values = {d: values.get(d, RELAXED[d]) for d in DIGITS}
-    for pull in pulls:
-        pose = settle(_ctx['solvers'][hand], contacts, vector, values, target, pull)
-        if pose.contact_error <= limit:
+    """First pose (over the given pulls) whose contact error is within ``limit``; None if none is. ``wide``: a
+    stretched hand, searched from several wrist starts (``wide_settle``) with the first pull. ``starts``: other
+    (vector, values) to settle from as well; of the poses within ``limit`` the least sunk (``least_sunk``)."""
+    hand, contacts, vector, values, target, pulls, limit, *extra = job
+    wide, starts = (list(extra) + [False, ()][len(extra):])[:2]
+    solver = _ctx['solvers'][hand]
+    if wide:
+        pose = wide_settle(solver, contacts, vector, {d: values.get(d, RELAXED[d]) for d in DIGITS}, target, pulls[0], limit)
+        if pose is not None and pose.contact_error <= limit:
             return pose
-    return None
+    found = []
+    for v, vals in ((vector, values), *starts):
+        vals = {d: vals.get(d, RELAXED[d]) for d in DIGITS}
+        for pull in pulls:
+            pose = settle(solver, contacts, v, vals, target, pull)
+            if pose.contact_error <= limit:
+                found.append(pose)
+                break
+    if len(found) > 1 and solver.heightfield is not None:
+        return least_sunk(solver, contacts, found, limit)
+    return found[0] if found else None
 
 
 def _track(job):
@@ -451,18 +495,33 @@ def run(args):
     planner_kwargs = dict(beam_width=args.beam, outer_voice_bonus=1.5, pair_table=table,
                           weights=Weights(**({} if args.finger_spacing is None else dict(finger_spacing=args.finger_spacing)),
                                           **({} if args.lift_speed is None else dict(lift_speed=args.lift_speed))))
-    planned = plan_parallel(build, (inputs, args.end), planner_kwargs, workers=workers)
-    planner, score = planned['planner'], planned['planner'].score
-    rows = plan_notes(planned['state'], score)
-    problems = validate(rows, score, raw['keyboard'], raw['envelopes'], raw['radii'], planner.w.hard_speed)
-    wrist_x = {(d.group, h): p.x for d in planned['state'].decisions() for h, p in d.poses}
-    stages['planning'] = time.perf_counter() - t0
+    stages['planning'] = stages['anchor_poses'] = stages['chord_shapes'] = 0.
+    forbidden = set()
+    for shape_round in range(SHAPE_ROUNDS + 1):
+        print(f'[planning] round {shape_round + 1}', flush=True)
+        planned = plan_parallel(build, (inputs, args.end), dict(planner_kwargs, forbidden=frozenset(forbidden)), workers=workers)
+        planner, score = planned['planner'], planned['planner'].score
+        rows = plan_notes(planned['state'], score)
+        problems = validate(rows, score, raw['keyboard'], raw['envelopes'], raw['radii'], planner.w.hard_speed)
+        wrist_x = {(d.group, h): p.x for d in planned['state'].decisions() for h, p in d.poses}
+        stages['planning'] += time.perf_counter() - t0
 
-    # 2. anchor poses (keyframes) on the chosen path
-    t0 = time.perf_counter()
-    notes = note_motions(rows, score)
-    anchors = solve_anchors(build_anchors(notes, wrist_x), notes, RIG, workers)
-    stages['anchor_poses'] = time.perf_counter() - t0
+        # 2. anchor poses (keyframes) on the chosen path
+        t0 = time.perf_counter()
+        notes = note_motions(rows, score)
+        anchors = solve_anchors(build_anchors(notes, wrist_x), notes, RIG, workers)
+        stages['anchor_poses'] += time.perf_counter() - t0
+        if shape_round == SHAPE_ROUNDS:
+            break
+        # 2a. chords the hand cannot shape cleanly: their inner finger refused to that note, the piece planned again
+        t0 = time.perf_counter()
+        new = squeezed_fingers(anchors, notes, dict(rig_path=str(RIG), notes=notes, checks=False), workers) - forbidden
+        stages['chord_shapes'] += time.perf_counter() - t0
+        print(f'chord shapes round {shape_round}: {len(new)} squeezed fingers refused', flush=True)
+        if not new:
+            break
+        forbidden |= new
+        t0 = time.perf_counter()
 
     # 2b. free early releases (identical sound), then orientation coherence between neighbouring anchors
     t0 = time.perf_counter()
@@ -477,16 +536,18 @@ def run(args):
     natural = {id(a): natural_orientation(posture_solvers[a.hand], a.pose.wrist) for a in anchors}
     turned = set()
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
-        for _ in range(COHERENCE_ROUNDS):
+        for round_ in range(COHERENCE_ROUNDS):
             order, jobs = [], []
             for h in 'LR':
                 mine = sorted((a for a in anchors if a.hand == h), key=lambda a: a.time)
                 offsets = [np.zeros(2) if id(a) in turned else natural[id(a)] for a in mine]
                 for a, target in zip(mine, neighbour_targets(mine, offsets)):
                     order.append(a)
-                    jobs.append((h, a.contacts(notes), vector_of(a.pose), a.pose.values, target, ORIENTATION_PULLS,
-                                 max(a.pose.contact_error, .0005)))
-            for a, pose in zip(order, pool.map(_settle, jobs, chunksize=4)):
+                    contacts = a.contacts(notes)
+                    # a stretched hand searched once, in the first round; the next rounds settle from what it found
+                    jobs.append((h, contacts, vector_of(a.pose), a.pose.values, target, ORIENTATION_PULLS,
+                                 max(a.pose.contact_error, .0005), round_ == 0 and stretched(c.pitch for c in contacts)))
+            for a, pose in zip(order, progress_map(pool, _settle, jobs, f'coherence {round_ + 1}/{COHERENCE_ROUNDS}')):
                 if pose is not None:
                     a.pose = pose
                     turned.add(id(a))
@@ -507,26 +568,32 @@ def run(args):
     paths, waypoints = paths_for(anchors), contact_waypoints(anchors, notes)
     samples = np.arange(0., duration, REFINE_STEP)
     intermediate = dropped_snaps = 0
-    for _ in range(REFINE_ROUNDS):
+    for refine_round in range(REFINE_ROUNDS):
+        print(f'[wrist paths] refine round {refine_round + 1}/{REFINE_ROUNDS}', flush=True)
         with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(base, paths=paths, waypoints=waypoints),)) as pool:
             jobs = [(h, c) for h in 'LR' for c in chunks(samples, workers * 2)]
             errors = {h: [] for h in 'LR'}
-            for (h, _), e in zip(jobs, pool.map(_check, jobs)):
+            for (h, _), e in zip(jobs, progress_map(pool, _check, jobs, 'wrist path check')):
                 errors[h].append(e)
             new = []
             for h in 'LR':
                 for t in refine_points(samples, refine_score(np.concatenate(errors[h])), [a for a in anchors if a.hand == h]):
+                    # an idle hand too: its resting fingers lifted clear of the keys
                     held = tuple(n.id for n in hand_notes[h].values() if n.touch <= t <= n.release)
-                    if held:
-                        new.append(Anchor(h, -1, float(t), float(paths[h](t)[0]), (), held))
+                    new.append(Anchor(h, -1, float(t), float(paths[h](t)[0]), (), held))
             if not new:
                 break
             jobs = []
             for a in new:
                 v = paths[a.hand](a.time)
                 values = {notes[k].digit: waypoint(waypoints[k], a.time)[1] for k in a.held if k in waypoints}
-                jobs.append((a.hand, a.contacts(notes), v, values, v, (NEAR_PATH,), REACH_TOLERANCE))
-            poses = list(pool.map(_settle, jobs, chunksize=2))
+                # also from the pose that took these keys: the path between anchors can carry a stretched hand
+                # into another basin (the thumb's joint across the next key)
+                took = max((o for o in anchors if o.hand == a.hand and o.time <= a.time and a.held
+                            and set(a.held) <= set(o.incoming) | set(o.held)), key=lambda o: o.time, default=None)
+                starts = ((vector_of(took.pose), took.pose.values),) if took else ()
+                jobs.append((a.hand, a.contacts(notes), v, values, v, (NEAR_PATH,), REACH_TOLERANCE, False, starts))
+            poses = progress_map(pool, _settle, jobs, 'intermediate poses', 2)
         kept = [replace(a, pose=p) for a, p in zip(new, poses)
                 if p is not None and gentle(a, p, paths[a.hand], [o for o in anchors + new if o.hand == a.hand])]
         dropped_snaps += sum(p is not None for p in poses) - len(kept)
@@ -558,13 +625,13 @@ def run(args):
     context = dict(base, paths=paths, waypoints=waypoints, torso_rows=(torso_rows, first, last), by_pitch=by_pitch)
     with ProcessPoolExecutor(min(workers, 10), initializer=_init, initargs=(context,)) as pool:
         tracks = {'L': {}, 'R': {}}
-        for (h, d), track in pool.map(_track, [(h, d) for h in 'LR' for d in DIGITS]):
+        for (h, d), track in progress_map(pool, _track, [(h, d) for h in 'LR' for d in DIGITS], 'finger tracks'):
             tracks[h][d] = track
     # free fingers after the spacing: a smooth lift where the swing sank them into the keys
     grid = np.arange(0., duration + CLEAR_STEP, CLEAR_STEP)
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(context, tracks=tracks),)) as pool:
         jobs = [(h, part) for h in 'LR' for part in chunks(grid, workers * 2)]
-        parts = list(pool.map(_room, jobs))
+        parts = progress_map(pool, _room, jobs, 'finger room')
     for h in 'LR':
         mine = [p for (hh, _), p in zip(jobs, parts) if hh == h]
         for d in DIGITS:
@@ -579,7 +646,7 @@ def run(args):
         import pickle
         pickle.dump(context, open(args.dump, 'wb'))
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(context,)) as pool:
-        parts = list(pool.map(_frames, chunks(times, workers * CHUNKS_PER_WORKER)))
+        parts = progress_map(pool, _frames, chunks(times, workers * CHUNKS_PER_WORKER), 'frames')
     frames = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
     frames['key_pitches'] = np.array(sorted(by_pitch))
     bridged = despike(frames)
@@ -609,7 +676,7 @@ def run(args):
                        audibly_shortened_notes=len(shortened), band_deficit_db=fidelity,
                        plan_validation_problems=len(problems), score_hands=score_hands(source, final_rows)),
         motion=dict(frames=len(times), rate=FRAME_RATE, anchors=summary([a for a in anchors if a.incoming]),
-                    intermediate_poses=intermediate, intermediate_dropped_snaps=dropped_snaps, idle_hand_yield_mm=yielded, early_releases_for_wrist=freed, bridged_frames=bridged,
+                    refused_chord_fingers=len(forbidden), intermediate_poses=intermediate, intermediate_dropped_snaps=dropped_snaps, idle_hand_yield_mm=yielded, early_releases_for_wrist=freed, bridged_frames=bridged,
                     brushed_keys=brushed,
                     smoothness=smoothness(frames, FRAME_RATE),
                     finger_sideways_at_press=sideways(frames, notes, FRAME_RATE),

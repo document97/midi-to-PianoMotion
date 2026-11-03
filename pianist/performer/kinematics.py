@@ -176,15 +176,18 @@ class Finger:
         b = data['bounds']
         self.lower = np.array([b[k][0] for k in VALUE_NAMES], FLOAT)
         self.upper = np.array([b[k][1] for k in VALUE_NAMES], FLOAT)
+        self.twist = 0.
 
     def root_matrix(self, lateral, lift):
-        """Root bone rotation (3x3) for the swing values: arc(base -> swung axis) @ neutral."""
+        """Root bone rotation (3x3) for the swing values: arc(base -> swung axis) @ neutral, then for the thumb a
+        turn about the swung axis that follows its sideways spread (``twist`` deg per deg)."""
         axis = axis_matrix(self.normal, math.radians(lateral)) @ (axis_matrix(self.lift, math.radians(lift)) @ self.base)
         k = np.cross(self.base, axis)
         sine = math.sqrt(k @ k)
-        if sine < 1e-12:
-            return self.neutral_matrix
-        return axis_matrix(k / sine, math.atan2(sine, float(self.base @ axis))) @ self.neutral_matrix
+        swing = self.neutral_matrix if sine < 1e-12 else             axis_matrix(k / sine, math.atan2(sine, float(self.base @ axis))) @ self.neutral_matrix
+        if self.twist:
+            swing = axis_matrix(axis / np.linalg.norm(axis), math.radians(self.twist * lateral)) @ swing
+        return swing
 
     def local_rotations(self, values):
         """(root quaternion, mcp euler, ip euler) written to the bones."""

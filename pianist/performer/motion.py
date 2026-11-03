@@ -44,7 +44,7 @@ ACCENT_RECOVER = .2              # ... and the wrist is back this long after the
 RIDE_STEADY = 3.                 # deg per unit: a riding finger prefers the previous frame's shape (no flicker
                                  # between near-equal solutions on the piecewise-flat key tops)
 RIDE_SWITCH = .0005              # the fresh solution replaces the warm one only when this much better (m)
-CORRECTION_FADE = .12            # free-time key-clearance and room corrections fade over this next to a stroke (s)
+CORRECTION_FADE = .04            # key-clearance and room corrections fade out over this as a stroke reaches its key (s)
 ANTICIPATE_SECONDS = .06         # a hurried leap sets off this long before the key is released ...
 ARRIVE_LATE_SECONDS = .05        # ... and lands this long after the next touch (within the press)
 DEPART_DELAY = .02               # after the last needed key is released
@@ -59,6 +59,9 @@ RELAX_GAP_SECONDS = .6           # free time after which a finger returns to the
 PREPARE_SECONDS = .22            # a rested finger takes its shape for the next key this long before the stroke
 RETURN_SECONDS = .3              # ... and returns to the relaxed hand within this after a lift
 RIDE_RETRY = .001                # a warm-started ride further than this off its key is solved again from the anchor
+RIDE_SLIP = .004                 # m per unit: a riding pad may slip toward its key's front (soft) rather than wedge its
+                                 # finger between the black keys or across the next one; never back, never sideways
+RIDE_FRONT_KEEP = .008           # ... staying this far behind the key's front edge
 IK_ITERATIONS = 20
 STROKE_CLEAR_STEP = .01          # grid of the strike / lift clearance (s)
 STROKE_CLEAR_FADE = .02          # ... faded out this close to the touch and the release
@@ -75,12 +78,15 @@ SPREAD_ROUNDS = 4                # ... passed on along the hand in this many rou
 SPREAD_SOFTNESS = .0005          # its onset eased over this (m): no pull at the relaxed gap
 CLEAR_STEP = .05                 # free-finger key clearance is solved at this spacing and interpolated (s)
 HOLD_SAMPLES = 3                 # ... each sample then holds the largest correction within this many samples (0.15 s)
+CLEAR_RETRY = .001               # a free finger still this far into the keys after clearing is retried from its relaxed curl (m)
 REFINE_STEP = .04                # contact check spacing along the wrist path (s)
 REFINE_TOLERANCE = .0015         # held-key pad error that calls for an intermediate pose (m) ...
 SIDEWAYS_FREE = {1: 30., 2: 8., 3: 8., 4: 10., 5: 20.}   # deg a finger swings sideways on its key without strain
                                                  # (thumb and little finger spread for an octave, sharing it); coherence
                                                  # prefers less; the thumb does not call for intermediate poses
-REFINE_LATERAL = 7.              # ... or a finger 2..5 swung sideways this far beyond SIDEWAYS_FREE on its key (deg)
+REFINE_LATERAL = 7.              # ... or a finger 2..5 swung sideways this far beyond SIDEWAYS_FREE on its key (deg) ...
+REFINE_FREE = .001               # ... or a free finger this far into the keys, lifted as far as it goes (m): the hand must rise
+REFINE_FREE_NEAR = .15           # a finger counts as free this long after its release and before its touch (s)
 LIFT_LATERAL_KEEP = .35          # a lifted finger lets its sideways swing go to this share, over the free time after
 LIFT_LATERAL_SOON = (.15, .45)   # its lift, when its next stroke is further than this away (s; none when sooner) ...
 LIFT_LATERAL_SECONDS = .2        # ... within at most this (the lift itself is too quick for it)
@@ -432,16 +438,21 @@ class FingerTrack:
     def room_values(self, t, values):
         return values if self.room is None else values + self._taper(t) * self._correction(t, self.room)
 
+    def clear_shift(self, t):
+        """The key-clearance correction at ``t`` (zero on the key)."""
+        return np.zeros(4, dtype=FLOAT) if self.correction is None else self._taper(t) * self._correction(t)
+
     def _taper(self, t):
-        """Free-time corrections fade out next to a stroke, whose own poses are solved clear of the keys:
-        switched off at the hover they snapped the finger into its stroke."""
-        i = np.searchsorted(self.starts, t, side='right')
-        gap = np.inf
-        if i < len(self.strokes):
-            gap = self.strokes[i].hover - t
-        if i > 0:
-            gap = min(gap, t - self.strokes[i - 1].lift_end)
-        return min(1., max(0., gap) / CORRECTION_FADE)
+        """The corrections run through the free time and the strike and lift alike (one smooth curve: a
+        correction switched off where a stroke joins the free time left the finger, still curled from its
+        key, sweeping through the keys behind it) and fade out only as the pad reaches its key."""
+        s = self.stroke(t)
+        if s is None:
+            return 1.
+        if s.touch <= t <= s.release:
+            return 0.
+        gap = s.touch - t if t < s.touch else t - s.release
+        return min(1., gap / CORRECTION_FADE)
 
     def _correction(self, t, correction=None):
         times, deltas, slopes = self.correction if correction is None else correction
@@ -505,11 +516,16 @@ class KeyFloor:
 class KeySurface:
     """The key tops as a continuous surface: the 1 mm key height field (checks.Heightfield), each key
     lowered by its current depth, bilinear between grid nodes. The finger's own key may be entered by
-    ``OWN_KEY_TOLERANCE`` (its pad rests on it)."""
+    ``OWN_KEY_TOLERANCE`` (its pad rests on it). Nodes in the gaps between keys are left out of the blend
+    (weights renormalised over the key nodes): blended in as a floor far below, they hid the skin lying
+    up to a millimetre over a neighbour's edge (a thumb's side on the next white key)."""
+
+    NO_KEY = -1.                    # surface height (m) where no node is on a key: nothing to collide with
 
     def __init__(self, heightfield):
         self.field = heightfield
-        self.top = np.where(np.isfinite(heightfield.top), heightfield.top, -1.)
+        self.on_key = np.isfinite(heightfield.top)
+        self.top = np.where(self.on_key, heightfield.top, self.NO_KEY)
 
     def __call__(self, points, depths, own_pitch):
         return self._surface(points, depths, own_pitch)[0]
@@ -520,16 +536,20 @@ class KeySurface:
         u = (points[:, :2] - f.origin) / CELL
         i = np.clip(np.floor(u).astype(int), 0, np.array(self.top.shape) - 2)
         w = np.clip(u - i, 0., 1.)
-        out, soft = 0., 0.
+        out, soft, total = 0., 0., 0.
         for dx, dy, weight in ((0, 0, (1 - w[:, 0]) * (1 - w[:, 1])), (1, 0, w[:, 0] * (1 - w[:, 1])),
                                (0, 1, (1 - w[:, 0]) * w[:, 1]), (1, 1, w[:, 0] * w[:, 1])):
             ix, iy = i[:, 0] + dx, i[:, 1] + dy
             pitch = f.pitch[ix, iy]
             z = self.top[ix, iy] - np.array([depths.get(int(p), 0.) for p in pitch], dtype=FLOAT)
             z = np.where(pitch == own_pitch, z - OWN_KEY_TOLERANCE, z)
+            weight = weight * self.on_key[ix, iy]
             out = out + weight * z
-            soft = soft + weight * (Heightfield.brushable(pitch, depths, own_pitch) & np.isfinite(f.top[ix, iy]))
-        return out, soft
+            soft = soft + weight * Heightfield.brushable(pitch, depths, own_pitch)
+            total = total + weight
+        keyed = total > 1e-9
+        safe = np.where(keyed, total, 1.)
+        return np.where(keyed, out / safe, self.NO_KEY).astype(FLOAT), np.where(keyed, soft / safe, 0.).astype(FLOAT)
 
     def clearance(self, points, depths, own_pitch, brush=False):
         """Depth of each point below the key surface (0 above it). ``brush``: a finger holding ``own_pitch``
@@ -675,13 +695,15 @@ class FingerIK:
         self.spacing = Spacing(solver)
 
     def ride(self, digit, palm, target, seed, depths, own_pitch, start=None, brush=False):
-        """Pad on its (moving) key point, the finger's sides kept out of the neighbouring keys. ``start``
-        (the previous frame's values) keeps a finger strained against its limits on one solution."""
+        """Pad on its (moving) key point, the finger's sides kept out of the neighbouring keys: where they would
+        sink, the pad slips along its key toward the front (``RIDE_SLIP``) instead. ``start`` (the previous
+        frame's values) keeps a finger strained against its limits on one solution."""
         if self.surface is None:
             return self.solve(digit, palm, target, seed)
         finger = self.solver.rig.fingers[self.solver.hand][digit]
         values = {d: RELAXED[d] for d in DIGITS}
         seed = np.asarray(seed, FLOAT)
+        front = self.solver.regions.keys[own_pitch]['bounds_min'][1] + RIDE_FRONT_KEEP
 
         def residual(v):
             values[digit] = v
@@ -689,15 +711,20 @@ class FingerIK:
             skin = (palm @ self.solver.local_clearance(digit, values))[:3].T
             below = self.surface.clearance(skin, depths, own_pitch, brush=brush) / FLOOR_SCALE
             steady = (v - start) / RIDE_STEADY if start is not None else np.zeros(0, dtype=FLOAT)
-            return np.r_[(point - target) / .0002, (v - seed) / IK_VALUE_SCALE, below,
-                         pad_residual(self.solver, digit, v, palm), steady]
+            off = point - target
+            slip = off[1] < 0.             # toward the key's front: the pad holds the key all along its length
+            along = off[1] / (RIDE_SLIP if slip else .0002)
+            return np.r_[off[0] / .0002, along, off[2] / .0002, max(0., front - point[1]) / .0002,
+                         (v - seed) / IK_VALUE_SCALE, below, pad_residual(self.solver, digit, v, palm), steady]
 
         def run(x0):
             x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, finger.lower, finger.upper),
                                                    finger.lower, finger.upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
             values[digit] = x
             point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
-            return x, float(np.linalg.norm(point - target))
+            off = point - target
+            off[1] = max(off[1], front - point[1], 0.) if off[1] < 0. else off[1]   # a slip toward the front is no miss
+            return x, float(np.linalg.norm(off))
 
         x, error = run(seed if start is None else start)
         if start is not None and error > RIDE_RETRY:
@@ -728,8 +755,18 @@ class FingerIK:
         # here would be undone by it, back onto a black key).
         lower, upper = finger.lower.copy(), finger.upper.copy()
         lower[0] = upper[0] = np.clip(start[0], finger.lower[0], finger.upper[0])
-        x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(start, lower, upper), lower, upper, np.full(4, 1e-2, dtype=FLOAT),
-                                               IK_ITERATIONS)
+
+        def run(x0):
+            x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, lower, upper), lower, upper, np.full(4, 1e-2, dtype=FLOAT),
+                                                   IK_ITERATIONS)
+            return x, float(np.sum(residual(x) ** 2))
+
+        x, cost = run(start)
+        if self.below_floor(digit, {**others, digit: x}, palm, lowered).max() > CLEAR_RETRY / FLOOR_SCALE:
+            # a curled finger lifting from its own shape can hook its tip into the key: try from the relaxed curl
+            y, other = run(np.r_[start[0], RELAXED[digit][1:]])
+            if other < cost:
+                x = y
         return x
 
     def solve(self, digit, palm, target, seed, lowered=None):
@@ -804,18 +841,24 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
     else:
         keyposes = [Keypose(0., relaxed)]
     track = FingerTrack(mine, keyposes)
-    # Free time: the keyposed values may let the skin dip into the keys under a moving wrist. The
-    # smallest lift is solved on a coarse grid and interpolated, so the correction is smooth in time.
-    times = np.arange(path.times[0], path.times[-1] + CLEAR_STEP, CLEAR_STEP)
-    deltas = np.zeros((len(times), 4), dtype=FLOAT)
-    for i, t in enumerate(times):
-        if track.stroke(t) is None:
-            base = track.keyposed(t)
-            deltas[i] = ik.clear(digit, solver.palm(*_split(path(t))), base) - base
-    track.set_correction(times, deltas)
     if ik.surface is not None:
         for s in mine:
             stroke_clearance(s, notes[s.note].pitch, digit, path, solver, ik, notes)
+    # Off the key (free time, strike, lift): the values may let the skin dip into the keys under a moving
+    # wrist. The smallest lift is solved on a coarse grid and interpolated, so the correction is smooth in
+    # time; in a stroke the key floor is lowered toward its key as for the stroke's own poses.
+    times = np.arange(path.times[0], path.times[-1] + CLEAR_STEP, CLEAR_STEP)
+    deltas = np.zeros((len(times), 4), dtype=FLOAT)
+    for i, t in enumerate(times):
+        s = track.stroke(t)
+        if s is None:
+            base, lowered = track.keyposed(t), 0.
+        elif s.touch <= t <= s.release:
+            continue
+        else:
+            base, lowered = s.values(t), stroke_floor(s, notes[s.note], t)
+        deltas[i] = ik.clear(digit, solver.palm(*_split(path(t))), base, lowered) - base
+    track.set_correction(times, deltas)
     return track
 
 
@@ -920,6 +963,7 @@ def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previ
                 # the lift leaves from where the ride ended (its own solution), not the solved release shape
                 x = (t - s.release) / max(s.lift_end - s.release, 1e-6)
                 values[d] = values[d] + (previous[d][1] - s.poses[2]) * (1. - ease(x))
+            values[d] = values[d] + tracks[d].clear_shift(t)
             continue
         target, seed = stroke_target(s, notes[s.note], waypoints[s.note], t, path)
         if depths is None:
@@ -932,12 +976,14 @@ def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previ
             if previous is not None:
                 previous[d] = (s.note, values[d])
         error = max(error, e)
-    playing = {d for d in DIGITS if tracks[d].stroke(t) is not None}
+    # The smooth corrections were sampled on other shapes (a neighbouring sample held, a stroke's curl):
+    # added to this one they may pass the joint limits.
+    fingers = solver.rig.fingers[solver.hand]
+    values = {d: np.clip(v, fingers[d].lower, fingers[d].upper) for d, v in values.items()}
     room = ik.spacing.make_room(values, {d: give_way(tracks[d].stroke(t), t) for d in DIGITS})
     if apply_room:
         for d in DIGITS:
-            if d not in playing:
-                room[d] = tracks[d].room_values(t, room[d])
+            room[d] = np.clip(tracks[d].room_values(t, room[d]), fingers[d].lower, fingers[d].upper)   # zero on the key (FingerTrack._taper)
     return vector, room, error
 
 
@@ -964,30 +1010,45 @@ def room_corrections(times, path, tracks, notes, waypoints, solver, ik):
         vector, room, _ = frame_hand(t, path, tracks, notes, waypoints, solver, ik, apply_room=False)
         palm = solver.palm(*_split(vector))
         for d in DIGITS:
-            if tracks[d].stroke(t) is None:
+            s = tracks[d].stroke(t)
+            if s is None:
                 deltas[d][i] = ik.clear(d, palm, room[d]) - room[d]
+            elif not s.touch <= t <= s.release:
+                deltas[d][i] = ik.clear(d, palm, room[d], stroke_floor(s, notes[s.note], t)) - room[d]
     return deltas
 
 
 def contact_error(t, path, notes, waypoints, solver, ik):
     """Over the keys this hand holds at ``t`` (the ride only): (worst pad error, worst sideways swing of a
-    finger 2..5 beyond its SIDEWAYS_FREE, degrees)."""
+    finger 2..5 beyond its SIDEWAYS_FREE, degrees, worst depth of a free finger in the keys after its own
+    clearance, metres)."""
     palm = solver.palm(*_split(path(t)))
-    worst, swing = 0., 0.
+    worst, swing, sunk = 0., 0., 0.
+    busy = set()
     for n in notes.values():
+        if n.touch - REFINE_FREE_NEAR <= t <= n.release + REFINE_FREE_NEAR:
+            busy.add(n.digit)
         if n.touch <= t <= n.release and n.id in waypoints:
             top, seed = waypoint(waypoints[n.id], t, path)
             values, e = ik.solve(n.digit, palm, top - np.array([0., 0., n.depth(t)], dtype=FLOAT), seed)
             worst = max(worst, e)
             if n.digit != 1:
                 swing = max(swing, abs(float(values[0])) - SIDEWAYS_FREE[n.digit])
-    return worst, swing
+    fingers = solver.rig.fingers[solver.hand]
+    for d in DIGITS:
+        if d not in busy:
+            lifted = np.r_[RELAXED[d][0], fingers[d].upper[1], RELAXED[d][2:]]
+            if not ik.below_floor(d, {**RELAXED, d: lifted}, palm, 0.).any():
+                continue                    # lifted all the way it clears: no need to solve how little will do
+            values = {**RELAXED, d: ik.clear(d, palm, RELAXED[d])}
+            sunk = max(sunk, float(ik.below_floor(d, values, palm, 0.).max()) * FLOOR_SCALE)
+    return worst, swing, sunk
 
 
 def refine_score(errors):
-    """``contact_error`` samples (n, 2) -> how far past what calls for an intermediate pose (> 1)."""
+    """``contact_error`` samples (n, 3) -> how far past what calls for an intermediate pose (> 1)."""
     errors = np.asarray(errors, FLOAT)
-    return np.maximum(errors[:, 0] / REFINE_TOLERANCE, errors[:, 1] / REFINE_LATERAL)
+    return np.maximum.reduce([errors[:, 0] / REFINE_TOLERANCE, errors[:, 1] / REFINE_LATERAL, errors[:, 2] / REFINE_FREE])
 
 
 def refine_points(times, scores, anchors):

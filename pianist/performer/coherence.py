@@ -11,6 +11,8 @@ intermediate pose). A few Jacobi rounds over all anchors run in parallel.
 identical (``pedal_release``), when the wrist would otherwise have to rush to its
 next position. The audio does not change.
 """
+import math
+
 import numpy as np
 
 from .checks import stretched
@@ -34,11 +36,12 @@ NEUTRAL_ORIENTATION = np.array([15., 12.], dtype=FLOAT)               # weak pul
 POSITION_TRAVEL = .05
 PALM_HEIGHT = .045              # the wrist at least this far above the white key tops while playing (m): the palm
 PALM_SCALE = .004               # stays off the keys and the fingers reach down arched (m per unit, one-sided)
-CENTRE_SCALE = .002             # pad pulled toward its key's centre line (m per unit): the finger's sides stay off the neighbours
+CENTRE_SCALE = .001             # pad pulled toward its key's centre line (m per unit): the finger's sides stay off the neighbours
 
 
-def settle(solver, contacts, vector, values, target, pull, iterations=25):
-    """Pose keeping ``contacts`` with the wrist pulled toward ``target`` (x, y, z, yaw, roll).
+def settle(solver, contacts, vector, values, target, pull, iterations=25, front=None):
+    """Pose keeping ``contacts`` with the wrist pulled toward ``target`` (x, y, z, yaw, roll); ``front``: white-key
+    pads preferably within this of their key's front edge (m) instead of ``WHITE_FRONT_CLEAR`` before the black keys.
 
     The contact fingers' skin stays above the key tops, seen as a continuous surface (``KeySurface``,
     bilinear), so a finger pressing a white key rises over the black keys behind it, raising the
@@ -62,7 +65,7 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25):
     stretch = stretched(depths)
     vals = dict(values)
     natural = natural_orientation(solver, vector[:3])
-    free_digits = [d for d in DIGITS if d != 1 and d not in digits]     # the thumb hangs below by design
+    free_digits = [d for d in DIGITS if d not in digits]
 
     def unpack(v):
         for i, d in enumerate(digits):
@@ -78,9 +81,18 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25):
             out.append([(point[0] - solver.regions.centre(c.pitch)[0]) / CENTRE_SCALE])
             if not solver.regions.is_black(c.pitch):
                 # a white key played close to the black keys catches their corners with the fingertip's sides
-                edge = solver.regions.black_front - WHITE_FRONT_CLEAR
+                edge = (solver.regions.black_front - WHITE_FRONT_CLEAR if front is None
+                        else solver.regions.keys[c.pitch]['bounds_min'][1] + front)
                 out.append([max(0., point[1] - edge) / WHITE_FRONT_SCALE])
+            else:
+                # a black key pressed at its very front edge: the pad slips off it, and its short travel is lost
+                edge = solver.regions.keys[c.pitch]['bounds_min'][1] + BLACK_FRONT_IN
+                out.append([max(0., edge - point[1]) / BLACK_FRONT_SCALE])
             out.append(pad_residual(solver, c.digit, vals[c.digit], palm))
+            if c.digit == 1:
+                # the thumb's last phalanx runs along its key (it plays with the side of its tip at the key's front);
+                # lying across, its joint rides over the next key and sinks into it as the key goes down
+                out.append([thumb_tip_angle(solver, vals, palm) / THUMB_TIP_SCALE])
             if surface is not None:
                 skin = (palm @ solver.local_clearance(c.digit, vals))[:3].T
                 out.append(surface.clearance(skin, depths, c.pitch, brush=stretch) / FLOOR_SCALE)
@@ -88,7 +100,7 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25):
             # Room for the fingers not on a key: lifted (as far as a free finger lifts) they clear the keys,
             # so a hand rolled or lowered onto its little-finger side comes back up.
             for d in free_digits:
-                skin = (palm @ solver.local_clearance(d, {**vals, d: FREE_LIFTED}))[:3].T
+                skin = (palm @ solver.local_clearance(d, {**vals, d: FREE_LIFTED[d != 1]}))[:3].T
                 out.append(np.maximum(0., surface(skin, depths, None) - skin[:, 2]) / FREE_CLEAR_SCALE)
         out.append(_order(solver, contacts, vals))
         out.append(np.array([vals[c.digit][0] / (THUMB_LATERAL_SCALE if c.digit == 1 else LATERAL_SCALE) for c in contacts], dtype=FLOAT))
@@ -114,11 +126,91 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25):
                     error, error <= CONTACT_TOLERANCE * 2.5, used, targets, clearance)
 
 
-FREE_LIFTED = np.array([0., 20., 20., 10.], dtype=FLOAT)   # a free finger lifted clear of the keys (lateral, lift, PIP, DIP)
+FREE_LIFTED = (np.array([0., 20., 8., 8.], dtype=FLOAT),     # a free thumb and finger lifted clear of the keys
+               np.array([0., 20., 20., 10.], dtype=FLOAT))   # (lateral, lift, PIP, DIP)
 FREE_CLEAR_SCALE = .002         # m per unit: its skin below the key tops
 WHITE_FRONT_CLEAR = .012        # white-key pads preferably this far in front of the black keys ...
 WHITE_FRONT_SCALE = .002        # ... m per unit (soft: a chord may still need them further in)
+BLACK_FRONT_IN = .012           # black-key pads preferably this far behind the black key's front ...
+BLACK_FRONT_SCALE = .002        # ... m per unit (soft, like WHITE_FRONT_CLEAR)
+THUMB_TIP_SCALE = 10.          # deg per unit: the thumb's last phalanx off its key's long axis
 ORDER_SCALE = .002              # m per unit: chord fingers 2..5 keep their order across the palm
+
+
+WIDE_STARTS = [np.array([0., dy, dz, dyaw, 0.], dtype=FLOAT)    # wrist starts tried for a stretched hand: back from the
+               for dy in (0., -.02, -.04) for dz in (0., -.015, -.03) for dyaw in (-10., 0., 10.)]   # keys, lower, turned
+WIDE_START_PULL = np.array([.005, .005, .005, 3., 3.], dtype=FLOAT)   # m, deg per unit: the wrist taken to a start
+WIDE_FRONT = .012               # ... each also with its white-key pads near the key's front edge (an octave's thumb and
+                                # little finger play the front of their keys: the hand's widest span is at the fingertips)
+WIDE_COARSE_ITERATIONS = 15     # every start is taken this far and scored (its rank barely changes after) ...
+WIDE_KEEP = 3                   # ... and the best few settled fully
+WIDE_ITERATIONS = 60
+THUMB_SINK_WEIGHT = 2.          # the thumb's side lying on the next key reads worst
+WIDE_CLEAN = 1.                 # mm: a stretched hand whose plain settle sinks no deeper than this is not searched
+
+
+def sunk(solver, contacts, pose):
+    """Per contact: mm its finger's skin sinks into keys other than its own."""
+    palm = solver.palm(pose.wrist, pose.yaw, pose.roll)
+    depths = {c.pitch: c.depth for c in contacts}
+    out = []
+    for c in contacts:
+        skin = (palm @ solver.local_clearance(c.digit, pose.values))[:3].T
+        out.append(float(solver.heightfield.penetration(skin, depths, (c.pitch, np.ones(len(skin), bool))).max(initial=0.)) * 1000)
+    return out
+
+
+def sink(solver, contacts, pose):
+    """Score of a pose: mm the contact fingers' skin sinks into keys other than their own (the thumb's weighted),
+    plus a tenth of the thumb's last phalanx angle off its key (deg)."""
+    score = sum(mm * (THUMB_SINK_WEIGHT if c.digit == 1 else 1.) for c, mm in zip(contacts, sunk(solver, contacts, pose)))
+    if any(c.digit == 1 for c in contacts):
+        score += abs(thumb_tip_angle(solver, pose.values, solver.palm(pose.wrist, pose.yaw, pose.roll))) / 10
+    return score
+
+
+def inner(contacts):
+    """Indices of the contacts between the chord's lowest and highest key: the fingers the hand's span leaves free
+    to choose (the outer two set the span)."""
+    if len(contacts) < 3:
+        return []
+    pitches = [c.pitch for c in contacts]
+    return [i for i, p in enumerate(pitches) if min(pitches) < p < max(pitches)]
+
+
+def wide_settle(solver, contacts, vector, values, target, pull, limit):
+    """``settle`` for a stretched hand (``stretched``: an octave). The local solve stays in the basin it starts in, and
+    a wide hand has several: the thumb's joint lying across the next key, or the wrist back and low with the thumb
+    along its key. Settle from each of ``WIDE_STARTS`` (and near the keys' front edge), then toward ``target``; keep
+    the pose within ``limit`` whose fingers sink least (``sink``), else the closest. Every start is scored after
+    ``WIDE_COARSE_ITERATIONS``; the ``WIDE_KEEP`` best go on. A plain settle that sinks nowhere (``WIDE_CLEAN``) is
+    kept without the search. None without a heightfield."""
+    if solver.heightfield is None:
+        return None
+    vector = np.asarray(vector, FLOAT)
+    plain = settle(solver, contacts, vector, values, target, pull)
+    if plain.contact_error <= limit and max(sunk(solver, contacts, plain)) <= WIDE_CLEAN:
+        return plain                     # nothing sinks where it starts: no other basin to look for
+    coarse = []
+    for front in (None, WIDE_FRONT):
+        for start in WIDE_STARTS:
+            p = settle(solver, contacts, vector, values, vector + start, WIDE_START_PULL, WIDE_COARSE_ITERATIONS, front)
+            coarse.append((sink(solver, contacts, p), front, p))
+    coarse.sort(key=lambda c: c[0])
+    return least_sunk(solver, contacts, [settle(solver, contacts, vector_of(p), p.values, target, pull, WIDE_ITERATIONS, front)
+                                         for _, front, p in coarse[:WIDE_KEEP]], limit)
+
+
+def least_sunk(solver, contacts, poses, limit):
+    """Of ``poses``, the one within ``limit`` whose fingers sink least (``sink``), else the closest."""
+    return min(poses, key=lambda p: (0, sink(solver, contacts, p)) if p.contact_error <= limit else (1, p.contact_error))
+
+
+def thumb_tip_angle(solver, values, palm):
+    """Top-view angle (deg) between the thumb's last bone and the keys' long axis."""
+    name = solver.rig.fingers[solver.hand][1].names[-1]
+    y = (palm @ solver.rig.bone_matrices(solver.hand, solver.identity, values, [name])[name])[:3, 1]
+    return math.degrees(math.atan2(y[0], y[1]))
 
 
 def lateral_hinge(digits, values):

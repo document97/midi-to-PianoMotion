@@ -53,6 +53,11 @@ PERFORMER_SEATING = (0., -.03, .145)
 # hand holds them. The character is scaled about the middle of the bench top so it stays seated; the feet move with
 # the scale, and so does the footrest (blender_main then refits bench and footrest: performer.staging).
 CHARACTER_SCALE = 1.05
+# Uniform scale of both hands about the wrist joints, on top of CHARACTER_SCALE: the model's hands are small for its
+# height (wrist to middle fingertip 15.0 cm at 1.60 m, a real hand about 17 cm) and its white-key octaves landed on the
+# key edges. Set on the wrist pose bones, so the fingers follow and the skin the wrist shares with the forearm blends
+# from 1 to this over the wrist.
+HAND_SCALE = 1.12
 
 
 def scaled_seat(arm, cal, offset):
@@ -92,6 +97,18 @@ def character():
     return arms[0], max(skins, key=lambda o: len(o.data.vertices))
 
 
+def scaled_hands(arm):
+    """Scale both wrist pose bones by HAND_SCALE (before the arm drivers read the wrist's world scale)."""
+    root = arm.parent or arm
+    if 'performer_hand_scale' in root:
+        if abs(root['performer_hand_scale'] - HAND_SCALE) > 1e-9:
+            raise ValueError('Scene already has a different hand scale')
+        return
+    for s in SIDE.values():
+        arm.pose.bones[s + '手首'].scale = (HAND_SCALE,) * 3
+    root['performer_hand_scale'] = HAND_SCALE
+
+
 def neutral_scene(cal):
     """The bake's neutral state (setup()), without HandModel / mesh clearance objects, on the performer's seat."""
     (arm, skin), scene = character(), bpy.context.scene
@@ -99,6 +116,7 @@ def neutral_scene(cal):
     keyboard = measured_keyboard()
     cal = dict(cal, ergonomics=dict(cal.get('ergonomics', {}), world_root_offset=list(PERFORMER_SEATING)))
     cal = scaled_seat(arm, cal, PERFORMER_SEATING)
+    scaled_hands(arm)
     apply_seating(arm, cal)
     remove_curves(arm, lambda c: any('"' + s in c.data_path for s in ARM_CHANNELS))
     for h, s in SIDE.items():

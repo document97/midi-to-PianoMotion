@@ -85,6 +85,7 @@ class HandState:
     pin_release: float = -INF    # latest lift of a key that pinned the pose since last_touch
     held: tuple = ()
     last_finger_use: tuple = ()  # ((finger, pitch, touch), ...): each finger's latest key
+    last_release: tuple = ()     # ((finger, pitch, lift), ...): each finger's latest key let go, and when
     last_crossing: float = -INF  # touch of the hand's latest thumb crossing
 
     def signature(self):
@@ -132,9 +133,10 @@ def initial_state():
 
 class Planner:
     def __init__(self, score, instrument, weights=Weights(), beam_width=48, finger_options=4, model=None,
-                 outer_voice_bonus=1., pair_table=None):
+                 outer_voice_bonus=1., pair_table=None, forbidden=()):
         """``pair_table``: two-finger feasibility of the animated rig (performer.reach_table); without it
-        the fixed-palm screens are used."""
+        the fixed-palm screens are used. ``forbidden``: (note, hand, finger) the animated hand cannot shape
+        cleanly within its chord (performer.pipeline.squeezed_fingers), never chosen."""
         self.score, self.w = score, weights
         outer = score.outer_voice_notes()
         self.voice_scale = [outer_voice_bonus if i in outer else 1. for i in range(len(score.notes))]
@@ -142,6 +144,7 @@ class Planner:
                                else GeometricHandModel(instrument))
         self.beam_width, self.finger_options = beam_width, finger_options
         self.split = hand_split_pitches(score)
+        self.forbidden = frozenset(forbidden)
         self.last_reason = None
 
     def _reject(self, reason):
@@ -198,6 +201,8 @@ class Planner:
     def evaluate_hand(self, hand, hs, group, notes, fingers):
         """HandOption for ``hand`` playing ``notes`` with ``fingers``; None if infeasible."""
         score, w, model = self.score, self.w, self.model
+        if self.forbidden and any((n, hand, f) in self.forbidden for n, f in zip(notes, fingers)):
+            return self._reject('forbidden_shape')
         touch = group.touch
         deadline = group.start - MINIMUM_DOWNSTROKE_SECONDS
         incoming = [(f, score.notes[n].pitch) for n, f in zip(notes, fingers)]
@@ -236,7 +241,9 @@ class Planner:
                           last_crossing=touch if crossed else hs.last_crossing,
                           held=tuple(sorted(kept + new_held, key=lambda h: (h.finger, h.pitch))),
                           last_finger_use=tuple(sorted({**{u[0]: u for u in hs.last_finger_use},
-                                                        **{f: (f, p, touch) for f, p in incoming}}.values())))
+                                                        **{f: (f, p, touch) for f, p in incoming}}.values())),
+                          last_release=tuple(sorted({**{u[0]: u for u in hs.last_release},
+                                                     **{h.finger: (h.finger, h.pitch, r) for h, (_, r) in zip(lifted, releases)}}.values())))
         return HandOption(cost, state, tuple(releases), tuple(fingers))
 
     def _shape_cost(self, hand, hs, group, kept, incoming):
@@ -355,7 +362,8 @@ class Planner:
         """Metres the left hand's finger range reaches past the right hand's (0 when apart)."""
         edges = []
         for hs, sign in ((left, 1.), (right, -1.)):
-            keys = [(h.finger, h.pitch) for h in hs.held] +                    [(f, p) for f, p, t in hs.last_finger_use if t >= touch - HANDS_NEAR_SECONDS]
+            # a key let go is near for a while after its lift, however long ago it was struck
+            keys = [(h.finger, h.pitch) for h in hs.held] +                    [(f, p) for f, p, t in hs.last_finger_use + hs.last_release if t >= touch - HANDS_NEAR_SECONDS]
             if not keys:
                 return 0.
             inner = [self.model.key_center(p) + sign * ((f - 1) * self.w.finger_spacing + HAND_EDGE) for f, p in keys]

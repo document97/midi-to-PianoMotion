@@ -19,6 +19,7 @@ import numpy as np
 from planner.music import KEY_RETURN_SECONDS
 
 from .pose import Contact
+from .progress import progress_map
 
 REACH_TOLERANCE = .0025         # contact error above which a held key is lifted early (the frame follower absorbs less)
 STRAIN_SWING = 18.              # contact finger sideways swing (deg) above which a silent lift frees the hand
@@ -161,7 +162,7 @@ def solve_anchors(anchors, notes, rig_path, workers, max_rounds=6):
         pending = list(range(len(anchors)))
         for _ in range(max_rounds):
             jobs = [(anchors[i].hand, anchors[i].contacts(notes), anchors[i].x_hint) for i in pending]
-            for i, pose in zip(pending, pool.map(_solve, jobs, chunksize=4)):
+            for i, pose in zip(pending, progress_map(pool, _solve, jobs, 'anchor poses', 4)):
                 anchors[i].pose = pose
             failed = [i for i in pending if anchors[i].held and anchors[i].pose.contact_error > REACH_TOLERANCE]
             strained = [i for i in pending if anchors[i].held and i not in failed and strain(anchors[i].pose) > STRAIN_SWING]
@@ -185,7 +186,7 @@ def solve_anchors(anchors, notes, rig_path, workers, max_rounds=6):
             jobs = [(anchors[i].hand, replace(anchors[i], held=keep).contacts(notes), anchors[i].x_hint)
                     for _, _, i, _, keep, _ in options]
             chosen = {}
-            for option, pose in zip(options, pool.map(_solve, jobs, chunksize=4)):
+            for option, pose in zip(options, progress_map(pool, _solve, jobs, 'anchor repairs', 4)):
                 i = option[2]
                 relieved = i in failed or strain(pose) < strain(anchors[i].pose) - 3.
                 if pose.contact_error <= REACH_TOLERANCE and relieved and i not in chosen:
