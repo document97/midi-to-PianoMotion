@@ -177,6 +177,7 @@ class Finger:
         self.lower = np.array([b[k][0] for k in VALUE_NAMES], FLOAT)
         self.upper = np.array([b[k][1] for k in VALUE_NAMES], FLOAT)
         self.twist = 0.
+        self._matrices = {}
 
     def root_matrix(self, lateral, lift):
         """Root bone rotation (3x3) for the swing values: arc(base -> swung axis) @ neutral, then for the thumb a
@@ -195,7 +196,18 @@ class Finger:
         return mat3_q(self.root_matrix(lateral, lift)), child_euler(self.row, 0, mcp), child_euler(self.row, 1, ip)
 
     def local_matrices(self, values):
-        """Bone matrices relative to the wrist bone's pose matrix."""
+        """Bone matrices relative to the wrist bone's pose matrix (kept per exact ``values``: a solver's difference
+        steps move one finger at a time and ask for its neighbours' unchanged ones again). Read-only."""
+        array = np.asarray(values)
+        key = (array.dtype.str, array.tobytes(), self.twist)
+        hit = self._matrices.get(key)
+        if hit is None:
+            if len(self._matrices) > 20000:
+                self._matrices.clear()
+            hit = self._matrices[key] = self._local_matrices(values)
+        return hit
+
+    def _local_matrices(self, values):
         lateral, lift, mcp, ip = values
         m0 = self.pre @ compose(self.root_loc, self.root_matrix(lateral, lift), self.root_scale)
         m1 = m0 @ self.links[0] @ compose(self.child_loc[0], euler_xyz_matrix(child_euler(self.row, 0, mcp)),

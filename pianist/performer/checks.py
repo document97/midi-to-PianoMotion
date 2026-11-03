@@ -16,6 +16,14 @@ import numpy as np
 
 from .kinematics import FLOAT
 
+
+def depth_table(depths):
+    """{pitch: key depth} as an array indexed by pitch (0 where absent): the pitch grid looks it up at once."""
+    table = np.zeros(128)
+    for p, d in depths.items():
+        table[p] = d
+    return table
+
 CELL = .001
 OWN_KEY_TOLERANCE = .0008
 BRUSH_DEPTH = .003               # deepest silent push of an unplayed key by a finger resting on it (m)
@@ -74,7 +82,7 @@ class Heightfield:
         ix, iy = idx[ok, 0], idx[ok, 1]
         top = self.top[ix, iy]
         pitch = self.pitch[ix, iy]
-        lowered = top - np.array([depths.get(int(p), 0.) for p in pitch], dtype=FLOAT)
+        lowered = top - depth_table(depths)[pitch].astype(FLOAT)
         pen = np.where(np.isfinite(top), lowered - points[ok, 2], 0.)
         if own is not None:
             own_pitch, mask = own
@@ -87,7 +95,9 @@ class Heightfield:
 
     @staticmethod
     def brushable(pitch, depths, own_pitch):
-        return (pitch != own_pitch) & np.array([depths.get(int(p), 0.) <= 0. for p in pitch], dtype=bool)
+        """``depths``: {pitch: depth} or its ``depth_table``."""
+        table = depths if isinstance(depths, np.ndarray) else depth_table(depths)
+        return (pitch != own_pitch) & (table[pitch] <= 0.)
 
     def split(self, points, depths, own_pitch):
         """For a finger holding ``own_pitch``: (penetration per point of keys it may not brush,
@@ -98,7 +108,7 @@ class Heightfield:
         wanted = {}
         ix, iy = idx[ok, 0], idx[ok, 1]
         top, pitch = self.top[ix, iy], self.pitch[ix, iy]
-        lowered = top - np.array([depths.get(int(p), 0.) for p in pitch], dtype=FLOAT)
+        lowered = top - depth_table(depths)[pitch].astype(FLOAT)
         pen = np.where(np.isfinite(top), lowered - points[ok, 2], 0.)
         pen = np.where(pitch == own_pitch, pen - OWN_KEY_TOLERANCE, pen)
         pen = np.maximum(pen, 0.)

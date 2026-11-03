@@ -26,7 +26,7 @@ import numpy as np
 from planner.music import KEY_RETURN_SECONDS
 
 from .anchors import KEY_TRAVEL, ease, lift_profile
-from .checks import CELL, OWN_KEY_TOLERANCE, Heightfield, brushed, stretched
+from .checks import CELL, OWN_KEY_TOLERANCE, Heightfield, brushed, depth_table, stretched
 from .kinematics import DIGITS, FLOAT
 from .pose import RELAXED, PoseSolver
 
@@ -521,32 +521,47 @@ class KeySurface:
     up to a millimetre over a neighbour's edge (a thumb's side on the next white key)."""
 
     NO_KEY = -1.                    # surface height (m) where no node is on a key: nothing to collide with
+    CORNERS = np.array([[0, 0], [1, 0], [0, 1], [1, 1]])
 
     def __init__(self, heightfield):
         self.field = heightfield
         self.on_key = np.isfinite(heightfield.top)
         self.top = np.where(self.on_key, heightfield.top, self.NO_KEY)
+        self._memo = {}
 
     def __call__(self, points, depths, own_pitch):
         return self._surface(points, depths, own_pitch)[0]
 
     def _surface(self, points, depths, own_pitch):
-        """(surface height, share of it on keys a finger holding ``own_pitch`` may brush)."""
+        """(surface height, share of it on keys a finger holding ``own_pitch`` may brush), read-only. Kept per exact
+        input: a solver's difference step that moves one finger leaves the other fingers' skin where it was."""
+        points = np.asarray(points)
+        key = (points.dtype.str, points.shape, points.tobytes(), tuple(sorted(depths.items())), own_pitch)
+        hit = self._memo.get(key)
+        if hit is None:
+            if len(self._memo) > 4096:
+                self._memo.clear()
+            hit = self._memo[key] = self._compute(points, depths, own_pitch)
+            for a in hit:
+                a.setflags(write=False)
+        return hit
+
+    def _compute(self, points, depths, own_pitch):
         f = self.field
         u = (points[:, :2] - f.origin) / CELL
         i = np.clip(np.floor(u).astype(int), 0, np.array(self.top.shape) - 2)
         w = np.clip(u - i, 0., 1.)
-        out, soft, total = 0., 0., 0.
-        for dx, dy, weight in ((0, 0, (1 - w[:, 0]) * (1 - w[:, 1])), (1, 0, w[:, 0] * (1 - w[:, 1])),
-                               (0, 1, (1 - w[:, 0]) * w[:, 1]), (1, 1, w[:, 0] * w[:, 1])):
-            ix, iy = i[:, 0] + dx, i[:, 1] + dy
-            pitch = f.pitch[ix, iy]
-            z = self.top[ix, iy] - np.array([depths.get(int(p), 0.) for p in pitch], dtype=FLOAT)
-            z = np.where(pitch == own_pitch, z - OWN_KEY_TOLERANCE, z)
-            weight = weight * self.on_key[ix, iy]
-            out = out + weight * z
-            soft = soft + weight * Heightfield.brushable(pitch, depths, own_pitch)
-            total = total + weight
+        table = depth_table(depths)
+        # the four grid corners at once (rows), summed in corner order
+        ix = i[:, 0] + self.CORNERS[:, :1]
+        iy = i[:, 1] + self.CORNERS[:, 1:]
+        weight = np.stack(((1 - w[:, 0]) * (1 - w[:, 1]), w[:, 0] * (1 - w[:, 1]), (1 - w[:, 0]) * w[:, 1], w[:, 0] * w[:, 1]))
+        pitch = f.pitch[ix, iy]
+        z = self.top[ix, iy] - table[pitch].astype(FLOAT)
+        z = np.where(pitch == own_pitch, z - OWN_KEY_TOLERANCE, z)
+        weight = weight * self.on_key[ix, iy]
+        wz, ws = weight * z, weight * Heightfield.brushable(pitch, table, own_pitch)
+        out, soft, total = ((wz[0] + wz[1]) + wz[2]) + wz[3], ((ws[0] + ws[1]) + ws[2]) + ws[3], ((weight[0] + weight[1]) + weight[2]) + weight[3]
         keyed = total > 1e-9
         safe = np.where(keyed, total, 1.)
         return np.where(keyed, out / safe, self.NO_KEY).astype(FLOAT), np.where(keyed, soft / safe, 0.).astype(FLOAT)
