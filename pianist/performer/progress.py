@@ -1,4 +1,5 @@
 """Live progress of the long parallel stages: the log shows a slow stage while it runs, not only in the report."""
+import copy
 import time
 
 EVERY_SHARE = .1                 # a line at every tenth of the jobs ...
@@ -10,9 +11,17 @@ def _clock(seconds):
     return f'{m}m{s:02d}s'
 
 
-def progress_map(pool, fn, jobs, label, chunksize=1):
-    """``pool.map(fn, jobs)`` as a list, logging done/total, elapsed and the time left."""
+def progress_map(pool, fn, jobs, label, chunksize=1, cache=None, key=None):
+    """``pool.map(fn, jobs)`` as a list, logging done/total, elapsed and the time left. With a ``cache`` dict,
+    jobs whose ``key(job)`` is in it are not run again (``fn`` must be deterministic); each caller gets its own copy."""
     jobs = list(jobs)
+    if cache is not None:
+        keys = [key(j) for j in jobs]
+        todo = {k: j for k, j in zip(keys, jobs) if k not in cache}
+        if len(todo) < len(jobs):
+            print(f'[{label}] {len(jobs) - len(todo)} of {len(jobs)} unchanged, reused', flush=True)
+        cache.update(zip(todo, progress_map(pool, fn, todo.values(), label, chunksize)))
+        return [copy.deepcopy(cache[k]) for k in keys]
     total, out = len(jobs), []
     if not total:
         return out

@@ -118,12 +118,18 @@ def _squeeze(job):
     return [i for i in inner(contacts) if mm[i] > SQUEEZE_MM]
 
 
-def squeezed_fingers(anchors, notes, base, workers):
+def _squeeze_key(job):
+    hand, contacts, vector, values = job
+    return hand, tuple(contacts), vector.tobytes(), tuple((d, np.asarray(v).tobytes()) for d, v in sorted(values.items()))
+
+
+def squeezed_fingers(anchors, notes, base, workers, cache=None):
     """(note index, hand, finger) of chord fingers the hand cannot place cleanly (``_squeeze``). The pair table
     judges two fingers at a time; a third between them may then only reach its key swung across the next one."""
     chords = [a for a in anchors if len(a.incoming) + len(a.held) >= 3]
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
-        found = progress_map(pool, _squeeze, [(a.hand, a.contacts(notes), vector_of(a.pose), a.pose.values) for a in chords], 'chord shapes', 2)
+        found = progress_map(pool, _squeeze, [(a.hand, a.contacts(notes), vector_of(a.pose), a.pose.values) for a in chords], 'chord shapes', 2,
+                             cache, _squeeze_key)
     out = set()
     for a, bad in zip(chords, found):
         ids = a.incoming + a.held
@@ -496,7 +502,7 @@ def run(args):
                           weights=Weights(**({} if args.finger_spacing is None else dict(finger_spacing=args.finger_spacing)),
                                           **({} if args.lift_speed is None else dict(lift_speed=args.lift_speed))))
     stages['planning'] = stages['anchor_poses'] = stages['chord_shapes'] = 0.
-    forbidden = set()
+    forbidden, anchor_cache, shape_cache = set(), {}, {}
     for shape_round in range(SHAPE_ROUNDS + 1):
         print(f'[planning] round {shape_round + 1}', flush=True)
         planned = plan_parallel(build, (inputs, args.end), dict(planner_kwargs, forbidden=frozenset(forbidden)), workers=workers)
@@ -509,13 +515,14 @@ def run(args):
         # 2. anchor poses (keyframes) on the chosen path
         t0 = time.perf_counter()
         notes = note_motions(rows, score)
-        anchors = solve_anchors(build_anchors(notes, wrist_x), notes, RIG, workers)
+        anchors = solve_anchors(build_anchors(notes, wrist_x), notes, RIG, workers, cache=anchor_cache)
         stages['anchor_poses'] += time.perf_counter() - t0
         if shape_round == SHAPE_ROUNDS:
             break
         # 2a. chords the hand cannot shape cleanly: their inner finger refused to that note, the piece planned again
         t0 = time.perf_counter()
-        new = squeezed_fingers(anchors, notes, dict(rig_path=str(RIG), notes=notes, checks=False), workers) - forbidden
+        new = squeezed_fingers(anchors, notes, dict(rig_path=str(RIG), notes=notes, checks=False), workers,
+                               shape_cache) - forbidden
         stages['chord_shapes'] += time.perf_counter() - t0
         print(f'chord shapes round {shape_round}: {len(new)} squeezed fingers refused', flush=True)
         if not new:

@@ -153,7 +153,7 @@ class PoseSolver:
 
     def _local(self, kind, digit, values):
         depends = self.pad_digits if kind == 'pad' else self.clearance_digits
-        key = (kind, digit) + tuple(v for d in depends[digit] for v in np.round(values[d], 6))
+        key = (kind, digit) + tuple(np.asarray(values[d]).tobytes() for d in depends[digit])
         hit = self._pad_cache.get(key)
         if hit is not None:
             return hit
