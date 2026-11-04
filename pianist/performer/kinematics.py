@@ -26,6 +26,13 @@ VALUE_NAMES = ('swing_lateral', 'swing_lift', 'mcp_delta', 'ip_delta')
 # octave, a small (160 cm) adult hand's limit: the thumb opens at its base joint (real abduction ~50 deg),
 # the little finger ~32. Thumb-little minor seventh before, octave (all keys) after; tenths are not one hand.
 SWING_LATERAL = {1: 50., 5: 32.}
+# The web between neighbouring fingers: how far apart two neighbours may open (deg, the angle of their first phalanges
+# seen on the palm), each swinging sideways on its own up to SWING_LATERAL / the rig's bounds. From a pianist's right
+# hand (references/analysis/for_elise_060: index-middle p95 17 / p99 20, middle-ring 13 / 20, ring-little 52 / 66,
+# measured from a hand whose little finger rests ~22 deg further out than this rig's), the opening beyond which a
+# shape strains (free) and its limit (hard). Thumb to index: not measured; an estimate of the web's reach.
+WEB_FREE = {1: 55., 2: 15., 3: 11., 4: 30.}      # gap after digit d (d, d + 1)
+WEB_HARD = {1: 65., 2: 18., 3: 18., 4: 44.}
 
 
 # ---------- quaternion / matrix helpers ----------
@@ -234,9 +241,50 @@ class Rig:
         self.wrist_bone = {h: data['hands'][h]['bones']['wrist'] for h in 'LR'}
         self.neutral_wrist_inverse = {h: np.linalg.inv(np.array(data['hands'][h]['neutral_wrist_matrix'], dtype=FLOAT)) for h in 'LR'}
         self.bone_owner = {h: {name: d for d, f in self.fingers[h].items() for name in f.names} for h in 'LR'}
+        self._web = {}
         for h in 'LR':
             for d, swing in SWING_LATERAL.items():
                 self.fingers[h][d].lower[0], self.fingers[h][d].upper[0] = -swing, swing
+
+    def web(self, hand):
+        """(rest, slope, free, hard), each (6, 6) by digit: two fingers a < b are open by
+        ``rest[a, b] + slope[a, b] * (lateral_b - lateral_a)`` deg (fitted to the first phalanges on the palm, within
+        half a degree), at most ``hard[a, b]`` (the gaps' WEB_HARD between them summed) and without strain up to
+        ``free[a, b]``."""
+        if hand not in self._web:
+            fingers = self.fingers[hand]
+            normal = np.mean([f.normal for f in fingers.values()], axis=0)
+            normal /= np.linalg.norm(normal)
+
+            def direction(d, lateral):
+                v = fingers[d].local_matrices(np.array([lateral, 0., 0., 0.], FLOAT))[0][:3, 1]
+                v = v - normal * (v @ normal)
+                return v / np.linalg.norm(v)
+
+            def angle(a, la, b, lb):
+                u, v = direction(a, la), direction(b, lb)
+                return math.degrees(math.atan2(float(np.cross(u, v) @ normal), float(u @ v)))
+
+            gap_rest, gap_slope = {}, {}
+            for d in (1, 2, 3, 4):
+                rest = angle(d, 0., d + 1, 0.)
+                slope = (angle(d, -10., d + 1, 10.) - angle(d, 10., d + 1, -10.)) / 40.
+                # opening: the direction that takes the two fingertips apart
+                tip = lambda e, lat: fingers[e].local_matrices(np.array([lat, 0., 0., 0.], FLOAT))[2][:3, 3]
+                apart = np.linalg.norm(tip(d + 1, 10.) - tip(d, -10.)) > np.linalg.norm(tip(d + 1, -10.) - tip(d, 10.))
+                sign = 1. if (slope > 0) == apart else -1.
+                gap_rest[d], gap_slope[d] = sign * rest, sign * slope
+            rest, slope, free, hard = (np.zeros((6, 6)) for _ in range(4))
+            for a in DIGITS:
+                for b in DIGITS:
+                    if a < b:
+                        gaps = range(a, b)
+                        rest[a, b] = sum(gap_rest[g] for g in gaps)
+                        slope[a, b] = float(np.mean([gap_slope[g] for g in gaps]))
+                        free[a, b] = sum(WEB_FREE[g] for g in gaps)
+                        hard[a, b] = sum(WEB_HARD[g] for g in gaps)
+            self._web[hand] = (rest, slope, free, hard)
+        return self._web[hand]
 
     def bone_matrices(self, hand, wrist_armature, values, bones):
         """Pose matrices (armature space) of ``bones`` for a hand pose; ``values`` {digit: 4 values}."""

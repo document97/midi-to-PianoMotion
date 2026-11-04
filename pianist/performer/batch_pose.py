@@ -18,7 +18,7 @@ import numpy as np
 
 from .checks import BRUSH_COST, BRUSH_DEPTH, CELL, OWN_KEY_TOLERANCE, stretched
 from .kinematics import DIGITS, FLOAT, child_euler
-from .pose import (CLEARANCE_SCALE, CONTACT_TOLERANCE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, RELAXED, ROLL_BOUNDS,
+from .pose import (CLEARANCE_SCALE, CONTACT_TOLERANCE, WEB_SCALE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, RELAXED, ROLL_BOUNDS,
                    SEED_ITERATIONS, SEEDS, STEP_TOLERANCE, VALUE_SCALE, WRIST_SCALE, WRIST_TRAVEL, YAW_BOUNDS, HandPose,
                    wrist_steps)
 
@@ -152,6 +152,7 @@ class _Hand:
                   ('pre', 'root_loc', 'root_scale', 'child_loc', 'child_scale', 'links', 'base', 'normal', 'lift')}
         self.f.update(neutral=t([f.neutral_matrix for f in fingers]), e0=t(e0), unit=t(unit))
         self.lower = {d: f.lower for d, f in zip(DIGITS, fingers)}
+        self.web_rest, self.web_slope, _, self.web_hard = (t(a) for a in rig.web(hand))
         self.upper = {d: f.upper for d, f in zip(DIGITS, fingers)}
         # bone matrices of a row: 5 x 3 finger bones, then the bones that move with the wrist (constants)
         owner = rig.bone_owner[hand]
@@ -309,6 +310,11 @@ class _Hand:
                 points = self._points(self.clear, digit, mats, palm)
                 pen = self._penetration(points, self.clear['mask'][digit], c['depth_map'], c['pitch'][:, i], c['stretch'])
                 out.append(pen / CLEARANCE_SCALE)
+        for i in range(slots.shape[1]):              # the web between every two contact fingers (PoseSolver.web_limit)
+            for j in range(i + 1, slots.shape[1]):
+                a, b = c['digit'][:, i] + 1, c['digit'][:, j] + 1
+                opening = self.web_rest[a, b] + self.web_slope[a, b] * (slots[:, j, 0] - slots[:, i, 0])
+                out.append(torch.relu(opening - self.web_hard[a, b])[:, None] / WEB_SCALE)
         out.append(prior * (x[:, :5] - c['prior_wrist']) / self.wrist_prior_scale)
         out.append((prior * (slots - self.relaxed[c['digit']]) / self.value_scale).flatten(1))
         return torch.cat(out, 1)

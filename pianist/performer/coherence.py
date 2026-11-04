@@ -20,7 +20,7 @@ from .anchors import KEY_TRAVEL
 from .kinematics import DIGITS, FLOAT
 from .posture import natural_orientation
 from .motion import SIDEWAYS_FREE, PLAYING_SHAPE, pad_residual, DEPART_DELAY, FLOOR_SCALE, MOVE_BASE_SECONDS, MOVE_SPEED, UNHURRIED, KeyFloor, KeySurface
-from .pose import CONTACT_TOLERANCE, RELAXED, ROLL_BOUNDS, VALUE_SCALE, YAW_BOUNDS, HandPose, PoseSolver, wrist_steps
+from .pose import CONTACT_TOLERANCE, RELAXED, ROLL_BOUNDS, VALUE_SCALE, WEB_SCALE, YAW_BOUNDS, HandPose, PoseSolver, wrist_steps
 
 NEIGHBOUR_SECONDS = .6          # gaussian width of the orientation smoothing over anchors
 COHERENCE_ROUNDS = 2
@@ -29,6 +29,7 @@ ORIENTATION_PULLS = (np.array([.08, .03, .015, 1., 1.], dtype=FLOAT),   # x, y, 
 LATERAL_SCALE = 6.              # deg per unit: a playing finger stays square to the hand; the hand moves over its key
 THUMB_LATERAL_SCALE = 25.       # ... the thumb reaches sideways under the hand by technique
 LATERAL_FREE = SIDEWAYS_FREE    # deg a finger swings sideways on its key without strain (motion.SIDEWAYS_FREE) ...
+WEB_STRAIN = 4.                 # deg per unit two contact fingers open beyond the web's free opening (Rig.web)
 LATERAL_HINGE = 4.              # ... beyond it, deg per unit: the hand moves over the key instead. Soft against the
                                 # contact (1 mm off the key = 5 units), and a settle that loses a key is not taken
 NEUTRAL_ORIENTATION = np.array([15., 12.], dtype=FLOAT)               # weak pull of yaw, roll toward the hand's natural
@@ -66,6 +67,8 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
     vals = dict(values)
     natural = natural_orientation(solver, vector[:3])
     free_digits = [d for d in DIGITS if d not in digits]
+    web_hard = solver.web_limit(digits)
+    web_free = solver.web_limit(digits, solver.rig.web(solver.hand)[2])
 
     def unpack(v):
         for i, d in enumerate(digits):
@@ -105,6 +108,9 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
         out.append(_order(solver, contacts, vals))
         out.append(np.array([vals[c.digit][0] / (THUMB_LATERAL_SCALE if c.digit == 1 else LATERAL_SCALE) for c in contacts], dtype=FLOAT))
         out.append(lateral_hinge(digits, vals))
+        # the web between the contact fingers: a wall at its limit, strain beyond its free opening
+        out.append(web_hard(vals))
+        out.append(web_free(vals) * (WEB_SCALE / WEB_STRAIN))
         out.append((v[:5] - target) / pull)
         out.append([max(0., solver.white_top + PALM_HEIGHT - v[2]) / PALM_SCALE])
         out.append((v[3:5] - natural) / NEUTRAL_ORIENTATION)

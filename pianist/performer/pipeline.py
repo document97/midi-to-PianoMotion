@@ -117,7 +117,8 @@ def gentle(anchor, pose, path, others):
 def awkwardness(solver, contacts, pose):
     """Units (``AWKWARD_*``): squared sink of every finger into the keys beside its own (the thumb and little finger on
     the shape's outer keys beyond an octave's usual), squared sideways swing of fingers 2..4 beyond their free range,
-    squared contact miss."""
+    squared opening of two contact fingers beyond the web's free opening (one unit at its limit, Rig.web), squared
+    contact miss."""
     fingers = solver.rig.fingers[solver.hand]
     pitches = [c.pitch for c in contacts]
     units = 0.
@@ -127,6 +128,12 @@ def awkwardness(solver, contacts, pose):
         if not outer:
             free, limit = SIDEWAYS_FREE[c.digit], float(fingers[c.digit].upper[0])
             units += AWKWARD_SIDEWAYS * (max(0., abs(float(pose.values[c.digit][0])) - free) / max(limit - free, 1e-6)) ** 2
+    rest, slope, free, hard = solver.rig.web(solver.hand)
+    digits = sorted({c.digit for c in contacts})
+    for i, a in enumerate(digits):
+        for b in digits[i + 1:]:
+            opening = rest[a, b] + slope[a, b] * (float(pose.values[b][0]) - float(pose.values[a][0]))
+            units += (max(0., opening - free[a, b]) / (hard[a, b] - free[a, b])) ** 2
     return units + (max(0., pose.contact_error - AWKWARD_MISS[0]) / AWKWARD_MISS[1]) ** 2
 
 

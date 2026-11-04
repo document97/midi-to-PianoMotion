@@ -75,6 +75,7 @@ SPACING_SHARE = .85              # free fingers keep this share of the relaxed f
 SPACING_SOFTNESS = .002          # smooth maximum width (m)
 SPREAD_COUPLING = .5             # share of a neighbour's stretch beyond the relaxed gap a free finger follows (tendons)
 SPREAD_ROUNDS = 4                # ... passed on along the hand in this many rounds
+WEB_ROUNDS = 24                  # rounds sharing out openings beyond the web (Spacing.web_fan)
 SPREAD_SOFTNESS = .0005          # its onset eased over this (m): no pull at the relaxed gap
 CLEAR_STEP = .05                 # free-finger key clearance is solved at this spacing and interpolated (s)
 HOLD_SAMPLES = 3                 # ... each sample then holds the largest correction within this many samples (0.15 s)
@@ -675,6 +676,38 @@ class Spacing:
             # the larger of the proximal and distal needs, blended (no flip when they disagree in sign)
             weights = np.abs(swings) ** 4 + 1e-30
             v[0] = np.clip(v[0] + float(np.dot(swings, weights) / weights.sum()), fingers[d].lower[0], fingers[d].upper[0])
+            out[d] = v
+        return self.web_fan(out, give)
+
+    def web_fan(self, values, give):
+        """Two neighbouring fingers open no further than their web lets them comfortably (``kinematics.Rig.web``'s
+        free limit). The web ties both: an opening beyond it is taken back by the two in proportion to their
+        ``give``, all of it once their gives add up to one (a free finger follows its lifting neighbour), none
+        while both are on their keys. Shared out in damped rounds, so a run of free fingers fans evenly and one
+        between two neighbours too far apart is left in between, both its webs equally over."""
+        rest, slope, free, _ = self.solver.rig.web(self.solver.hand)
+        fingers = self.solver.rig.fingers[self.solver.hand]
+        share = {d: give.get(d, 1.) for d in DIGITS}
+        lateral = {d: float(values[d][0]) for d in DIGITS}
+        start = dict(lateral)
+        pairs = [(d, d + 1) for d in (1, 2, 3, 4) if share[d] + share[d + 1] > 0]
+        for _ in range(WEB_ROUNDS):
+            step = {d: 0. for d in DIGITS}
+            for a, b in pairs:
+                over = rest[a, b] + slope[a, b] * (lateral[b] - lateral[a]) - free[a, b]
+                if over <= 0:
+                    continue
+                taken = over / slope[a, b] * min(1., share[a] + share[b]) / (share[a] + share[b])
+                step[a] += taken * share[a]
+                step[b] -= taken * share[b]
+            for d in DIGITS:
+                lateral[d] += .5 * step[d]
+        out = dict(values)
+        for d in DIGITS:
+            if abs(lateral[d] - start[d]) < 1e-6:
+                continue
+            v = np.array(values[d], FLOAT)
+            v[0] = np.clip(lateral[d], fingers[d].lower[0], fingers[d].upper[0])
             out[d] = v
         return out
 

@@ -29,6 +29,7 @@ RELAXED = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 9., 34.
 for _d in (3, 4, 5):
     RELAXED[_d] = RELAXED[2]
 VALUE_SCALE = np.array([18., 18., 30., 25.], dtype=FLOAT)   # degrees per unit of preference residual
+WEB_SCALE = .5                  # degrees per unit two fingers open beyond the web's limit (kinematics.Rig.web): a wall
 WRIST_SCALE = np.array([.04, .03, .025, 12., 10.], dtype=FLOAT)   # x, y, z (m), yaw, roll (deg)
 WRIST_TRAVEL = np.array([.08, .07, .05], dtype=FLOAT)
 FOLLOW_WRIST_SCALE = np.array([.004, .004, .004, 2., 2.], dtype=FLOAT)   # frame correction: m and deg per unit
@@ -227,11 +228,12 @@ class PoseSolver:
             return v[:3], v[3], v[4], vals
 
         stretch = stretched(c.pitch for c in contacts)
+        web = self.web_limit(digits)
 
         def residuals(v, prior, clear):
             w, ya, ro, vals = unpack(v)
             palm = self.palm(w, ya, ro)
-            out = []
+            out = [web(vals)]
             for c in contacts:
                 point = self.contact_point(self.pad_world(c.digit, vals, palm))
                 out.append(self.regions.residual(c.pitch, c.depth, point) / CONTACT_TOLERANCE)
@@ -284,6 +286,23 @@ class PoseSolver:
             worst_clearance = max(worst_clearance, float(pen.max()) * CLEARANCE_SCALE if len(pen) else 0.)
         return HandPose(np.array(w, dtype=FLOAT), float(ya), float(ro), {d: np.array(v, dtype=FLOAT) for d, v in vals.items()},
                         error, error <= CONTACT_TOLERANCE * 2.5, it, targets, worst_clearance)
+
+    def web_limit(self, digits, limit=None):
+        """Residual of the contact ``digits`` opening beyond the web between them (``kinematics.Rig.web``; ``limit``
+        its hard or free table): vals -> (pairs,)."""
+        rest, slope, free, hard = self.rig.web(self.hand)
+        limit = hard if limit is None else limit
+        pairs = [(a, b) for i, a in enumerate(digits) for b in digits[i + 1:]]
+        if not pairs:
+            return lambda vals: np.zeros(0, dtype=FLOAT)
+        a, b = np.array([p[0] for p in pairs]), np.array([p[1] for p in pairs])
+        r, k, cap = rest[a, b], slope[a, b], limit[a, b]
+
+        def residual(vals):
+            lateral = {d: float(vals[d][0]) for d in digits}
+            opening = r + k * np.array([lateral[y] - lateral[x] for x, y in pairs])
+            return (np.maximum(0., opening - cap) / WEB_SCALE).astype(FLOAT)
+        return residual
 
     def follow(self, points, vector, values, iterations=20, depths=None, pitches=None):
         """Hold every pad on its fixed world point, moving the wrist as little as possible from ``vector``.
