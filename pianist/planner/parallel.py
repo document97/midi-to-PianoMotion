@@ -3,7 +3,8 @@
 Target machines: 8 or 16 equal-performance cores. The score is cut into
 ``workers * segments_per_worker`` segments of equal note count (work is close
 to proportional to notes), each planned from a free state after a warm-up
-span. The stitcher replays segment decisions in order from the true state;
+span and on through a look-ahead span (its last notes are fingered for what follows them, as the sequential
+search does). The stitcher replays segment decisions in order from the true state;
 where a decision is infeasible at a seam, a short sequential beam search from
 the true state repairs it. The result is one consistent plan; parallelism
 never weakens a constraint.
@@ -23,14 +24,15 @@ def _init_worker(factory, factory_args, planner_kwargs):
 
 
 def _plan_segment(bounds):
-    first, warm_first, last = bounds
+    first, warm_first, last, ahead = bounds
     planner = _WORKER['planner']
-    best = planner.run(planner.score.groups[warm_first:last])[0]
-    return [d for d in best.decisions() if d.group >= first]
+    best = planner.run(planner.score.groups[warm_first:ahead])[0]
+    return [d for d in best.decisions() if first <= d.group < last]
 
 
 def segment_bounds(groups, count, warm_seconds):
-    """(first, warm_first, last) group ranges with near-equal note counts."""
+    """(first, warm_first, last, ahead) group ranges with near-equal note counts: decisions are kept for
+    first..last, searched from warm_first to ahead (``warm_seconds`` on either side)."""
     total = sum(len(g.notes) for g in groups)
     cuts, running, target = [0], 0, total / count
     for i, g in enumerate(groups):
@@ -43,7 +45,10 @@ def segment_bounds(groups, count, warm_seconds):
         warm = first
         while warm > 0 and groups[warm - 1].start > groups[first].start - warm_seconds:
             warm -= 1
-        bounds.append((first, warm, last))
+        ahead = last
+        while ahead < len(groups) and groups[ahead].start < groups[last - 1].start + warm_seconds:
+            ahead += 1
+        bounds.append((first, warm, last, ahead))
     return bounds
 
 
