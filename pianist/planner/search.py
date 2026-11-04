@@ -349,7 +349,9 @@ class Planner:
         hands = {h: self._advance(state.hands[h], group.touch) for h in HANDS}
         playable, lifts = self._restrike(hands, group)
         if forced is None:
-            candidates = {h: self.hand_candidates(h, hands[h], group, playable) for h in HANDS}
+            # a hand-split score (a pianist's own division) is kept: each hand is offered only its own notes
+            candidates = {h: self.hand_candidates(h, hands[h], group, [n for n in playable if self.score.notes[n].hand in (None, h)])
+                          for h in HANDS}
         else:
             candidates = self._forced_candidates(hands, group, playable, forced)
             if candidates is None:

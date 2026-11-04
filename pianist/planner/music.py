@@ -38,6 +38,7 @@ class Note:
     pedal_release: float      # earliest lift with identical damping
     earliest_release: float   # earliest permitted lift (minimum press)
     group: int
+    hand: str = None          # the hand the score gives the note ('L', 'R'), None when it does not say
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,8 @@ class Score:
                 pedal = d['end']
             earliest = min(pedal, floor)
             notes.append(Note(index, d['id'], d['pitch'], d['velocity'], at, d['end'],
-                              at - downstroke_seconds(d['velocity']), pedal, earliest, group_of_tick[d['start_tick']]))
+                              at - downstroke_seconds(d['velocity']), pedal, earliest, group_of_tick[d['start_tick']],
+                              raw.get('hand') if raw.get('hand') in ('L', 'R') else None))
             self.raw.append(raw)
         self.notes = tuple(notes)
         # Source damper closure per note; None (final open pedal) means the source end.

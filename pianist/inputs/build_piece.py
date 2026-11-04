@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from midi_input.timeline import load_midi
 from midi_input.hold_demands import build_hold_demands
+from midi_input.damper import infer_pedal
 
 
 def channels(midi_path, track):
@@ -45,12 +46,13 @@ def main():
         if track is not None:
             hand_map.update({f'{track}:{c}': hand for c in channels(midi_path, track)})
     timeline = load_midi(midi_path, hand_map)
+    inferred = infer_pedal(timeline)          # a typed-in score without pedal: the pedal a pianist uses
     demands = build_hold_demands(timeline)
     for name, data in (('timeline', timeline), ('demands', demands)):
         (folder / f'{name}.json').write_text(json.dumps(data, default=str), encoding='utf-8')
     hands = Counter(n['hand'] or 'unassigned' for n in timeline['notes'])
     pedal = sum(1 for e in timeline['events'] if e['message']['type'] == 'control_change' and e['message']['control'] == 64)
-    print(f"{a.name}: {len(timeline['notes'])} notes {dict(hands)}, {timeline['duration']:.1f} s, pedal events {pedal}, "
+    print(f"{a.name}: {len(timeline['notes'])} notes {dict(hands)}, {timeline['duration']:.1f} s, pedal events {pedal}{' (inferred)' if inferred else ''}, "
           f"diagnostics {len(timeline['diagnostics'])}, unresolved holds {len(demands.get('unresolved', []))}")
 
 
