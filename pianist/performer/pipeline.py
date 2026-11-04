@@ -29,13 +29,13 @@ from planner.validate import validate
 
 from .anchors import REACH_TOLERANCE, Anchor, build_anchors, note_motions, solve_anchors, summary
 from .checks import BRUSH_DEPTH, Heightfield, stretched
-from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, inner, least_sunk, neighbour_targets,
+from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, least_sunk, neighbour_targets,
                         settle, sunk, vector_of, wide_settle)
 from .kinematics import DIGITS, SWING_LATERAL, Rig
 from .torso import Torso
 from .contacts import HandCapsules, finger_pairs, hands_gap, pointing, raised_between
 from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contact_error, contact_waypoints, finger_track, frame_hand,
-                     refine_points, refine_score, strokes, waypoint, wrist_path, YieldingPath, yield_offsets)
+                     refine_points, refine_score, strokes, waypoint, wrist_path, SIDEWAYS_FREE, YieldingPath, yield_offsets)
 from .pedal import damper_depth, damper_intervals
 from .pose import RELAXED, hand_solvers
 from .progress import progress_map
@@ -93,10 +93,18 @@ HANDS_APART = .16                 # m between the wrists: an idle hand moves out
                                   # 20 mm between the hands' bodies)
 YIELD_SPEED = .4                  # m/s: how fast the idle hand moves aside and back
 YIELD_BUSY = (.35, .15)           # s before a note's onset / after its release the hand counts as playing
-SQUEEZE_MM = 6.                   # an inner chord finger sinking deeper than this into the next keys once its chord is
-                                  # settled (swung to its limit across a black key, or wedged between two) is refused
-                                  # to that note and the piece planned again ...
-SHAPE_ROUNDS = 3                  # ... at most this many times
+# Awkward hand shapes: every anchor of two or more keys is settled as the coherence will settle it, and its
+# awkwardness (squared, summed over the fingers) priced for the planner, which then plays the shape anyway, takes
+# other fingers, omits a note or lets a held key go early, whichever costs least; the piece is planned again.
+AWKWARD_SINK = .006               # m a finger sinks into the keys beside its own: one unit
+AWKWARD_OUTER_SINK = .008         # ... beyond this for the thumb or little finger on the shape's outer key: at this
+                                  # hand's size every octave has them lying 6-8 mm on the next keys, at their limit
+AWKWARD_SIDEWAYS = .25            # units for a finger 2..4 swung sideways to its limit (beyond SIDEWAYS_FREE)
+AWKWARD_MISS = (.002, .003)       # contact error free up to (an octave's usual miss), then m per unit
+AWKWARD_FREE = .5                 # units a shape may have without cost
+AWKWARD_COST = 9.                 # per unit beyond: one unit ~ an inner finger 6 mm into the next key ~ omitting a soft
+                                  # inner note (Weights.omission x importance 8..16; melody and bass 12..24)
+SHAPE_ROUNDS = 4                  # planning rounds at most (each prices the shapes the previous plan chose)
 
 
 def gentle(anchor, pose, path, others):
@@ -106,35 +114,62 @@ def gentle(anchor, pose, path, others):
     return float(np.abs(dev[3:]).max()) / dt <= INTERMEDIATE_TURN and float(np.linalg.norm(dev[:3])) / dt <= INTERMEDIATE_SPEED
 
 
-def _squeeze(job):
-    """Inner contacts (``coherence.inner``) of a chord sinking deeper than ``SQUEEZE_MM`` into the next keys once
-    settled from its anchor pose, as the coherence settles it."""
-    hand, contacts, vector, values = job
+def awkwardness(solver, contacts, pose):
+    """Units (``AWKWARD_*``): squared sink of every finger into the keys beside its own (the thumb and little finger on
+    the shape's outer keys beyond an octave's usual), squared sideways swing of fingers 2..4 beyond their free range,
+    squared contact miss."""
+    fingers = solver.rig.fingers[solver.hand]
+    pitches = [c.pitch for c in contacts]
+    units = 0.
+    for c, mm in zip(contacts, sunk(solver, contacts, pose)):
+        outer = c.digit in (1, 5) and c.pitch in (min(pitches), max(pitches))
+        units += (max(0., mm / 1000 - (AWKWARD_OUTER_SINK if outer else 0.)) / AWKWARD_SINK) ** 2
+        if not outer:
+            free, limit = SIDEWAYS_FREE[c.digit], float(fingers[c.digit].upper[0])
+            units += AWKWARD_SIDEWAYS * (max(0., abs(float(pose.values[c.digit][0])) - free) / max(limit - free, 1e-6)) ** 2
+    return units + (max(0., pose.contact_error - AWKWARD_MISS[0]) / AWKWARD_MISS[1]) ** 2
+
+
+def _awkward(job):
+    """``awkwardness`` of an anchor settled from its pose (over the key surface, as the coherence settles it); None
+    without a heightfield."""
+    hand, contacts, vector, values, error = job
     solver = _ctx['solvers'][hand]
     if solver.heightfield is None:
-        return []
+        return None
     pose = settle(solver, contacts, vector, {d: values.get(d, RELAXED[d]) for d in DIGITS}, vector, ORIENTATION_PULLS[0])
-    mm = sunk(solver, contacts, pose)
-    return [i for i in inner(contacts) if mm[i] > SQUEEZE_MM]
+    return awkwardness(solver, contacts, pose)
 
 
-def _squeeze_key(job):
-    hand, contacts, vector, values = job
-    return hand, tuple(contacts), vector.tobytes(), tuple((d, np.asarray(v).tobytes()) for d, v in sorted(values.items()))
+def _awkward_key(job):
+    hand, contacts, vector, values, error = job
+    return hand, tuple(contacts), vector.tobytes(), tuple((d, np.asarray(v).tobytes()) for d, v in sorted(values.items())), error
 
 
-def squeezed_fingers(anchors, notes, base, workers, cache=None):
-    """(note index, hand, finger) of chord fingers the hand cannot place cleanly (``_squeeze``). The pair table
-    judges two fingers at a time; a third between them may then only reach its key swung across the next one."""
-    chords = [a for a in anchors if len(a.incoming) + len(a.held) >= 3]
+def shape_key(anchor, notes):
+    """The planner's name for an anchor's shape (``Planner.shape_penalty``): hand and its (note, finger) on the keys."""
+    return anchor.hand, frozenset((notes[i].index, notes[i].digit) for i in anchor.incoming + anchor.held)
+
+
+def awkward_shapes(anchors, notes, base, workers, cache=None):
+    """{shape_key: awkwardness units} of every anchor holding two or more keys."""
+    chords = [a for a in anchors if len(a.incoming) + len(a.held) >= 2]
+    jobs = [(a.hand, a.contacts(notes), vector_of(a.pose), a.pose.values, float(a.pose.contact_error)) for a in chords]
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
-        found = progress_map(pool, _squeeze, [(a.hand, a.contacts(notes), vector_of(a.pose), a.pose.values) for a in chords], 'chord shapes', 2,
-                             cache, _squeeze_key)
-    out = set()
-    for a, bad in zip(chords, found):
-        ids = a.incoming + a.held
-        out |= {(notes[ids[i]].index, a.hand, notes[ids[i]].digit) for i in bad}
+        found = progress_map(pool, _awkward, jobs, 'chord shapes', 2, cache, _awkward_key)
+    out = {}
+    for a, units in zip(chords, found):
+        if units is not None:
+            key = shape_key(a, notes)
+            out[key] = max(out.get(key, 0.), units)
     return out
+
+
+def shape_report(chosen):
+    """The plan's shapes beyond ``AWKWARD_FREE`` (played anyway: no cheaper alternative was found)."""
+    units = sorted((u for u in chosen.values() if u > AWKWARD_FREE), reverse=True)
+    return dict(shapes=len(chosen), awkward=len(units), worst_units=[round(u, 2) for u in units[:10]],
+                cost=round(sum(AWKWARD_COST * (u - AWKWARD_FREE) for u in units), 1))
 
 
 def _settle(job):
@@ -502,10 +537,11 @@ def run(args):
                           weights=Weights(**({} if args.finger_spacing is None else dict(finger_spacing=args.finger_spacing)),
                                           **({} if args.lift_speed is None else dict(lift_speed=args.lift_speed))))
     stages['planning'] = stages['anchor_poses'] = stages['chord_shapes'] = 0.
-    forbidden, anchor_cache, shape_cache = set(), {}, {}
-    for shape_round in range(SHAPE_ROUNDS + 1):
+    shapes, anchor_cache, shape_cache = {}, {}, {}
+    for shape_round in range(SHAPE_ROUNDS):
         print(f'[planning] round {shape_round + 1}', flush=True)
-        planned = plan_parallel(build, (inputs, args.end), dict(planner_kwargs, forbidden=frozenset(forbidden)), workers=workers)
+        penalty = {k: AWKWARD_COST * (u - AWKWARD_FREE) for k, u in shapes.items() if u > AWKWARD_FREE}
+        planned = plan_parallel(build, (inputs, args.end), dict(planner_kwargs, shape_penalty=penalty), workers=workers)
         planner, score = planned['planner'], planned['planner'].score
         rows = plan_notes(planned['state'], score)
         problems = validate(rows, score, raw['keyboard'], raw['envelopes'], raw['radii'], planner.w.hard_speed)
@@ -517,17 +553,16 @@ def run(args):
         notes = note_motions(rows, score)
         anchors = solve_anchors(build_anchors(notes, wrist_x), notes, RIG, workers, cache=anchor_cache)
         stages['anchor_poses'] += time.perf_counter() - t0
-        if shape_round == SHAPE_ROUNDS:
-            break
-        # 2a. chords the hand cannot shape cleanly: their inner finger refused to that note, the piece planned again
+        # 2a. the awkwardness of the shapes this plan chose; shapes not priced yet send the piece back to planning
         t0 = time.perf_counter()
-        new = squeezed_fingers(anchors, notes, dict(rig_path=str(RIG), notes=notes, checks=False), workers,
-                               shape_cache) - forbidden
+        chosen = awkward_shapes(anchors, notes, dict(rig_path=str(RIG), notes=notes, checks=False), workers, shape_cache)
         stages['chord_shapes'] += time.perf_counter() - t0
-        print(f'chord shapes round {shape_round}: {len(new)} squeezed fingers refused', flush=True)
-        if not new:
+        unpriced = {k: u for k, u in chosen.items() if k not in shapes}
+        shapes.update(unpriced)
+        print(f'chord shapes round {shape_round + 1}: {len(chosen)} shapes, {len(unpriced)} new, '
+              f'{sum(u > AWKWARD_FREE for u in unpriced.values())} of them awkward', flush=True)
+        if not any(u > AWKWARD_FREE for u in unpriced.values()):
             break
-        forbidden |= new
         t0 = time.perf_counter()
 
     # 2b. free early releases (identical sound), then orientation coherence between neighbouring anchors
@@ -683,7 +718,7 @@ def run(args):
                        audibly_shortened_notes=len(shortened), band_deficit_db=fidelity,
                        plan_validation_problems=len(problems), score_hands=score_hands(source, final_rows)),
         motion=dict(frames=len(times), rate=FRAME_RATE, anchors=summary([a for a in anchors if a.incoming]),
-                    refused_chord_fingers=len(forbidden), intermediate_poses=intermediate, intermediate_dropped_snaps=dropped_snaps, idle_hand_yield_mm=yielded, early_releases_for_wrist=freed, bridged_frames=bridged,
+                    awkward_shapes=shape_report(chosen), intermediate_poses=intermediate, intermediate_dropped_snaps=dropped_snaps, idle_hand_yield_mm=yielded, early_releases_for_wrist=freed, bridged_frames=bridged,
                     brushed_keys=brushed,
                     smoothness=smoothness(frames, FRAME_RATE),
                     finger_sideways_at_press=sideways(frames, notes, FRAME_RATE),

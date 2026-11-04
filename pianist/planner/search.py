@@ -133,10 +133,11 @@ def initial_state():
 
 class Planner:
     def __init__(self, score, instrument, weights=Weights(), beam_width=48, finger_options=4, model=None,
-                 outer_voice_bonus=1., pair_table=None, forbidden=()):
+                 outer_voice_bonus=1., pair_table=None, shape_penalty=None):
         """``pair_table``: two-finger feasibility of the animated rig (performer.reach_table); without it
-        the fixed-palm screens are used. ``forbidden``: (note, hand, finger) the animated hand cannot shape
-        cleanly within its chord (performer.pipeline.squeezed_fingers), never chosen."""
+        the fixed-palm screens are used. ``shape_penalty``: {(hand, frozenset of (note, finger) on the keys)}: cost
+        of the animated hand's awkwardness in that shape (performer.pipeline.awkward_shapes); the search weighs it
+        against other fingers, an omitted note or a held key let go early."""
         self.score, self.w = score, weights
         outer = score.outer_voice_notes()
         self.voice_scale = [outer_voice_bonus if i in outer else 1. for i in range(len(score.notes))]
@@ -144,7 +145,7 @@ class Planner:
                                else GeometricHandModel(instrument))
         self.beam_width, self.finger_options = beam_width, finger_options
         self.split = hand_split_pitches(score)
-        self.forbidden = frozenset(forbidden)
+        self.shape_penalty = shape_penalty or {}
         self.last_reason = None
 
     def _reject(self, reason):
@@ -201,8 +202,6 @@ class Planner:
     def evaluate_hand(self, hand, hs, group, notes, fingers):
         """HandOption for ``hand`` playing ``notes`` with ``fingers``; None if infeasible."""
         score, w, model = self.score, self.w, self.model
-        if self.forbidden and any((n, hand, f) in self.forbidden for n, f in zip(notes, fingers)):
-            return self._reject('forbidden_shape')
         touch = group.touch
         deadline = group.start - MINIMUM_DOWNSTROKE_SECONDS
         incoming = [(f, score.notes[n].pitch) for n, f in zip(notes, fingers)]
@@ -217,6 +216,8 @@ class Planner:
             (kept if compatible and not pedalled else lifted).append(h)
         if any(h.earliest + KEY_RETURN_SECONDS > touch + 1e-9 for h in lifted):
             return self._reject('held_key_not_liftable')
+        kept, freed, awkward = self._awkward_lift(hand, kept, notes, fingers, touch)
+        lifted += freed
         placement = model.place(hand, hs.pose, [(h.finger, h.pitch) for h in kept] + incoming)
         if placement is None:
             return self._reject('held_span')
@@ -234,7 +235,7 @@ class Planner:
         for h, (_, r) in zip(lifted, releases):
             cost += self._lift_cost(h, r)
         shape_cost, crossed = self._shape_cost(hand, hs, group, kept, incoming)
-        cost += shape_cost
+        cost += shape_cost + awkward
         new_held = [Held(n, f, score.notes[n].pitch, score.notes[n].end, score.notes[n].pedal_release,
                          score.notes[n].earliest_release) for n, f in zip(notes, fingers)]
         state = HandState(pose=placement.pose, last_touch=touch, pin_release=-INF,
@@ -245,6 +246,28 @@ class Planner:
                           last_release=tuple(sorted({**{u[0]: u for u in hs.last_release},
                                                      **{h.finger: (h.finger, h.pitch, r) for h, (_, r) in zip(lifted, releases)}}.values())))
         return HandOption(cost, state, tuple(releases), tuple(fingers))
+
+    def _awkward_lift(self, hand, kept, notes, fingers, touch):
+        """(kept, lifted early, awkwardness cost): the held keys whose early lift (at its sound cost) makes the
+        shape's awkwardness (``shape_penalty``) cheapest; none when keeping them all costs least."""
+        if not self.shape_penalty:
+            return kept, [], 0.
+        playing = frozenset(zip(notes, fingers))
+
+        def penalty(held):
+            return self.shape_penalty.get((hand, playing | {(h.note, h.finger) for h in held}), 0.)
+
+        best = (penalty(kept), kept, [])
+        if best[0] <= 0.:
+            return kept, [], 0.
+        liftable = [h for h in kept if h.earliest + KEY_RETURN_SECONDS <= touch + 1e-9]
+        for size in range(1, len(liftable) + 1):
+            for gone in combinations(liftable, size):
+                stay = [h for h in kept if h not in gone]
+                cost = penalty(stay) + sum(self._lift_cost(h, self._lift_time(h, touch)) for h in gone)
+                if cost < best[0] - 1e-9:
+                    best = (cost - sum(self._lift_cost(h, self._lift_time(h, touch)) for h in gone), stay, list(gone))
+        return best[1], best[2], best[0]
 
     def _shape_cost(self, hand, hs, group, kept, incoming):
         w, model = self.w, self.model
