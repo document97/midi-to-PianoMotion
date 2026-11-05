@@ -45,7 +45,10 @@ class Weights:
     hard_speed: float = 4.           # m/s average; above it is rejected
     lift_speed: float = 4.           # m/s average the release timing plans for (keys are held until the wrist must
                                      # leave at this speed); lower values buy unhurried hand travel with sound
-    stretch_metre: float = 40.       # per metre beyond a relaxed finger spacing
+    stretch_metre: float = 40.       # per metre beyond a relaxed finger spacing (without the rig's pair strain)
+    strain_unit: float = 9.          # per unit of the rig hand's strain holding a shape (hand_model.shape_strain) ...
+    strain_free: float = 0.          # ... beyond this many: none, as the planner compares fingerings (a finger swung
+                                     # to its sideways limit is only AWKWARD_SIDEWAYS units, under the performer's free)
     finger_spacing: float = .0235    # relaxed spacing per finger index, fingers 2..5 (one white key; the performer
                                      # measures its rig's hand instead)
     thumb_spacing: float = .0235     # relaxed thumb-to-index spacing
@@ -133,7 +136,7 @@ def initial_state():
 
 class Planner:
     def __init__(self, score, instrument, weights=Weights(), beam_width=48, finger_options=4, model=None,
-                 outer_voice_bonus=1., pair_table=None, shape_penalty=None):
+                 outer_voice_bonus=1., pair_table=None, pair_strain=None, shape_penalty=None):
         """``pair_table``: two-finger feasibility of the animated rig (performer.reach_table); without it
         the fixed-palm screens are used. ``shape_penalty``: {(hand, frozenset of (note, finger) on the keys)}: cost
         of the animated hand's awkwardness in that shape (performer.pipeline.awkward_shapes); the search weighs it
@@ -141,7 +144,7 @@ class Planner:
         self.score, self.w = score, weights
         outer = score.outer_voice_notes()
         self.voice_scale = [outer_voice_bonus if i in outer else 1. for i in range(len(score.notes))]
-        self.model = model or (RigHandModel(instrument, pair_table) if pair_table is not None
+        self.model = model or (RigHandModel(instrument, pair_table, pair_strain) if pair_table is not None
                                else GeometricHandModel(instrument))
         self.beam_width, self.finger_options = beam_width, finger_options
         self.split = hand_split_pitches(score)
@@ -218,9 +221,19 @@ class Planner:
             return self._reject('held_key_not_liftable')
         kept, freed, awkward = self._awkward_lift(hand, kept, notes, fingers, touch)
         lifted += freed
-        placement = model.place(hand, hs.pose, [(h.finger, h.pitch) for h in kept] + incoming)
+        keys = [(h.finger, h.pitch) for h in kept] + incoming
+        placement = model.place(hand, hs.pose, keys)
         if placement is None:
             return self._reject('held_span')
+        # One hand position covers the keys of its last touch and the new ones, or the hand moves: then the wrist
+        # travels at least between where each set is comfortable (a finger reaching across from the old position
+        # to a key no one position holds with the last ones is no free move)
+        recent = [(f, p) for f, p, t in hs.last_finger_use
+                  if t >= hs.last_touch - 1e-9 and all(p != q for _, q in keys)]
+        if recent and model.chord_window(hand, keys + recent) is None:
+            moved = abs(model.comfortable_x(hand, keys) - model.comfortable_x(hand, recent))                 if model.chord_window(hand, recent) is not None else 0.
+            if moved > placement.travel_metres:
+                placement = replace(placement, travel_metres=moved)
         releases = [(h.note, self._lift_time(h, touch)) for h in lifted]
         cost = w.wrist_metre * placement.travel_metres
         if placement.travel_metres > 1e-6:
@@ -273,10 +286,15 @@ class Planner:
         w, model = self.w, self.model
         cost = 0.
         shape = sorted([(h.finger, h.pitch) for h in kept] + incoming)
-        for (f1, p1), (f2, p2) in zip(shape, shape[1:]):
-            gap = abs(model.key_center(p2) - model.key_center(p1))
-            relaxed = (w.thumb_spacing + (f2 - 2) * w.finger_spacing) if f1 == 1 else (f2 - f1) * w.finger_spacing
-            cost += w.stretch_metre * max(0., gap - relaxed * 1.6)
+        strain = model.shape_strain(hand, shape) if len(shape) > 1 and hasattr(model, 'shape_strain') else None
+        if strain is not None:
+            # how strained the animated hand holds the shape (measured on the rig, as the performer prices it)
+            cost += w.strain_unit * max(0., strain - w.strain_free)
+        else:
+            for (f1, p1), (f2, p2) in zip(shape, shape[1:]):
+                gap = abs(model.key_center(p2) - model.key_center(p1))
+                relaxed = (w.thumb_spacing + (f2 - 2) * w.finger_spacing) if f1 == 1 else (f2 - f1) * w.finger_spacing
+                cost += w.stretch_metre * max(0., gap - relaxed * 1.6)
         direction = 1 if hand == 'R' else -1
         split = self.split[group.index]
         # The whole hand shifting (an octave or a chord moved as one shape) is wrist travel, not a finger hopping.

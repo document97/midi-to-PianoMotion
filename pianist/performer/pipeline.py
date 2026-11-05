@@ -27,7 +27,7 @@ from planner.problem import PIECE_FILES, build, load_raw, plan_notes, register_r
 from planner.search import Weights
 from planner.validate import validate
 
-from .anchors import REACH_TOLERANCE, Anchor, build_anchors, note_motions, solve_anchors, summary
+from .anchors import KEY_TRAVEL, REACH_TOLERANCE, Anchor, build_anchors, note_motions, solve_anchors, summary
 from .checks import BRUSH_DEPTH, Heightfield, stretched
 from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, least_sunk, neighbour_targets,
                         settle, sunk, vector_of, wide_settle)
@@ -39,7 +39,7 @@ from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contac
 from .pedal import damper_depth, damper_intervals
 from .pose import RELAXED, hand_solvers
 from .progress import progress_map
-from .reach_table import load_or_compute
+from .reach_table import MAX_INTERVAL, REFERENCE_OCTAVE, cache_path, load_or_compute
 from .regions import performer_solvers
 from .posture import natural_orientation
 
@@ -137,20 +137,74 @@ def awkwardness(solver, contacts, pose):
     return units + (max(0., pose.contact_error - AWKWARD_MISS[0]) / AWKWARD_MISS[1]) ** 2
 
 
+def free_start(solver, contacts):
+    """(vector, values) of ``contacts`` solved from the hand's own wide seeds, not from where the planner put the wrist:
+    a shape settled only from its anchor's pose stays in the basin it starts in, often a strained one."""
+    from .pose import WIDE_SEEDS
+    pose = solver.solve(contacts, seeds=WIDE_SEEDS)
+    return vector_of(pose), pose.values
+
+
 def _awkward(job):
-    """``awkwardness`` of an anchor settled from its pose (over the key surface, as the coherence settles it); None
-    without a heightfield."""
+    """``awkwardness`` of an anchor settled from its pose (over the key surface, as the coherence settles it), or for
+    a shape of two or more keys from a free start (``free_start``) where that is less awkward, as the coherence settles
+    it too; None without a heightfield."""
     hand, contacts, vector, values, error = job
     solver = _ctx['solvers'][hand]
     if solver.heightfield is None:
         return None
-    pose = settle(solver, contacts, vector, {d: values.get(d, RELAXED[d]) for d in DIGITS}, vector, ORIENTATION_PULLS[0])
-    return awkwardness(solver, contacts, pose)
+    starts = [(vector, values)] + ([free_start(solver, contacts)] if len(contacts) > 1 else [])
+    return min(awkwardness(solver, contacts, settle(solver, contacts, v, {d: vals.get(d, RELAXED[d]) for d in DIGITS}, v,
+                                                     ORIENTATION_PULLS[0])) for v, vals in starts)
 
 
 def _awkward_key(job):
     hand, contacts, vector, values, error = job
     return hand, tuple(contacts), vector.tobytes(), tuple((d, np.asarray(v).tobytes()) for d, v in sorted(values.items())), error
+
+
+def _pair_awkward(case):
+    """``awkwardness`` of one finger pair on its keys (the pair table's pose, settled as an anchor is)."""
+    from .pose import WIDE_SEEDS, Contact
+    hand, f1, p1, f2, p2 = case
+    solver = _ctx['solvers'][hand]
+    contacts = [Contact(f1, p1, KEY_TRAVEL), Contact(f2, p2, KEY_TRAVEL)]
+    pose = solver.solve(contacts, seeds=WIDE_SEEDS, clearance=False)
+    if not pose.ok:
+        return case, float('inf')
+    pose = settle(solver, contacts, vector_of(pose), {d: pose.values.get(d, RELAXED[d]) for d in DIGITS}, vector_of(pose),
+                  ORIENTATION_PULLS[0])
+    return case, awkwardness(solver, contacts, pose)
+
+
+def pair_awkwardness(table, workers):
+    """The shape awkwardness (``awkwardness``) of every feasible finger pair of the pair table, shaped like it (inf
+    where infeasible): the planner prices a shape's strain with the measure the performer judges it by. Cached next
+    to the pair table, for its geometry and the code that measures it."""
+    import hashlib
+    code = hashlib.sha256(np.ascontiguousarray(table).tobytes())
+    for name in ('pipeline.py', 'coherence.py', 'motion.py', 'pose.py', 'kinematics.py', 'checks.py'):
+        code.update((HERE / name).read_bytes())
+    path = cache_path(RIG).with_name(f'pair_awkward_{cache_path(RIG).stem[6:]}_{code.hexdigest()[:8]}.npz')
+    if path.exists():
+        return np.load(path)['units']
+    units = np.full(table.shape, np.inf)
+    jobs = []
+    for h, hand in enumerate('LR'):
+        for f1 in DIGITS:
+            for f2 in DIGITS:
+                for pc in range(12):
+                    for interval in range(1, MAX_INTERVAL + 1):
+                        if f1 != f2 and table[h, f1 - 1, f2 - 1, pc, interval + MAX_INTERVAL]:
+                            p1 = REFERENCE_OCTAVE[hand] + pc
+                            jobs.append((hand, f1, p1, f2, p1 + interval))
+    with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(rig_path=str(RIG), notes={}, checks=True),)) as pool:
+        for (hand, f1, p1, f2, p2), u in progress_map(pool, _pair_awkward, jobs, 'pair awkwardness', 8):
+            h = 'LR'.index(hand)
+            units[h, f1 - 1, f2 - 1, p1 % 12, p2 - p1 + MAX_INTERVAL] = u
+            units[h, f2 - 1, f1 - 1, p2 % 12, p1 - p2 + MAX_INTERVAL] = u
+    np.savez_compressed(path, units=units)
+    return units
 
 
 def shape_key(anchor, notes):
@@ -182,10 +236,11 @@ def shape_report(chosen):
 def _settle(job):
     """First pose (over the given pulls) whose contact error is within ``limit``; None if none is. ``wide``: a
     stretched hand, searched from several wrist starts (``wide_settle``) with the first pull. ``starts``: other
-    (vector, values) to settle from as well; of the poses within ``limit`` the least sunk (``least_sunk``)."""
+    (vector, values) to settle from as well; of the poses within ``limit`` the least awkward (``awkwardness``)."""
     hand, contacts, vector, values, target, pulls, limit, *extra = job
     wide, starts = (list(extra) + [False, ()][len(extra):])[:2]
     solver = _ctx['solvers'][hand]
+    starts = [free_start(solver, contacts) if s == 'free' else s for s in starts]
     if wide:
         pose = wide_settle(solver, contacts, vector, {d: values.get(d, RELAXED[d]) for d in DIGITS}, target, pulls[0], limit)
         if pose is not None and pose.contact_error <= limit:
@@ -199,7 +254,7 @@ def _settle(job):
                 found.append(pose)
                 break
     if len(found) > 1 and solver.heightfield is not None:
-        return least_sunk(solver, contacts, found, limit)
+        return min(found, key=lambda p: awkwardness(solver, contacts, p))
     return found[0] if found else None
 
 
@@ -540,7 +595,7 @@ def run(args):
     t0 = time.perf_counter()
     inputs = piece_inputs(args.inputs)
     raw = load_raw(inputs)
-    planner_kwargs = dict(beam_width=args.beam, outer_voice_bonus=1.5, pair_table=table,
+    planner_kwargs = dict(beam_width=args.beam, outer_voice_bonus=1.5, pair_table=table, pair_strain=pair_awkwardness(table, workers),
                           weights=Weights(**({} if args.finger_spacing is None else dict(finger_spacing=args.finger_spacing)),
                                           **({} if args.lift_speed is None else dict(lift_speed=args.lift_speed))))
     stages['planning'] = stages['anchor_poses'] = stages['chord_shapes'] = 0.
@@ -594,8 +649,11 @@ def run(args):
                     order.append(a)
                     contacts = a.contacts(notes)
                     # a stretched hand searched once, in the first round; the next rounds settle from what it found
+                    # a shape of two or more keys is also settled from a free start in the first round: the least
+                    # awkward is kept (its anchor's pose may sit in a strained basin)
                     jobs.append((h, contacts, vector_of(a.pose), a.pose.values, target, ORIENTATION_PULLS,
-                                 max(a.pose.contact_error, .0005), round_ == 0 and stretched(c.pitch for c in contacts)))
+                                 max(a.pose.contact_error, .0005), round_ == 0 and stretched(c.pitch for c in contacts),
+                                 ('free',) if round_ == 0 and len(contacts) > 1 else ()))
             for a, pose in zip(order, progress_map(pool, _settle, jobs, f'coherence {round_ + 1}/{COHERENCE_ROUNDS}')):
                 if pose is not None:
                     a.pose = pose

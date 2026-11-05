@@ -70,6 +70,11 @@ class GeometricHandModel:
         x = min(max(previous.x, low), high)
         return Placement(WristPose(x), abs(x - previous.x), window)
 
+    def comfortable_x(self, hand, keys):
+        """Wrist x where ``keys`` are comfortable (the middle of the range that holds them); None if impossible."""
+        window = self.chord_window(hand, keys)
+        return None if window is None else (window[0] + window[1]) / 2
+
     def hands_ordered(self, left, right):
         """Existing non-crossing fixed-palm style."""
         if left is None or right is None:
@@ -82,13 +87,29 @@ class RigHandModel(GeometricHandModel):
 
     ``pair_table[hand, f1-1, f2-1, p1 % 12, p2-p1+max]`` comes from the whole-hand
     pose solver that also generates the motion (performer.reach_table), so the
-    planner never chooses a chord shape the animated hand cannot hold.
+    planner never chooses a chord shape the animated hand cannot hold. ``pair_strain``, shaped like it
+    (performer.pipeline.pair_awkwardness), is the performer's awkwardness of the rig's hand holding each pair.
     """
 
-    def __init__(self, instrument, pair_table):
+    def __init__(self, instrument, pair_table, pair_strain=None):
         super().__init__(instrument)
         self.pair_table = pair_table
         self.max_interval = (pair_table.shape[-1] - 1) // 2
+        self.strain = pair_strain
+
+    def shape_strain(self, hand, keys):
+        """Awkwardness units of the rig's hand holding ``keys`` ((finger, pitch), two or more): the sum over its
+        neighbouring fingers' pairs; None without ``pair_strain``."""
+        if self.strain is None:
+            return None
+        h = 'LR'.index(hand)
+        keys = sorted(keys)
+        units = 0.
+        for (f1, p1), (f2, p2) in zip(keys, keys[1:]):
+            if f1 == f2 or p1 == p2 or abs(p2 - p1) > self.max_interval:
+                return float('inf')
+            units += float(self.strain[h, f1 - 1, f2 - 1, p1 % 12, p2 - p1 + self.max_interval])
+        return units
 
     def pair_feasible(self, hand, f1, p1, f2, p2):
         interval = p2 - p1
