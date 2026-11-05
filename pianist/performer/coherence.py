@@ -61,7 +61,10 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
                   np.concatenate([fingers[d].lower for d in digits]) if digits else []]
     upper = np.r_[vector[:3] + POSITION_TRAVEL, YAW_BOUNDS[1], ROLL_BOUNDS[1],
                   np.concatenate([fingers[d].upper for d in digits]) if digits else []]
-    x = np.clip(np.r_[vector, np.concatenate([values[d] for d in digits]) if digits else []], lower, upper)
+    # start just inside the joint limits: a joint starting on its limit stalls the bounded solve (every step the
+    # clip bends back fails), and the pose stays where it began
+    margin = np.r_[np.zeros(3), np.full(len(lower) - 3, START_MARGIN)]
+    x = np.clip(np.r_[vector, np.concatenate([values[d] for d in digits]) if digits else []], lower + margin, upper - margin)
     depths = {c.pitch: c.depth for c in contacts}
     stretch = stretched(depths)
     vals = dict(values)
@@ -152,7 +155,9 @@ WIDE_COARSE_ITERATIONS = 15     # every start is taken this far and scored (its 
 WIDE_KEEP = 3                   # ... and the best few settled fully
 WIDE_ITERATIONS = 60
 THUMB_SINK_WEIGHT = 2.          # the thumb's side lying on the next key reads worst
+START_MARGIN = .1               # deg: a settle starts its angles this far inside their limits (``settle``)
 WIDE_CLEAN = 1.                 # mm: a stretched hand whose plain settle sinks no deeper than this is not searched
+WIDE_CLEAN_CONTACT = .0005      # m: ... when it is this close to its keys (off them, it is searched anyway)
 
 
 def sunk(solver, contacts, pose):
@@ -189,14 +194,14 @@ def wide_settle(solver, contacts, vector, values, target, pull, limit):
     a wide hand has several: the thumb's joint lying across the next key, or the wrist back and low with the thumb
     along its key. Settle from each of ``WIDE_STARTS`` (and near the keys' front edge), then toward ``target``; keep
     the pose within ``limit`` whose fingers sink least (``sink``), else the closest. Every start is scored after
-    ``WIDE_COARSE_ITERATIONS``; the ``WIDE_KEEP`` best go on. A plain settle that sinks nowhere (``WIDE_CLEAN``) is
-    kept without the search. None without a heightfield."""
+    ``WIDE_COARSE_ITERATIONS``; the ``WIDE_KEEP`` best go on. A plain settle on its keys (``WIDE_CLEAN_CONTACT``) that sinks
+    nowhere (``WIDE_CLEAN``) is kept without the search; one off its keys is no reason to stop looking. None without a heightfield."""
     if solver.heightfield is None:
         return None
     vector = np.asarray(vector, FLOAT)
     plain = settle(solver, contacts, vector, values, target, pull)
-    if plain.contact_error <= limit and max(sunk(solver, contacts, plain)) <= WIDE_CLEAN:
-        return plain                     # nothing sinks where it starts: no other basin to look for
+    if plain.contact_error <= min(limit, WIDE_CLEAN_CONTACT) and max(sunk(solver, contacts, plain)) <= WIDE_CLEAN:
+        return plain                     # on its keys and nothing sinks where it starts: no other basin to look for
     coarse = []
     for front in (None, WIDE_FRONT):
         for start in WIDE_STARTS:
