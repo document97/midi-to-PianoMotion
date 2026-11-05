@@ -1,8 +1,8 @@
 """Listening preview of a note selection.
 
 ``render`` (the preview.wav of a run) plays the selected notes with the source CC64 on a sampled grand piano
-(FluidSynth with the Salamander Grand Piano SF2, Yamaha C5; see TOOLS_DIR) and writes WAV with one uniform gain
-(peak to PEAK_DB), nothing else: no compression, EQ or effects. A note the planner shortens is let go at its key
+(FluidSynth with Dore Mark's Fazioli F308 SF2; see TOOLS_DIR) and writes WAV with one uniform gain (peak to
+PEAK_DB), nothing else: no compression, EQ or effects (FluidSynth's reverb and chorus off). A note the planner shortens is let go at its key
 lift, so its sound stops where the source damper closes after it.
 
 ``synthesize`` is the plainer in-house sampler (Windows GM samples, the envelope of lib/render_bound_piano_audio.py)
@@ -27,7 +27,9 @@ SOUNDBANK = Path('C:/Windows/System32/drivers/gm.dls')
 RATE = 44100
 TOOLS_DIR = Path(__file__).resolve().parents[2] / 'tools'     # downloaded once, never committed (README)
 FLUIDSYNTH = Path(os.environ.get('PIANOMOTION_FLUIDSYNTH', TOOLS_DIR / 'fluidsynth' / 'bin' / 'fluidsynth.exe'))
-SOUNDFONT = Path(os.environ.get('PIANOMOTION_SOUNDFONT', TOOLS_DIR / 'salamander' / 'SalamanderGrandPiano-V3+20200602.sf2'))
+SOUNDFONT = Path(os.environ.get('PIANOMOTION_SOUNDFONT', TOOLS_DIR / 'fazioli' / "Dore Mark's Fazioli F308-v2.6.sf2"))
+SYNTH_GAIN = .5                       # FluidSynth's master gain: its 16-bit output clips at 1.0 with this piano; halved
+                                      # again if a render still reaches full scale (the WAV's gain is set after)
 PEAK_DB = -1.
 MIDI_TICKS_PER_SECOND = 2000          # the preview MIDI's clock (0.5 ms)
 
@@ -60,11 +62,17 @@ def render(timeline, note_ids, path, duration=None, cut_releases=None):
     with tempfile.TemporaryDirectory() as folder:
         midi, raw = Path(folder) / 'preview.mid', Path(folder) / 'preview.wav'
         midi.write_bytes(_midi_file(events))
-        subprocess.run([str(FLUIDSYNTH), '-ni', '-q', '-g', '1.0', '-r', str(RATE), '-F', str(raw), str(SOUNDFONT), str(midi)],
-                       check=True, capture_output=True)
-        with wave.open(str(raw), 'rb') as reader:
-            channels, width = reader.getnchannels(), reader.getsampwidth()
-            audio = np.frombuffer(reader.readframes(reader.getnframes()), dtype='<i2').reshape(-1, channels) / 32768.
+        gain = SYNTH_GAIN
+        while True:
+            subprocess.run([str(FLUIDSYNTH), '-ni', '-q', '-R', '0', '-C', '0', '-g', str(gain), '-r', str(RATE), '-F', str(raw),
+                            str(SOUNDFONT), str(midi)], check=True, capture_output=True)
+            with wave.open(str(raw), 'rb') as reader:
+                channels, width = reader.getnchannels(), reader.getsampwidth()
+                samples = np.frombuffer(reader.readframes(reader.getnframes()), dtype='<i2').reshape(-1, channels)
+            if np.abs(samples.astype(np.int32)).max() < 32767 or gain < .01:
+                break
+            gain /= 2
+        audio = samples / 32768.
     if duration is not None:
         frames = math.ceil(duration * RATE)
         audio = np.pad(audio, ((0, max(0, frames - len(audio))), (0, 0)))[:frames]

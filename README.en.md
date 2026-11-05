@@ -38,7 +38,7 @@ Only the algorithm. The character, piano and scene models used during developmen
 ## Requirements
 
 - Python (with `numpy`, `scipy`, `mido`) and Blender.
-- For the listening audio (`preview.wav` in the output folder): [FluidSynth](https://github.com/FluidSynth/fluidsynth/releases) (the Windows build unpacked into `tools/fluidsynth/`) and the [Salamander Grand Piano](https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html) SF2 (a Yamaha C5, into `tools/salamander/`), or set `PIANOMOTION_FLUIDSYNTH` and `PIANOMOTION_SOUNDFONT`. The output is WAV with one uniform gain and nothing else.
+- For the listening audio (`preview.wav` in the output folder): [FluidSynth](https://github.com/FluidSynth/fluidsynth/releases) (the Windows build unpacked into `tools/fluidsynth/`) and Dore Mark's Fazioli F308 SF2 (a Fazioli grand, converted by soundfonts4u; that site is gone, the [Hugging Face mirror](https://huggingface.co/datasets/projectlosangeles/soundfonts4u) has `Dore Mark's Fazioli F308-v2.6.sf2`, into `tools/fazioli/`), or set `PIANOMOTION_FLUIDSYNTH` and `PIANOMOTION_SOUNDFONT`. The output is WAV with one uniform gain and nothing else.
 - Optional: PyTorch with GPU support (the CUDA build for NVIDIA, ROCm for AMD) to speed up the finger pair table. Without it, or without a GPU, the table is computed on CPU processes as before.
 - Developed on Windows 11, Python 3.12 and Blender 5.2; other setups have not been tested.
 

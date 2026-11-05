@@ -6,5 +6,5 @@ pianist/performer/rig_cache/
 output/
 *.blend
 *.blend1
-# preview-audio tools (FluidSynth, Salamander SF2): downloaded, never committed
+# preview-audio tools (FluidSynth, Fazioli SF2): downloaded, never committed
 tools/
