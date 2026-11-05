@@ -145,21 +145,33 @@ def free_start(solver, contacts):
     return vector_of(pose), pose.values
 
 
+def _free_start(shape):
+    hand, contacts = shape
+    return free_start(_ctx['solvers'][hand], list(contacts))
+
+
+def free_starts(pool, shapes, starts):
+    """Adds to ``starts`` the ``free_start`` of every (hand, contacts) of two or more keys in ``shapes`` it lacks: it
+    depends on nothing else, so each shape is solved once for every planning round and the coherence."""
+    todo = sorted({(h, tuple(c)) for h, c in shapes if len(c) > 1} - set(starts), key=repr)
+    starts.update(zip(todo, progress_map(pool, _free_start, todo, 'free starts')))
+
+
 def _awkward(job):
     """``awkwardness`` of an anchor settled from its pose (over the key surface, as the coherence settles it), or for
     a shape of two or more keys from a free start (``free_start``) where that is less awkward, as the coherence settles
     it too; None without a heightfield."""
-    hand, contacts, vector, values, error = job
+    hand, contacts, vector, values, error, free = job
     solver = _ctx['solvers'][hand]
     if solver.heightfield is None:
         return None
-    starts = [(vector, values)] + ([free_start(solver, contacts)] if len(contacts) > 1 else [])
+    starts = [(vector, values)] + ([free] if free is not None else [])
     return min(awkwardness(solver, contacts, settle(solver, contacts, v, {d: vals.get(d, RELAXED[d]) for d in DIGITS}, v,
                                                      ORIENTATION_PULLS[0])) for v, vals in starts)
 
 
 def _awkward_key(job):
-    hand, contacts, vector, values, error = job
+    hand, contacts, vector, values, error, free = job
     return hand, tuple(contacts), vector.tobytes(), tuple((d, np.asarray(v).tobytes()) for d, v in sorted(values.items())), error
 
 
@@ -182,9 +194,14 @@ def pair_awkwardness(table, workers):
     where infeasible): the planner prices a shape's strain with the measure the performer judges it by. Cached next
     to the pair table, for its geometry and the code that measures it."""
     import hashlib
+    import inspect
     code = hashlib.sha256(np.ascontiguousarray(table).tobytes())
-    for name in ('pipeline.py', 'coherence.py', 'motion.py', 'pose.py', 'kinematics.py', 'checks.py'):
+    for name in ('coherence.py', 'motion.py', 'pose.py', 'kinematics.py', 'checks.py'):
         code.update((HERE / name).read_bytes())
+    # of this module only what the measure runs (other edits here leave it valid)
+    code.update(repr((AWKWARD_SINK, AWKWARD_OUTER_SINK, AWKWARD_SIDEWAYS, AWKWARD_MISS)).encode())
+    for fn in (awkwardness, _pair_awkward):
+        code.update(inspect.getsource(fn).encode())
     path = cache_path(RIG).with_name(f'pair_awkward_{cache_path(RIG).stem[6:]}_{code.hexdigest()[:8]}.npz')
     if path.exists():
         return np.load(path)['units']
@@ -212,11 +229,16 @@ def shape_key(anchor, notes):
     return anchor.hand, frozenset((notes[i].index, notes[i].digit) for i in anchor.incoming + anchor.held)
 
 
-def awkward_shapes(anchors, notes, base, workers, cache=None):
-    """{shape_key: awkwardness units} of every anchor holding two or more keys."""
+def awkward_shapes(anchors, notes, base, workers, cache=None, starts=None):
+    """{shape_key: awkwardness units} of every anchor holding two or more keys. ``starts``: the free starts
+    (``free_starts``) found so far, added to."""
     chords = [a for a in anchors if len(a.incoming) + len(a.held) >= 2]
-    jobs = [(a.hand, a.contacts(notes), vector_of(a.pose), a.pose.values, float(a.pose.contact_error)) for a in chords]
+    starts = {} if starts is None else starts
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
+        shapes = [(a.hand, a.contacts(notes)) for a in chords]
+        free_starts(pool, shapes, starts)
+        jobs = [(h, c, vector_of(a.pose), a.pose.values, float(a.pose.contact_error), starts.get((h, tuple(c))))
+                for a, (h, c) in zip(chords, shapes)]
         found = progress_map(pool, _awkward, jobs, 'chord shapes', 2, cache, _awkward_key)
     out = {}
     for a, units in zip(chords, found):
@@ -240,7 +262,6 @@ def _settle(job):
     hand, contacts, vector, values, target, pulls, limit, *extra = job
     wide, starts = (list(extra) + [False, ()][len(extra):])[:2]
     solver = _ctx['solvers'][hand]
-    starts = [free_start(solver, contacts) if s == 'free' else s for s in starts]
     if wide:
         pose = wide_settle(solver, contacts, vector, {d: values.get(d, RELAXED[d]) for d in DIGITS}, target, pulls[0], limit)
         if pose is not None and pose.contact_error <= limit:
@@ -599,7 +620,7 @@ def run(args):
                           weights=Weights(**({} if args.finger_spacing is None else dict(finger_spacing=args.finger_spacing)),
                                           **({} if args.lift_speed is None else dict(lift_speed=args.lift_speed))))
     stages['planning'] = stages['anchor_poses'] = stages['chord_shapes'] = 0.
-    shapes, anchor_cache, shape_cache = {}, {}, {}
+    shapes, anchor_cache, shape_cache, starts = {}, {}, {}, {}
     for shape_round in range(SHAPE_ROUNDS):
         print(f'[planning] round {shape_round + 1}', flush=True)
         penalty = {k: AWKWARD_COST * (u - AWKWARD_FREE) for k, u in shapes.items() if u > AWKWARD_FREE}
@@ -617,7 +638,7 @@ def run(args):
         stages['anchor_poses'] += time.perf_counter() - t0
         # 2a. the awkwardness of the shapes this plan chose; shapes not priced yet send the piece back to planning
         t0 = time.perf_counter()
-        chosen = awkward_shapes(anchors, notes, dict(rig_path=str(RIG), notes=notes, checks=False), workers, shape_cache)
+        chosen = awkward_shapes(anchors, notes, dict(rig_path=str(RIG), notes=notes, checks=False), workers, shape_cache, starts)
         stages['chord_shapes'] += time.perf_counter() - t0
         unpriced = {k: u for k, u in chosen.items() if k not in shapes}
         shapes.update(unpriced)
@@ -640,6 +661,7 @@ def run(args):
     natural = {id(a): natural_orientation(posture_solvers[a.hand], a.pose.wrist) for a in anchors}
     turned = set()
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
+        free_starts(pool, [(a.hand, a.contacts(notes)) for a in anchors], starts)
         for round_ in range(COHERENCE_ROUNDS):
             order, jobs = [], []
             for h in 'LR':
@@ -653,7 +675,7 @@ def run(args):
                     # awkward is kept (its anchor's pose may sit in a strained basin)
                     jobs.append((h, contacts, vector_of(a.pose), a.pose.values, target, ORIENTATION_PULLS,
                                  max(a.pose.contact_error, .0005), round_ == 0 and stretched(c.pitch for c in contacts),
-                                 ('free',) if round_ == 0 and len(contacts) > 1 else ()))
+                                 (starts[h, tuple(contacts)],) if round_ == 0 and len(contacts) > 1 else ()))
             for a, pose in zip(order, progress_map(pool, _settle, jobs, f'coherence {round_ + 1}/{COHERENCE_ROUNDS}')):
                 if pose is not None:
                     a.pose = pose
