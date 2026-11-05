@@ -49,14 +49,19 @@ def render(timeline, note_ids, path, duration=None, cut_releases=None):
     for n in timeline['notes']:
         if n['id'] in wanted:
             events.append((n['start'], 1, bytes([0x90 | n['channel'], n['pitch'], max(1, n['velocity'])])))
-            events.append((min(n['end'], cut_releases.get(n['id'], n['end'])), 0, bytes([0x80 | n['channel'], n['pitch'], 0])))
+            if n['id'] in cut_releases and cut_releases[n['id']] < n['end']:
+                # a key the plan lifts early counts every pedal event at its lift instant as already happened
+                # (DamperClock.damping_time), so a lift as the pedal goes down is caught by it
+                events.append((cut_releases[n['id']], 3, bytes([0x80 | n['channel'], n['pitch'], 0])))
+            else:
+                events.append((n['end'], 0, bytes([0x80 | n['channel'], n['pitch'], 0])))
     for e in timeline['events']:
         m = e['message']
         if m['type'] == 'control_change':
-            # at one instant: releases, then the pedal going up, then new notes, then the pedal going down
+            # at one instant: source releases, the pedal going up, new notes, the pedal going down, planned lifts
             order = 0 if m['control'] == 64 and m['value'] < 64 else 2
             events.append((e['seconds'], order, bytes([0xB0 | m['channel'], m['control'], m['value']])))
-    events.sort(key=lambda e: (e[0], e[1]))
+    events.sort(key=lambda e: (round(e[0] * MIDI_TICKS_PER_SECOND), e[1]))   # by MIDI tick: an instant is one tick
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as folder:
