@@ -89,6 +89,9 @@ INTERMEDIATE_TURN = 120.          # deg/s: an intermediate pose turning the wris
 INTERMEDIATE_SPEED = .3           # m/s: ... or moving it off faster than this (deviation / time to the nearest
                                   # anchor) is dropped: a snap of the hand is worse than a pad off its key centre
 ARM_STRETCH = .998                # an out-of-reach wrist: the arm stretches to this share of its full length
+RELAX_DELAY = .15                 # s after a hand lifts some of its keys it settles around those it still holds ...
+RELAX_HOLD = .5                   # ... when it holds them at least this much longer before its next anchor (a pose
+                                  # taken for all of them is no pose to hold the rest in)
 HANDS_APART = .16                 # m between the wrists: an idle hand moves out of the playing one's way (about
                                   # 20 mm between the hands' bodies)
 YIELD_SPEED = .4                  # m/s: how fast the idle hand moves aside and back
@@ -105,6 +108,26 @@ AWKWARD_FREE = .5                 # units a shape may have without cost
 AWKWARD_COST = 9.                 # per unit beyond: one unit ~ an inner finger 6 mm into the next key ~ omitting a soft
                                   # inner note (Weights.omission x importance 8..16; melody and bass 12..24)
 SHAPE_ROUNDS = 4                  # planning rounds at most (each prices the shapes the previous plan chose)
+
+
+def relax_anchors(anchors, notes):
+    """Anchors (no new key) where a hand, having lifted some keys, holds the rest ``RELAX_HOLD`` or more before its
+    next anchor: there it settles around the keys it still holds (the coherence turns it to its natural orientation)
+    instead of keeping, through the hold, the shape it took for all of them."""
+    out = []
+    for h in 'LR':
+        mine = sorted((a for a in anchors if a.hand == h), key=lambda a: a.time)
+        for a, b in zip(mine, mine[1:]):
+            keys = a.incoming + a.held
+            lifts = sorted({notes[k].release for k in keys if a.time < notes[k].release < b.time})
+            for r, after in zip(lifts, lifts[1:] + [None]):
+                t = r + RELAX_DELAY
+                if after is not None and after <= t:
+                    continue                      # settle once the lifts close together are done
+                held = tuple(k for k in keys if notes[k].held_at(t))
+                if held and b.time - t >= RELAX_HOLD:
+                    out.append(Anchor(h, -1, t, a.x_hint, (), held))
+    return out
 
 
 def gentle(anchor, pose, path, others):
@@ -653,6 +676,11 @@ def run(args):
     stroke_of = strokes(notes)
     lifts = [free_releases([a for a in anchors if a.hand == h], notes, stroke_of, args.motion_cut) for h in 'LR']
     freed = dict(sound_identical=sum(l[0] for l in lifts), audible=sum(l[1] for l in lifts))
+    relaxed = relax_anchors(anchors, notes)
+    if relaxed:
+        anchors = anchors + solve_anchors(relaxed, notes, RIG, workers, cache=anchor_cache)
+        for a in anchors:   # a key a repair lifted earlier is no longer held
+            a.held = tuple(k for k in a.held if notes[k].held_at(a.time))
     stroke_of = strokes(notes)
     base = dict(rig_path=str(RIG), notes=notes, strokes=stroke_of, checks=not args.no_checks)
     # The anchors were solved square to the keys; the first settle turns each toward the hand's natural
