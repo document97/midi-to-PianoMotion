@@ -16,7 +16,8 @@ WHITE_DEEP = .012               # how far behind the black keys' front a white-k
 # The calibrated neutral wrist (from the bake's seat) sits over the white keys' front edge: from there the
 # fingers can only reach the keys curled steeply down onto their tips. Further back and lower, they meet
 # the keys with the pad (last phalanx ~40 deg; measured on test chords), about 3 cm above the key tops.
-PLAYING_WRIST_OFFSET = np.array([0., -.08, -.025], dtype=FLOAT)
+PLAYING_WRIST_OFFSET = np.array([0., -.08, .005], dtype=FLOAT)   # raised 3 cm (was -.025): the knuckles stay the
+                                                                # hand's highest point, the middle joints below them
 
 
 def deepen(regions):

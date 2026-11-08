@@ -35,7 +35,7 @@ LATERAL_HINGE = 4.              # ... beyond it, deg per unit: the hand moves ov
 NEUTRAL_ORIENTATION = np.array([15., 12.], dtype=FLOAT)               # weak pull of yaw, roll toward the hand's natural
                                                          # orientation on its forearm (posture.natural_orientation)
 POSITION_TRAVEL = .05
-PALM_HEIGHT = .022              # the wrist at least this far above the white key tops while playing (m; the palm tilted up, arm.PALM_PITCH): the palm
+PALM_HEIGHT = .035              # the wrist at least this far above the white key tops while playing (m; the palm tilted up, arm.PALM_PITCH): the palm
 PALM_SCALE = .004               # stays off the keys and the fingers reach down arched (m per unit, one-sided)
 CENTRE_SCALE = .001             # pad pulled toward its key's centre line (m per unit): the finger's sides stay off the neighbours
 

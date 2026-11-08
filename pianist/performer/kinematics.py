@@ -26,6 +26,9 @@ VALUE_NAMES = ('swing_lateral', 'swing_lift', 'mcp_delta', 'ip_delta')
 # octave, a small (160 cm) adult hand's limit: the thumb opens at its base joint (real abduction ~50 deg),
 # the little finger ~32. Thumb-little minor seventh before, octave (all keys) after; tenths are not one hand.
 SWING_LATERAL = {1: 50., 5: 32.}
+# The long fingers' last joint never straightens fully: a relaxed or playing finger keeps a small bend there (the
+# calibration's working bound allows 5 deg, which reads as a stiff, straight tip).
+LAST_JOINT_MIN = 14.
 # The web between neighbouring fingers: how far apart two neighbours may open (deg, the angle of their first phalanges
 # seen on the palm), each swinging sideways on its own up to SWING_LATERAL / the rig's bounds. From a pianist's right
 # hand (references/analysis/for_elise_060: index-middle p95 17 / p99 20, middle-ring 13 / 20, ring-little 52 / 66,
@@ -245,6 +248,8 @@ class Rig:
         for h in 'LR':
             for d, swing in SWING_LATERAL.items():
                 self.fingers[h][d].lower[0], self.fingers[h][d].upper[0] = -swing, swing
+            for d in (2, 3, 4, 5):
+                self.fingers[h][d].lower[3] = max(self.fingers[h][d].lower[3], LAST_JOINT_MIN)
 
     def web(self, hand):
         """(rest, slope, free, hard), each (6, 6) by digit: two fingers a < b are open by

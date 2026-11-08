@@ -34,7 +34,7 @@ for _d in (3, 4, 5):
 # curve in all three joints, the last phalanx ~60 deg down: keys are met with the pad. A hand spanning wide (an
 # octave) flattens: the knuckles open until they are about as high as the middle joints and the fingers lengthen.
 # The shape follows the span of the keys the hand holds, the same for planner and performer.
-ARCHED = {1: np.array([0., -4., 8., 16.], dtype=FLOAT), 2: np.array([0., -27., 30., 8.], dtype=FLOAT)}
+ARCHED = {1: np.array([0., -4., 8., 16.], dtype=FLOAT), 2: np.array([0., -35., 30., 20.], dtype=FLOAT)}
 FLAT = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 12., 34., 18.], dtype=FLOAT)}
 for _d in (3, 4, 5):
     ARCHED[_d], FLAT[_d] = ARCHED[2], FLAT[2]

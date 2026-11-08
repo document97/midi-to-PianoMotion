@@ -81,6 +81,24 @@ STROKE_CLEAR_SMOOTH = .025       # gaussian width spreading a correction over ne
 FLOOR_SCALE = .0005              # skin below the key surface, metres per residual unit
 FREE_VALUE_SCALE = 20.           # a free finger leaves its keyposed values by as little as possible (deg per unit)
 IK_VALUE_SCALE = 15.             # prior toward the seed: fixes the finger's free direction (3 targets, 4 values)
+# How each finger rises off its key by itself (anatomy, and the reference mocap's free fingers): the index lifts high
+# from its knuckle keeping its curve; the middle and little fingers lift less and open the knuckle and middle joint
+# together (a flatter finger); the ring finger hardly lifts on its own. FINGER_REACH: share of the hover / lift height
+# a finger takes on its own (the rest of a loud stroke comes from the hand, strike_lift). FINGER_JOINTS: how freely
+# each value (sideways, knuckle, middle, last) leaves its shape when the finger moves off the key (x the scales).
+FINGER_REACH = {1: 1., 2: 1., 3: .6, 4: .35, 5: .6}
+# A free finger that would dip into the keys rises along its own path (deg per unit, from the shape it waits in):
+# the index from its knuckle keeping its curve, the others opening knuckle and middle joint together (flatter, the
+# middle joint staying below the knuckle; curling up instead cannot clear the keys). The smallest step that clears
+# is taken; a finger the path cannot clear falls back to the free solve.
+LIFT_PATH = {2: np.array([0., 50., 0., 0.], dtype=FLOAT), 3: np.array([0., 35., -30., -10.], dtype=FLOAT),
+             4: np.array([0., 35., -30., -10.], dtype=FLOAT), 5: np.array([0., 35., -30., -10.], dtype=FLOAT)}
+LIFT_PATH_STEPS = 12
+FINGER_JOINTS = {1: np.ones(4, dtype=FLOAT),
+                 2: np.array([1., 1.6, .5, .5], dtype=FLOAT),
+                 3: np.array([1., 1.2, 1.2, .8], dtype=FLOAT),
+                 4: np.array([1., 1., .7, .7], dtype=FLOAT),
+                 5: np.array([1., 1.2, 1.2, .8], dtype=FLOAT)}
 FLOOR_RAMP = .015                # the key floor phases in over a stroke: lowered this much at the key (m)
 SPACING_SHARE = .85              # free fingers keep this share of the relaxed fingertip spacing from their neighbours
 SPACING_SOFTNESS = .002          # smooth maximum width (m)
@@ -399,9 +417,9 @@ def strokes(notes):
         mine.sort(key=lambda n: n.touch)
         timing = []
         for n in mine:
-            height = hover_height(n.velocity)
+            height = hover_height(n.velocity) * FINGER_REACH[n.digit]
             strike = 2 * height * max(n.onset - n.touch, 1e-3) / KEY_TRAVEL
-            timing.append([strike, height, KEY_RETURN_SECONDS, LIFT_HEIGHT])
+            timing.append([strike, height, KEY_RETURN_SECONDS, LIFT_HEIGHT * FINGER_REACH[n.digit]])
         for (p, tp), (n, tn) in zip(zip(mine, timing), zip(mine[1:], timing[1:])):
             need = tp[2] + tn[0]
             gap = n.touch - p.release
@@ -845,10 +863,22 @@ class FingerIK:
         if not self.below_floor(digit, {**others, digit: start}, palm, lowered).any():
             return start
         finger = self.solver.rig.fingers[self.solver.hand][digit]
+        if digit in LIFT_PATH:
+            def along(u):
+                return np.clip(start + u * LIFT_PATH[digit], finger.lower, finger.upper).astype(FLOAT)
+            if not self.below_floor(digit, {**others, digit: along(1.)}, palm, lowered).any():
+                lo, hi = 0., 1.
+                for _ in range(LIFT_PATH_STEPS):
+                    mid = (lo + hi) / 2
+                    if self.below_floor(digit, {**others, digit: along(mid)}, palm, lowered).any():
+                        lo = mid
+                    else:
+                        hi = mid
+                return along(hi)
 
         def residual(v):
             others[digit] = v
-            return np.r_[(v - start) / FREE_VALUE_SCALE, self.below_floor(digit, others, palm, lowered)]
+            return np.r_[(v - start) / (FREE_VALUE_SCALE * FINGER_JOINTS[digit]), self.below_floor(digit, others, palm, lowered)]
 
         # The finger lifts over the keys; its sideways swing is left to the spacing (dodging sideways
         # here would be undone by it, back onto a black key).
@@ -878,7 +908,7 @@ class FingerIK:
         def residual(v):
             values[digit] = v
             point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
-            out = np.r_[(point - target) / .0002, (v - seed) / IK_VALUE_SCALE,
+            out = np.r_[(point - target) / .0002, (v - seed) / (IK_VALUE_SCALE * FINGER_JOINTS[digit]),
                         pad_residual(self.solver, digit, v, palm)]
             if lowered is not None:
                 out = np.r_[out, self.below_floor(digit, values, palm, lowered)]
@@ -1034,7 +1064,7 @@ def stroke_clearance(s, pitch, digit, path, solver, ik, notes):
         if below(base).max() * FLOOR_SCALE < STROKE_CLEAR_TOLERANCE:
             continue
         lower[0] = upper[0] = np.clip(base[0], finger.lower[0], finger.upper[0])
-        x, _ = PoseSolver._levenberg_marquardt(lambda v: np.r_[(v - base) / FREE_VALUE_SCALE, below(v)],
+        x, _ = PoseSolver._levenberg_marquardt(lambda v: np.r_[(v - base) / (FREE_VALUE_SCALE * FINGER_JOINTS[digit]), below(v)],
                                                np.clip(base, lower, upper), lower, upper, np.full(4, 1e-2, dtype=FLOAT),
                                                IK_ITERATIONS)
         deltas[i] = (x - base) * fade
