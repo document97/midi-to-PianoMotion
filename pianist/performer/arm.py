@@ -9,6 +9,10 @@ import numpy as np
 
 from .kinematics import FLOAT, basis, loc_rot_scale, mat3_q, q_axis, q_mat3, q_mul
 
+# deg the playing palm is tilted up from the calibrated (bake) hand, about the axis across the hand: the back of the hand
+# rises from the wrist to the knuckles (pose.ARCHED bends the knuckles down past it, so they are its highest point)
+PALM_PITCH = 15.
+
 ELBOW_OUT = .035                # elbow rest: this far outside the shoulder (elbows a little wider than the shoulders)
 ELBOW_FOLLOW = .4               # share of the hand's sideways position the elbow follows
 
@@ -74,8 +78,9 @@ class Arm:
         self.upper_elbow_link = np.array(data['upper_elbow_link'], dtype=FLOAT)
         self.elbow_twist_link = np.array(data['elbow_twist_link'], dtype=FLOAT)
         self.twist_wrist_link = np.array(data['twist_wrist_link'], dtype=FLOAT)
-        self.palm = np.array(data['palm'], dtype=FLOAT)
         self.palm_forward = np.array(data['palm_forward'], dtype=FLOAT)
+        across = np.cross(self.palm_forward, (0., 0., 1.))
+        self.palm = q_mul(q_axis(across / np.linalg.norm(across), PALM_PITCH), np.array(data['palm'], dtype=FLOAT)).astype(FLOAT)
 
     def palm_q(self, yaw, roll):
         return q_mul(q_axis((0, 0, 1), yaw), q_mul(q_axis(self.palm_forward, roll), self.palm))

@@ -19,8 +19,8 @@ from .checks import stretched
 from .anchors import KEY_TRAVEL
 from .kinematics import DIGITS, FLOAT
 from .posture import natural_orientation
-from .motion import SIDEWAYS_FREE, PLAYING_SHAPE, pad_residual, DEPART_DELAY, FLOOR_SCALE, MOVE_BASE_SECONDS, MOVE_SPEED, UNHURRIED, KeyFloor, KeySurface
-from .pose import CONTACT_TOLERANCE, RELAXED, ROLL_BOUNDS, VALUE_SCALE, WEB_SCALE, YAW_BOUNDS, HandPose, PoseSolver, wrist_steps
+from .motion import SIDEWAYS_FREE, pad_residual, DEPART_DELAY, FLOOR_SCALE, MOVE_BASE_SECONDS, MOVE_SPEED, UNHURRIED, KeyFloor, KeySurface
+from .pose import CONTACT_TOLERANCE, RELAXED, hand_shape, ROLL_BOUNDS, VALUE_SCALE, WEB_SCALE, YAW_BOUNDS, HandPose, PoseSolver, wrist_steps
 
 NEIGHBOUR_SECONDS = .6          # gaussian width of the orientation smoothing over anchors
 COHERENCE_ROUNDS = 2
@@ -35,7 +35,7 @@ LATERAL_HINGE = 4.              # ... beyond it, deg per unit: the hand moves ov
 NEUTRAL_ORIENTATION = np.array([15., 12.], dtype=FLOAT)               # weak pull of yaw, roll toward the hand's natural
                                                          # orientation on its forearm (posture.natural_orientation)
 POSITION_TRAVEL = .05
-PALM_HEIGHT = .045              # the wrist at least this far above the white key tops while playing (m): the palm
+PALM_HEIGHT = .022              # the wrist at least this far above the white key tops while playing (m; the palm tilted up, arm.PALM_PITCH): the palm
 PALM_SCALE = .004               # stays off the keys and the fingers reach down arched (m per unit, one-sided)
 CENTRE_SCALE = .001             # pad pulled toward its key's centre line (m per unit): the finger's sides stay off the neighbours
 
@@ -70,6 +70,11 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
     vals = dict(values)
     natural = natural_orientation(solver, vector[:3])
     free_digits = [d for d in DIGITS if d not in digits]
+    shape = hand_shape(solver.span(depths))
+    # free fingers preferably clear the keys keeping their curve (the knuckle opened FREE_CURVED_LIFT), so the wrist
+    # stays high enough for them where the chord allows it; never at a cost to the contacts (re-settled without)
+    curved_free = {d: shape[d] + np.array([0., FREE_CURVED_LIFT, 0., 0.], dtype=FLOAT) for d in free_digits}
+    curved = [True]
     web_hard = solver.web_limit(digits)
     web_free = solver.web_limit(digits, solver.rig.web(solver.hand)[2])
 
@@ -108,6 +113,9 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
             for d in free_digits:
                 skin = (palm @ solver.local_clearance(d, {**vals, d: FREE_LIFTED[d != 1]}))[:3].T
                 out.append(np.maximum(0., surface(skin, depths, None) - skin[:, 2]) / FREE_CLEAR_SCALE)
+                if curved[0]:
+                    skin = (palm @ solver.local_clearance(d, {**vals, d: curved_free[d]}))[:3].T
+                    out.append(np.maximum(0., surface(skin, depths, None) - skin[:, 2]) / FREE_CURVED_SCALE)
         out.append(_order(solver, contacts, vals))
         out.append(np.array([vals[c.digit][0] / (THUMB_LATERAL_SCALE if c.digit == 1 else LATERAL_SCALE) for c in contacts], dtype=FLOAT))
         out.append(lateral_hinge(digits, vals))
@@ -118,11 +126,22 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
         out.append([max(0., solver.white_top + PALM_HEIGHT - v[2]) / PALM_SCALE])
         out.append((v[3:5] - natural) / NEUTRAL_ORIENTATION)
         for d in digits:
-            out.append((vals[d] - PLAYING_SHAPE[d]) / VALUE_SCALE)
+            out.append((vals[d] - shape[d]) / VALUE_SCALE)
         return np.concatenate(out)
 
+    def contact_error(v):
+        palm = unpack(v)
+        return max((float(np.max(np.abs(solver.regions.residual(c.pitch, c.depth,
+                                                                solver.contact_point(solver.pad_world(c.digit, vals, palm))))))
+                    for c in contacts), default=0.)
+
     steps = wrist_steps(len(digits))
-    x, used = PoseSolver._levenberg_marquardt(residuals, x, lower, upper, steps, iterations)
+    start = x.copy()
+    x, used = PoseSolver._levenberg_marquardt(residuals, start, lower, upper, steps, iterations)
+    if free_digits and surface is not None and contact_error(x) > CONTACT_TOLERANCE * 2.5:
+        curved[0] = False      # the curved free fingers held the hand off its keys (an octave's middle fingers)
+        x, more = PoseSolver._levenberg_marquardt(residuals, start, lower, upper, steps, iterations)
+        used += more
     palm = unpack(x)
     error, targets, clearance = 0., {}, 0.
     for c in contacts:
@@ -138,6 +157,8 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
 FREE_LIFTED = (np.array([0., 20., 8., 8.], dtype=FLOAT),     # a free thumb and finger lifted clear of the keys
                np.array([0., 20., 20., 10.], dtype=FLOAT))   # (lateral, lift, PIP, DIP)
 FREE_CLEAR_SCALE = .002         # m per unit: its skin below the key tops
+FREE_CURVED_LIFT = 10.          # deg a free finger keeping its curve opens its knuckle to clear the keys ...
+FREE_CURVED_SCALE = .01         # ... m per unit (a preference: far below a contact, 1 mm off its key = 5 units)
 WHITE_FRONT_CLEAR = .012        # white-key pads preferably this far in front of the black keys ...
 WHITE_FRONT_SCALE = .002        # ... m per unit (soft: a chord may still need them further in)
 BLACK_FRONT_IN = .012           # black-key pads preferably this far behind the black key's front ...

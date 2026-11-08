@@ -28,6 +28,30 @@ CLEARANCE_SCALE = .0005          # skin penetration into other keys, metres per 
 RELAXED = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 9., 34., 18.], dtype=FLOAT)}
 for _d in (3, 4, 5):
     RELAXED[_d] = RELAXED[2]
+# The playing hand (values: sideways swing, knuckle lift, middle joint, last joint; a negative lift bends the knuckle
+# down), the shape the contact fingers prefer and free fingers wait in. Its palm is tilted up from the wrist
+# (arm.PALM_PITCH), so with the knuckles bent down past it the knuckles are the hand's highest point and the fingers
+# curve in all three joints, the last phalanx ~60 deg down: keys are met with the pad. A hand spanning wide (an
+# octave) flattens: the knuckles open until they are about as high as the middle joints and the fingers lengthen.
+# The shape follows the span of the keys the hand holds, the same for planner and performer.
+ARCHED = {1: np.array([0., -4., 8., 16.], dtype=FLOAT), 2: np.array([0., -27., 30., 8.], dtype=FLOAT)}
+FLAT = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 12., 34., 18.], dtype=FLOAT)}
+for _d in (3, 4, 5):
+    ARCHED[_d], FLAT[_d] = ARCHED[2], FLAT[2]
+SPAN_ARCHED = .10                # m between the outermost keys' centres up to which the hand stays arched ...
+SPAN_FLAT = .155                 # ... and from which it is flat (an octave's outer keys are ~.165 apart)
+
+
+def span_share(span):
+    """0 (arched) .. 1 (flat) for a hand whose outermost keys are ``span`` metres apart (smoothstep)."""
+    x = min(max((span - SPAN_ARCHED) / (SPAN_FLAT - SPAN_ARCHED), 0.), 1.)
+    return x * x * (3. - 2. * x)
+
+
+def hand_shape(span):
+    """{digit: preferred values} of a hand spanning ``span`` metres."""
+    w = span_share(span)
+    return {d: (ARCHED[d] + (FLAT[d] - ARCHED[d]) * w).astype(FLOAT) for d in DIGITS}
 VALUE_SCALE = np.array([18., 18., 30., 25.], dtype=FLOAT)   # degrees per unit of preference residual
 WEB_SCALE = .5                  # degrees per unit two fingers open beyond the web's limit (kinematics.Rig.web): a wall
 WRIST_SCALE = np.array([.04, .03, .025, 12., 10.], dtype=FLOAT)   # x, y, z (m), yaw, roll (deg)
@@ -139,6 +163,11 @@ class PoseSolver:
                                  for d in DIGITS}
 
     # ----- geometry -----
+    def span(self, pitches):
+        """Metres between the centres of the outermost of ``pitches`` (0 for one key)."""
+        xs = [self.regions.centre(p)[0] for p in pitches]
+        return float(max(xs) - min(xs)) if xs else 0.
+
     def palm(self, wrist, yaw, roll):
         m = np.eye(4, dtype=FLOAT)
         m[:3, :3] = q_mat3(self.arm.palm_q(yaw, roll)) * self.arm.scale['wrist']
@@ -229,6 +258,7 @@ class PoseSolver:
 
         stretch = stretched(c.pitch for c in contacts)
         web = self.web_limit(digits)
+        shape = hand_shape(self.span(c.pitch for c in contacts))
 
         def residuals(v, prior, clear):
             w, ya, ro, vals = unpack(v)
@@ -241,7 +271,7 @@ class PoseSolver:
                     out.append(self.clearance_residual(c.digit, vals, palm, depths, c.pitch, stretch))
             out.append(prior * (v[:5] - prior_wrist) / WRIST_SCALE)
             for d in digits:
-                out.append(prior * (vals[d] - RELAXED[d]) / VALUE_SCALE)
+                out.append(prior * (vals[d] - shape[d]) / VALUE_SCALE)
             return np.concatenate(out)
 
         steps = wrist_steps(len(digits))

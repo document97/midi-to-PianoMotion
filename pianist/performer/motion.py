@@ -28,7 +28,7 @@ from planner.music import KEY_RETURN_SECONDS
 from .anchors import KEY_TRAVEL, ease, lift_profile
 from .checks import CELL, OWN_KEY_TOLERANCE, Heightfield, brushed, depth_table, stretched
 from .kinematics import DIGITS, FLOAT
-from .pose import RELAXED, PoseSolver
+from .pose import ARCHED, RELAXED, PoseSolver, hand_shape
 
 MOVE_BASE_SECONDS = .10          # natural wrist move: base duration ...
 MOVE_SPEED = .9                  # ... plus distance / this speed (m/s)
@@ -52,6 +52,15 @@ ARC_RATIO, ARC_MAX = .15, .04    # wrist rises by this fraction of the travel (m
 LIFT_RATE = .3                   # m/s: a hurried leap lifts only between the release and the next touch, at most
                                  # this times that time (a hop, not a slide over the keys)
 ARC_MIN_DISTANCE = .02
+# Strike or crawl, per chord of a hand (measured on the reference pianist, references/data/for_elise_060):
+# the hand crawls (fingers walk, the wrist stays level) while a key stays held or the notes join legato;
+# it lifts and drops into the next chord when the same finger plays again, on a chord, on a position change
+# or after a rest. How high is set by the time the hand is free (release .. next touch), not the reason.
+LEGATO_MARGIN = .03              # a release this close before the next touch (or later) joins the notes
+STRIKE_REST = .3                 # a free hand this long before its next touch lifts even for a single note
+STRIKE_SHIFT = .025              # wrist travel (m) that counts as a position change
+LIFT_WINDOWS = (.12, .25, .4, .7, 1.)          # free time (s) ...
+LIFT_HEIGHTS = (0., .002, .007, .03, .05)      # ... and the wrist's rise (m): knuckle lift on the reference
 LEAD_IN_SECONDS = 1.2            # from the rest pose to the first anchor
 LIFT_HEIGHT = .008               # pad above the key top at the end of a lift (m)
 HOVER_HEIGHT = (.002, .025)      # pad above the key before the stroke: soft starts on the key, loud from above
@@ -91,15 +100,13 @@ REFINE_FREE_NEAR = .15           # a finger counts as free this long after its r
 LIFT_LATERAL_KEEP = .35          # a lifted finger lets its sideways swing go to this share, over the free time after
 LIFT_LATERAL_SOON = (.15, .45)   # its lift, when its next stroke is further than this away (s; none when sooner) ...
 LIFT_LATERAL_SECONDS = .2        # ... within at most this (the lift itself is too quick for it)
+APPROACH_SECONDS = .15          # a finger takes its key's sideways swing over this before its stroke ...
+APPROACH_MIN_TRAVEL = .005      # ... when the wrist travels further than this (m) to its touch
 TRANSITION_SPEED = 400.          # deg/s: a finger's lifted shape and its next hover shape (solved apart) meet at
                                  # most this fast; when one finger's notes follow closely, both shapes meet halfway
 
 
-# A pianist's hand: knuckles moderately bent and the finger joints curved, so the fingertip comes down
-# onto the key (the calibrated relaxed hand is flatter: MCP 34, IP 18). The thumb keeps its relaxed shape.
-# Geometric bends as measured on a reference pianist (FurElise dataset, performance 060: PIP ~27, DIP ~12 deg median): the last
-# joint stays open, so the finger meets the key with its pad rather than its tip.
-PLAYING_SHAPE = {1: RELAXED[1], **{d: np.array([0., 14., 42., 22.], dtype=FLOAT) for d in (2, 3, 4, 5)}}   # arched: the palm stays off the keys
+# The playing hand's shape (arched, flattened by a wide span) is pose.hand_shape, shared with the planner.
 PAD_PITCH_MAX = 50.              # deg: a last phalanx steeper than this meets the key with the fingertip (slips);
                                  # measured on the rig: the pad's lowest point is mid-pad below ~30, the tip above ~40;
                                  # an arched hand plays on the front of the pad, between the two
@@ -214,6 +221,24 @@ def _arc(va, vb, free):
     return min(ARC_MAX, ARC_RATIO * d) if free and d > ARC_MIN_DISTANCE else 0.
 
 
+def strike_lift(a, b, notes, free, keep, travel):
+    """Wrist rise (m) before anchor ``b``'s chord when the hand strikes it; 0 when it crawls. ``free``: when
+    the hand let go of its last key not kept; ``keep``: keys held through; ``travel``: wrist distance (m)."""
+    if keep or not b.incoming:
+        return 0.
+    touch = min(notes[k].touch for k in b.incoming)
+    window = touch - free
+    legato = window < LEGATO_MARGIN
+    shift = travel > STRIKE_SHIFT
+    if legato and not shift:
+        return 0.
+    same = {notes[k].digit for k in b.incoming} & {notes[k].digit for k in a.incoming + a.held}
+    chord = len(b.incoming) > 1
+    if not (same or chord or shift or window >= STRIKE_REST):
+        return 0.
+    return float(np.interp(window, LIFT_WINDOWS, LIFT_HEIGHTS))
+
+
 def wrist_path(anchors, notes, strokes, rest, duration):
     """``anchors`` of one hand (with poses); intermediate poses have no incoming keys and are passed through."""
     anchors = sorted(anchors, key=lambda a: a.time)
@@ -261,6 +286,14 @@ def wrist_path(anchors, notes, strokes, rest, duration):
         if end - start < MIN_MOVE_SECONDS:
             start = max(at, end - MIN_MOVE_SECONDS)
         arc = _arc(va, vb, not keep)
+        lift = strike_lift(a, b, notes, free, keep, float(np.linalg.norm(vb[:2] - va[:2])))
+        if lift > arc and start >= free:
+            # a strike: the arm lifts the hand as it lets go and lowers it onto the next chord, carrying
+            # it across over the whole free time (the hand lands as the first finger starts its stroke)
+            start = max(at, free + DEPART_DELAY)
+            end = max(end, min(arrive, b.time))
+            if end - start >= LIFT_WINDOWS[0]:
+                arc = lift
         if start < free and arc:
             # set off while a key is still held: the hand hops from its release to the next touch
             touch = min(end, min(notes[k].touch for k in b.incoming))
@@ -594,7 +627,7 @@ class Spacing:
 
     def __init__(self, solver):
         self.solver = solver
-        relaxed = {d: RELAXED[d] for d in DIGITS}
+        relaxed = {d: ARCHED[d] for d in DIGITS}          # the playing hand the free fingers wait in
         tips = {d: solver.local_pad(d, relaxed)[:3].mean(axis=1) for d in DIGITS}
         lateral = tips[5] - tips[2]
         self.lateral = lateral / np.linalg.norm(lateral)
@@ -844,18 +877,33 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
     """Keyposes at each stroke's start (hover) and end (lifted), relaxed hand in long gaps."""
     mine = sorted((replace(strokes_by_note[n.id]) for n in notes.values()
                    if n.hand == hand and n.digit == digit and n.id in waypoints), key=lambda s: s.hover)
-    relaxed = PLAYING_SHAPE[digit]          # free fingers wait curved, ready to play
+    # free fingers wait in the playing hand's shape (pose.hand_shape), arched or flattened by the span of the keys the
+    # hand is on around then (held, or about to be struck)
+    mine_hand = [n for n in notes.values() if n.hand == hand and n.id in waypoints]
+
+    def shape_at(t):
+        pitches = [n.pitch for n in mine_hand if n.touch - PREPARE_SECONDS <= t <= n.release]
+        return hand_shape(solver.span(pitches))[digit] if pitches else ARCHED[digit]
+
+    # before the hand's first stroke and after its last the hand is at rest, its fingers loose (RELAXED): they
+    # take the playing shape as the arm brings the hand onto the keys and let it go as it leaves
+    hand_strokes = [strokes_by_note[n.id] for n in notes.values() if n.hand == hand and n.id in waypoints]
+    first = min((s.hover for s in hand_strokes), default=None)
+    last = max((s.lift_end for s in hand_strokes), default=None)
     keyposes, previous = [], None
+    if first is not None:
+        keyposes += [Keypose(first - LEAD_IN_SECONDS, RELAXED[digit]), Keypose(first - .4 * LEAD_IN_SECONDS, shape_at(first))]
     for k, s in enumerate(mine):
         note = notes[s.note]
         next_hover = mine[k + 1].hover if k + 1 < len(mine) else np.inf
         if previous is None:
-            keyposes.append(Keypose(s.hover - PREPARE_SECONDS, relaxed))
+            if s.hover - PREPARE_SECONDS > first - .4 * LEAD_IN_SECONDS:
+                keyposes.append(Keypose(s.hover - PREPARE_SECONDS, shape_at(s.hover)))
         else:
             gap = s.hover - previous.lift_end
             if gap > RELAX_GAP_SECONDS:
-                keyposes += [Keypose(previous.lift_end + min(.3 * gap, RETURN_SECONDS), relaxed),
-                             Keypose(s.hover - min(.3 * gap, PREPARE_SECONDS), relaxed)]
+                t1, t2 = previous.lift_end + min(.3 * gap, RETURN_SECONDS), s.hover - min(.3 * gap, PREPARE_SECONDS)
+                keyposes += [Keypose(t1, shape_at(t1)), Keypose(t2, shape_at(t2))]
         poses = []
         # The finger takes its shape on the hand, and the hand carries it: the hover shape is solved
         # with the wrist where it will be at the touch, the lifted shape with the wrist of the release.
@@ -867,6 +915,19 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
             poses.append(values)
         s.poses = tuple(poses)
         keyposes += [Keypose(s.hover, poses[0]), Keypose(s.lift_end, poses[3])]
+        # A finger swings sideways toward its next key only as far as the hand has come to it: one pointing at its
+        # key while the hand is still on its way swings across its neighbours (crossings). Before its stroke its
+        # sideways swing is the hover swing times the share of the way the wrist has covered.
+        since = previous.lift_end if previous is not None else s.hover - PREPARE_SECONDS
+        aim = s.hover - APPROACH_SECONDS
+        if digit != 1 and aim > since + LIFT_LATERAL_SECONDS:
+            to = path(s.touch)[:2]
+            way = float(np.linalg.norm(path(since)[:2] - to))
+            if way > APPROACH_MIN_TRAVEL:
+                covered = float(np.clip(1. - np.linalg.norm(path(aim)[:2] - to) / way, 0., 1.))
+                early = poses[0].copy()
+                early[0] *= covered
+                keyposes.append(Keypose(aim, early))
         lo, hi = LIFT_LATERAL_SOON
         let_go = (1. - LIFT_LATERAL_KEEP) * float(np.clip((next_hover - s.lift_end - lo) / (hi - lo), 0., 1.))
         if digit != 1 and let_go > 0 and next_hover - s.lift_end <= RELAX_GAP_SECONDS:   # longer: relaxed keyposes
@@ -885,9 +946,14 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
             p.poses[3][:] += diff * share
             n.poses[0][:] -= diff * share
     if previous is not None:
-        keyposes.append(Keypose(previous.lift_end + RETURN_SECONDS, relaxed))
+        keyposes.append(Keypose(previous.lift_end + RETURN_SECONDS, shape_at(previous.lift_end + RETURN_SECONDS)))
+    if last is not None:
+        keyposes = [k for k in keyposes if k.time < last + RETURN_SECONDS + 1e-3]
+        keyposes += [Keypose(last + RETURN_SECONDS + 1e-3, ARCHED[digit]),
+                     Keypose(last + KEY_RETURN_SECONDS + LEAD_IN_SECONDS, RELAXED[digit])]
     else:
-        keyposes = [Keypose(0., relaxed)]
+        keyposes = [Keypose(0., RELAXED[digit])]
+    keyposes.sort(key=lambda k: k.time)
     track = FingerTrack(mine, keyposes)
     if ik.surface is not None:
         for s in mine:
@@ -895,7 +961,8 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
     # Off the key (free time, strike, lift): the values may let the skin dip into the keys under a moving
     # wrist. The smallest lift is solved on a coarse grid and interpolated, so the correction is smooth in
     # time; in a stroke the key floor is lowered toward its key as for the stroke's own poses.
-    times = np.arange(path.times[0], path.times[-1] + CLEAR_STEP, CLEAR_STEP)
+    # from the earliest keypose (the lead-in runs before zero; a yielding path's own grid starts at zero)
+    times = np.arange(min(path.times[0], keyposes[0].time), max(path.times[-1], keyposes[-1].time) + CLEAR_STEP, CLEAR_STEP)
     deltas = np.zeros((len(times), 4), dtype=FLOAT)
     for i, t in enumerate(times):
         s = track.stroke(t)

@@ -40,9 +40,10 @@ def _regions():
     return piano_regions(SOUNDBANK)
 
 
-def render(timeline, note_ids, path, duration=None, cut_releases=None):
+def render(timeline, note_ids, path, duration=None, cut_releases=None, lead=0.):
     """Write the preview WAV of ``note_ids`` (``cut_releases``: {note id: key lift} for notes the plan shortens);
-    returns the number of sounding notes. ``duration`` pads or trims the file to that many seconds."""
+    returns the number of sounding notes. ``duration`` pads or trims the file to that many seconds; ``lead``:
+    seconds of silence before the piece (the hands' silent lead-in)."""
     cut_releases = cut_releases or {}
     wanted = set(note_ids)
     events = []
@@ -81,6 +82,7 @@ def render(timeline, note_ids, path, duration=None, cut_releases=None):
     if duration is not None:
         frames = math.ceil(duration * RATE)
         audio = np.pad(audio, ((0, max(0, frames - len(audio))), (0, 0)))[:frames]
+    audio = np.pad(audio, ((round(lead * RATE), 0), (0, 0)))
     audio = audio * (10 ** (PEAK_DB / 20) / max(float(np.abs(audio).max()), 1e-8))
     with wave.open(str(path), 'wb') as writer:
         writer.setnchannels(channels)

@@ -18,7 +18,7 @@ import numpy as np
 
 from .checks import BRUSH_COST, BRUSH_DEPTH, CELL, OWN_KEY_TOLERANCE, stretched
 from .kinematics import DIGITS, FLOAT, child_euler
-from .pose import (CLEARANCE_SCALE, CONTACT_TOLERANCE, WEB_SCALE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, RELAXED, ROLL_BOUNDS,
+from .pose import (hand_shape, CLEARANCE_SCALE, CONTACT_TOLERANCE, WEB_SCALE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, RELAXED, ROLL_BOUNDS,
                    SEED_ITERATIONS, SEEDS, STEP_TOLERANCE, VALUE_SCALE, WRIST_SCALE, WRIST_TRAVEL, YAW_BOUNDS, HandPose,
                    wrist_steps)
 
@@ -316,7 +316,7 @@ class _Hand:
                 opening = self.web_rest[a, b] + self.web_slope[a, b] * (slots[:, j, 0] - slots[:, i, 0])
                 out.append(torch.relu(opening - self.web_hard[a, b])[:, None] / WEB_SCALE)
         out.append(prior * (x[:, :5] - c['prior_wrist']) / self.wrist_prior_scale)
-        out.append((prior * (slots - self.relaxed[c['digit']]) / self.value_scale).flatten(1))
+        out.append((prior * (slots - c['shape']) / self.value_scale).flatten(1))
         return torch.cat(out, 1)
 
     def _chunked(self, key, run, count):
@@ -462,6 +462,7 @@ class _Hand:
                 depth_map[c.pitch] = c.depth
             centre = np.array([x_hint, s.neutral[1], s.neutral[2]], FLOAT)
             values = np.array([RELAXED[d] for d in DIGITS], FLOAT)
+            shape = hand_shape(s.span(c.pitch for c in contacts))
             lower = np.r_[centre - WRIST_TRAVEL, YAW_BOUNDS[0], ROLL_BOUNDS[0], *[self.lower[d] for d in digits]]
             upper = np.r_[centre + WRIST_TRAVEL, YAW_BOUNDS[1], ROLL_BOUNDS[1], *[self.upper[d] for d in digits]]
             x = np.clip(np.r_[wrist, 0., 0., *[values[d - 1] for d in digits]], lower, upper)
@@ -469,14 +470,15 @@ class _Hand:
                              pitch=np.array([c.pitch for c in contacts], np.int64),
                              depth=np.array([c.depth for c in contacts], FLOAT), depth_map=depth_map, values=values,
                              prior_wrist=np.r_[x_hint, s.neutral[1], s.neutral[2], 0., 0.],
-                             stretch=stretched(c.pitch for c in contacts), lower=lower, upper=upper, x=x))
+                             stretch=stretched(c.pitch for c in contacts), lower=lower, upper=upper, x=x,
+                             shape=np.array([shape[d] for d in digits], FLOAT)))
         n_seeds = len(seeds)
         # problem-major, seed-minor rows
         stack = lambda k, dtype=FLOAT: torch.as_tensor(np.repeat(np.stack([r[k] for r in rows]).astype(dtype), n_seeds, 0),
                                                        device=self.dev)
         c = dict(digit=stack('digit', np.int64), onehot=stack('onehot'), pitch=stack('pitch', np.int64),
                  depth=stack('depth'), depth_map=stack('depth_map'), values=stack('values'),
-                 prior_wrist=stack('prior_wrist'), stretch=stack('stretch', bool))
+                 prior_wrist=stack('prior_wrist'), stretch=stack('stretch', bool), shape=stack('shape'))
         lower, upper, x = stack('lower'), stack('upper'), stack('x')
         offsets = torch.as_tensor(np.tile(np.array(seeds, FLOAT), (len(rows), 1)), device=self.dev)
         x[:, 0] += offsets[:, 1]

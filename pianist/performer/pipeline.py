@@ -53,7 +53,11 @@ def run_rig(run):
     report = json.loads((Path(run) / 'report.json').read_text(encoding='utf-8'))
     return HERE / 'rig_cache' / report.get('rig', LEGACY_RIG)
 FRAME_RATE = 60.                  # samples per second (written as fractional scene frames)
-TAIL_SECONDS = .6                 # after the source end
+TAIL_SECONDS = 2.4                # after the source end: the hands lift off and come to rest (silent)
+REST_OFFSET = np.array([0., -.25, -.09])   # before and after the piece the hands rest in front of the keys, below
+                                  # their tops (from the calibrated neutral wrist, which is over the keys' front edge)
+INTRO_SECONDS = 2.                # silent lead-in: the hands rest, then come onto the keys (motion and audio start
+                                  # this much later in the outputs)
 WARM_FRAMES = 12                 # frames solved before a chunk (discarded) so the warm start carries over
 CHUNKS_PER_WORKER = 4
 REFINE_ROUNDS = 3                 # wrist path -> contact check -> intermediate poses, repeated
@@ -523,7 +527,7 @@ def rig_finger_spacing(rig_path):
 
 def sideways(frames, notes, rate):
     """Share of presses where the playing finger swings sideways (the hand is not over its key)."""
-    swing = np.array([abs(frames[f'{n.hand}_values'][min(int(round(n.onset * rate)), len(frames['times']) - 1), n.digit - 1, 0])
+    swing = np.array([abs(frames[f'{n.hand}_values'][min(int(round((n.onset - frames['times'][0]) * rate)), len(frames['times']) - 1), n.digit - 1, 0])
                       for n in notes.values()])
     limit = np.array([SWING_LATERAL.get(n.digit, 24.) - 1. for n in notes.values()])
     return dict(over_15_deg=round(float((swing > 15).mean()), 3), at_limit=round(float((swing >= limit).mean()), 3),
@@ -715,7 +719,8 @@ def run(args):
     rig = Rig(RIG)
     duration = (args.end if args.end is not None else float(raw['timeline']['duration'])) + TAIL_SECONDS
     rest_solvers = performer_solvers(rig)
-    rest = {h: np.r_[rig.neutral_wrist[h], natural_orientation(rest_solvers[h], rig.neutral_wrist[h])] for h in 'LR'}
+    rest = {h: np.r_[rig.neutral_wrist[h] + REST_OFFSET, natural_orientation(rest_solvers[h], rig.neutral_wrist[h] + REST_OFFSET)]
+            for h in 'LR'}
     hand_notes = {h: {k: n for k, n in notes.items() if n.hand == h} for h in 'LR'}
 
     def paths_for(anchors):
@@ -785,7 +790,7 @@ def run(args):
         for (h, d), track in progress_map(pool, _track, [(h, d) for h in 'LR' for d in DIGITS], 'finger tracks'):
             tracks[h][d] = track
     # free fingers after the spacing: a smooth lift where the swing sank them into the keys
-    grid = np.arange(0., duration + CLEAR_STEP, CLEAR_STEP)
+    grid = np.arange(-INTRO_SECONDS, duration + CLEAR_STEP, CLEAR_STEP)
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(context, tracks=tracks),)) as pool:
         jobs = [(h, part) for h in 'LR' for part in chunks(grid, workers * 2)]
         parts = progress_map(pool, _room, jobs, 'finger room')
@@ -797,7 +802,7 @@ def run(args):
 
     # 5. frames
     t0 = time.perf_counter()
-    times = np.arange(0., duration, 1. / FRAME_RATE)
+    times = np.arange(-INTRO_SECONDS, duration, 1. / FRAME_RATE)
     context['tracks'] = tracks
     if args.dump:
         import pickle
@@ -818,6 +823,8 @@ def run(args):
     # 6. outputs
     frames['damper_intervals'] = damper_intervals(raw['timeline'])
     frames['damper'] = damper_depth(frames['damper_intervals'], frames['times'])
+    frames['times'] = frames['times'] + INTRO_SECONDS          # outputs start at the lead-in
+    frames['damper_intervals'] = frames['damper_intervals'] + INTRO_SECONDS
     np.savez_compressed(out / 'motion.npz', fps_source=rig.fps, rate=FRAME_RATE, **frames)
     played = {n.id for n in notes.values()}
     source = [n for n in raw['timeline']['notes'] if args.end is None or n['start'] <= args.end + 1e-9]
@@ -847,7 +854,7 @@ def run(args):
                     worst_penetration_mm={h: float(frames[f'{h}_penetration'].max() * 1000) for h in 'LR'},
                     arm_out_of_reach_frames={h: int((~frames[f'{h}_arm_ok']).sum()) for h in 'LR'}),
         seconds=dict(stages, total=time.perf_counter() - started), workers=workers,
-        music_seconds=duration - TAIL_SECONDS)
+        music_seconds=duration - TAIL_SECONDS, intro_seconds=INTRO_SECONDS)
     plan = dict(schema='performer-plan', notes=final_rows, omitted_ids=sorted(n['id'] for n in source if n['id'] not in played),
                 validation_problems=problems,
                 anchors=[dict(hand=a.hand, group=a.group, time=a.time, incoming=a.incoming, held=a.held, lifted=a.lifted,
@@ -855,7 +862,7 @@ def run(args):
     (out / 'plan.json').write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding='utf-8')
     (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     render(raw['timeline'], played, out / 'preview.wav',
-           cut_releases={r['id']: r['physical_release'] for r, _ in shortened})
+           cut_releases={r['id']: r['physical_release'] for r, _ in shortened}, lead=INTRO_SECONDS)
     return report
 
 
