@@ -54,10 +54,11 @@ def run_rig(run):
     return HERE / 'rig_cache' / report.get('rig', LEGACY_RIG)
 FRAME_RATE = 60.                  # samples per second (written as fractional scene frames)
 TAIL_SECONDS = 2.4                # after the source end: the hands lift off and come to rest (silent)
-REST_OFFSET = np.array([0., -.25, -.09])   # before and after the piece the hands rest in front of the keys, below
-                                  # their tops (from the calibrated neutral wrist, which is over the keys' front edge)
-INTRO_SECONDS = 2.                # silent lead-in: the hands rest, then come onto the keys (motion and audio start
-                                  # this much later in the outputs)
+REST_OFFSET = np.array([0., -.04, .03])    # before and after the piece the hands rest on the lap: the wrist this far
+                                  # from the thigh's top (rig_export.lap) where the palm lies
+REST_YAW = 30.                    # deg the resting hands are turned in toward each other
+INTRO_SECONDS = 2.                # the hands rest at least this long before the first note, then come onto the keys:
+                                  # a piece starting sooner is preceded by silence (motion and audio start that much later)
 WARM_FRAMES = 12                 # frames solved before a chunk (discarded) so the warm start carries over
 CHUNKS_PER_WORKER = 4
 REFINE_ROUNDS = 3                 # wrist path -> contact check -> intermediate poses, repeated
@@ -644,6 +645,7 @@ def run(args):
     inputs = piece_inputs(args.inputs)
     raw = load_raw(inputs)
     planner_kwargs = dict(beam_width=args.beam, outer_voice_bonus=1.5, pair_table=table, pair_strain=pair_awkwardness(table, workers),
+                          rest_x={h: float(Rig(RIG).neutral_wrist[h][0]) for h in 'LR'},
                           weights=Weights(**({} if args.finger_spacing is None else dict(finger_spacing=args.finger_spacing)),
                                           **({} if args.lift_speed is None else dict(lift_speed=args.lift_speed))))
     stages['planning'] = stages['anchor_poses'] = stages['chord_shapes'] = 0.
@@ -718,9 +720,14 @@ def run(args):
     t0 = time.perf_counter()
     rig = Rig(RIG)
     duration = (args.end if args.end is not None else float(raw['timeline']['duration'])) + TAIL_SECONDS
+    intro = max(0., INTRO_SECONDS - min(n['start'] for n in raw['timeline']['notes']))
     rest_solvers = performer_solvers(rig)
-    rest = {h: np.r_[rig.neutral_wrist[h] + REST_OFFSET, natural_orientation(rest_solvers[h], rig.neutral_wrist[h] + REST_OFFSET)]
-            for h in 'LR'}
+    rest = {}
+    for h in 'LR':      # on the lap: the palm on the thigh (rig_export.lap), the hand turned in a little
+        wrist = np.array(rig.data['hands'][h]['lap'], dtype=float) + REST_OFFSET
+        orientation = np.array(natural_orientation(rest_solvers[h], wrist), dtype=float)
+        orientation[0] += REST_YAW * (1. if h == 'R' else -1.)
+        rest[h] = np.r_[wrist, orientation]
     hand_notes = {h: {k: n for k, n in notes.items() if n.hand == h} for h in 'LR'}
 
     def paths_for(anchors):
@@ -790,7 +797,7 @@ def run(args):
         for (h, d), track in progress_map(pool, _track, [(h, d) for h in 'LR' for d in DIGITS], 'finger tracks'):
             tracks[h][d] = track
     # free fingers after the spacing: a smooth lift where the swing sank them into the keys
-    grid = np.arange(-INTRO_SECONDS, duration + CLEAR_STEP, CLEAR_STEP)
+    grid = np.arange(-intro, duration + CLEAR_STEP, CLEAR_STEP)
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(context, tracks=tracks),)) as pool:
         jobs = [(h, part) for h in 'LR' for part in chunks(grid, workers * 2)]
         parts = progress_map(pool, _room, jobs, 'finger room')
@@ -802,7 +809,7 @@ def run(args):
 
     # 5. frames
     t0 = time.perf_counter()
-    times = np.arange(-INTRO_SECONDS, duration, 1. / FRAME_RATE)
+    times = np.arange(-intro, duration, 1. / FRAME_RATE)
     context['tracks'] = tracks
     if args.dump:
         import pickle
@@ -823,8 +830,8 @@ def run(args):
     # 6. outputs
     frames['damper_intervals'] = damper_intervals(raw['timeline'])
     frames['damper'] = damper_depth(frames['damper_intervals'], frames['times'])
-    frames['times'] = frames['times'] + INTRO_SECONDS          # outputs start at the lead-in
-    frames['damper_intervals'] = frames['damper_intervals'] + INTRO_SECONDS
+    frames['times'] = frames['times'] + intro          # outputs start at the lead-in
+    frames['damper_intervals'] = frames['damper_intervals'] + intro
     np.savez_compressed(out / 'motion.npz', fps_source=rig.fps, rate=FRAME_RATE, **frames)
     played = {n.id for n in notes.values()}
     source = [n for n in raw['timeline']['notes'] if args.end is None or n['start'] <= args.end + 1e-9]
@@ -854,7 +861,7 @@ def run(args):
                     worst_penetration_mm={h: float(frames[f'{h}_penetration'].max() * 1000) for h in 'LR'},
                     arm_out_of_reach_frames={h: int((~frames[f'{h}_arm_ok']).sum()) for h in 'LR'}),
         seconds=dict(stages, total=time.perf_counter() - started), workers=workers,
-        music_seconds=duration - TAIL_SECONDS, intro_seconds=INTRO_SECONDS)
+        music_seconds=duration - TAIL_SECONDS, intro_seconds=intro)
     plan = dict(schema='performer-plan', notes=final_rows, omitted_ids=sorted(n['id'] for n in source if n['id'] not in played),
                 validation_problems=problems,
                 anchors=[dict(hand=a.hand, group=a.group, time=a.time, incoming=a.incoming, held=a.held, lifted=a.lifted,
@@ -862,7 +869,7 @@ def run(args):
     (out / 'plan.json').write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding='utf-8')
     (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     render(raw['timeline'], played, out / 'preview.wav',
-           cut_releases={r['id']: r['physical_release'] for r, _ in shortened}, lead=INTRO_SECONDS)
+           cut_releases={r['id']: r['physical_release'] for r, _ in shortened}, lead=intro)
     return report
 
 

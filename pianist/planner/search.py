@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from itertools import combinations
 import math
 
-from .hand_model import GeometricHandModel, RigHandModel
+from .hand_model import GeometricHandModel, RigHandModel, WristPose
 from .instrument import FINGERS, HANDS
 from .music import KEY_RETURN_SECONDS, MINIMUM_DOWNSTROKE_SECONDS, hand_split_pitches
 
@@ -130,13 +130,15 @@ class HandOption:
     fingers: tuple
 
 
-def initial_state():
-    return State(0., {h: HandState() for h in HANDS})
+def initial_state(rest_x=None):
+    """``rest_x``: {hand: wrist x (m)} where each hand rests before the piece: its first touch travels from there
+    (without it a hand's first key costs no travel, and an idle hand takes a note far from its own register)."""
+    return State(0., {h: HandState(pose=None if rest_x is None else WristPose(rest_x[h])) for h in HANDS})
 
 
 class Planner:
     def __init__(self, score, instrument, weights=Weights(), beam_width=48, finger_options=4, model=None,
-                 outer_voice_bonus=1., pair_table=None, pair_strain=None, shape_penalty=None):
+                 outer_voice_bonus=1., pair_table=None, pair_strain=None, shape_penalty=None, rest_x=None):
         """``pair_table``: two-finger feasibility of the animated rig (performer.reach_table); without it
         the fixed-palm screens are used. ``shape_penalty``: {(hand, frozenset of (note, finger) on the keys)}: cost
         of the animated hand's awkwardness in that shape (performer.pipeline.awkward_shapes); the search weighs it
@@ -149,7 +151,11 @@ class Planner:
         self.beam_width, self.finger_options = beam_width, finger_options
         self.split = hand_split_pitches(score)
         self.shape_penalty = shape_penalty or {}
+        self.rest_x = rest_x
         self.last_reason = None
+
+    def initial_state(self):
+        return initial_state(self.rest_x)
 
     def _reject(self, reason):
         self.last_reason = reason
@@ -430,7 +436,7 @@ class Planner:
         return candidates
 
     def run(self, groups, state=None):
-        beam = [state or initial_state()]
+        beam = [state or self.initial_state()]
         for group in groups:
             successors = [s for b in beam for s in self.expand(b, group)]
             if not successors:

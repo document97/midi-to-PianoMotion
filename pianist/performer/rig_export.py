@@ -264,6 +264,50 @@ def validation_poses(arm, skin, drivers, cal, hands, count, seed):
     return samples
 
 
+LAP_ALONG = .35                 # the hands rest on the thighs this share of the way from hip to knee ...
+LAP_OUT = .03                   # ... this far outside the thigh bone (m), on the top surface (the clothes on the thigh)
+
+
+def lap(arm, skin):
+    """{hand: (x, y, z)}: the top of each thigh (the clothes on it) where a hand rests before and after the piece:
+    the first skin from above not carried by an arm (its bones and what hangs from them, the sleeves: the arms lie
+    over the thighs here)."""
+    from mathutils import Vector
+    world = arm.matrix_world
+    evaluated = skin.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    inverse = skin.matrix_world.inverted()
+    names = {g.index: g.name for g in skin.vertex_groups}
+    carried = {b.name for side in SIDE.values() for b in [arm.data.bones[side + '腕']] + list(arm.data.bones[side + '腕'].children_recursive)}
+
+    def arm_skin(polygon):
+        weights = {}
+        for v in skin.data.polygons[polygon].vertices:
+            for g in skin.data.vertices[v].groups:
+                name = names.get(g.group, '')
+                if name in arm.data.bones:          # bone groups only (MMD adds others)
+                    key = 'arm' if name in carried else 'other'
+                    weights[key] = weights.get(key, 0.) + g.weight
+        return weights.get('arm', 0.) > weights.get('other', 0.)
+
+    out = {}
+    for h, side in SIDE.items():
+        bone = arm.pose.bones[side + '足']
+        hip, knee = world @ bone.head, world @ bone.tail
+        point = hip + (knee - hip) * LAP_ALONG
+        point.x += LAP_OUT * (1 if point.x > 0 else -1)
+        origin, down = inverse @ Vector((point.x, point.y, point.z + 1.)), inverse @ Vector((point.x, point.y, point.z))
+        direction = (down - origin).normalized()
+        while True:
+            ok, loc, _, polygon = evaluated.ray_cast(origin, direction, distance=(down - origin).length)
+            if not ok:
+                raise RuntimeError(f'no thigh surface found above {side}足')
+            if not arm_skin(polygon):
+                break
+            origin = loc + direction * 1e-4
+        out[h] = vec(skin.matrix_world @ loc)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True)
@@ -274,6 +318,8 @@ def main():
     arm, skin, drivers, body, keyboard = neutral_scene(cal)
     coords, normals = mesh_world(skin)
     hands = {h: export_hand(arm, skin, drivers[h], cal['hands'][h], coords, normals) for h in 'LR'}
+    for h, point in lap(arm, skin).items():
+        hands[h]['lap'] = point
     torso = None
     if body.bone is not None:
         torso = dict(bone=body.bone.name, pivot=vec(body.pivot), pre=mat(body.pre), world=mat(body.world),

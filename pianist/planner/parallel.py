@@ -55,7 +55,7 @@ def segment_bounds(groups, count, warm_seconds):
 def stitch(planner, decisions, repair_groups=24):
     """Replay decisions from the true state; repair infeasible stretches."""
     groups = planner.score.groups
-    state, index, repairs = initial_state(), 0, []
+    state, index, repairs = planner.initial_state(), 0, []
     while index < len(groups):
         successors = planner.expand(state, groups[index], forced=decisions[index].assignment)
         if successors:

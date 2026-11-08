@@ -72,6 +72,8 @@ RIDE_SLIP = .004                 # m per unit: a riding pad may slip toward its 
                                  # finger between the black keys or across the next one; never back, never sideways
 RIDE_FRONT_KEEP = .008           # ... staying this far behind the key's front edge
 IK_ITERATIONS = 20
+ROOM_WORSE = .001                # m: a room correction sinking a finger this much deeper than without it is cut back ...
+ROOM_SHARES = (0., .25, .5, .75)  # ... to the share of it that sinks least
 STROKE_CLEAR_STEP = .01          # grid of the strike / lift clearance (s)
 STROKE_CLEAR_FADE = .02          # ... faded out this close to the touch and the release
 STROKE_CLEAR_TOLERANCE = .0005   # skin this far into another key is left alone (m)
@@ -708,7 +710,23 @@ class Spacing:
             v = np.array(values[d], FLOAT)
             # the larger of the proximal and distal needs, blended (no flip when they disagree in sign)
             weights = np.abs(swings) ** 4 + 1e-30
-            v[0] = np.clip(v[0] + float(np.dot(swings, weights) / weights.sum()), fingers[d].lower[0], fingers[d].upper[0])
+            swing = float(np.dot(swings, weights) / weights.sum())
+            if give.get(d, 1.) >= 1.:
+                # ... but a free finger's one swing moves both halves: keep each half between its neighbours (one half's
+                # need taken whole swung the other half across a neighbour, a middle finger squeezed between the index
+                # and ring finger on neighbouring keys); with no room for both, the swing that misses each alike
+                low, high = -np.inf, np.inf
+                for k in range(2):
+                    if abs(slope[k]) < 1e-6:
+                        continue
+                    a = want[d - 1][k] + self.whole_gaps[d - 1][k] if d - 1 in want else -np.inf
+                    b = want[d + 1][k] - self.whole_gaps[d][k] if d + 1 in want else np.inf
+                    if a > b:
+                        a = b = (a + b) / 2
+                    ends = sorted(((a - s[d][k]) / slope[k], (b - s[d][k]) / slope[k]))
+                    low, high = max(low, ends[0]), min(high, ends[1])
+                swing = float(np.clip(swing, low, high)) if low <= high else float((low + high) / 2)
+            v[0] = np.clip(v[0] + swing, fingers[d].lower[0], fingers[d].upper[0])
             out[d] = v
         return self.web_fan(out, give)
 
@@ -1098,7 +1116,18 @@ def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previ
     room = ik.spacing.make_room(values, {d: give_way(tracks[d].stroke(t), t) for d in DIGITS})
     if apply_room:
         for d in DIGITS:
-            room[d] = np.clip(tracks[d].room_values(t, room[d]), fingers[d].lower, fingers[d].upper)   # zero on the key (FingerTrack._taper)
+            corrected = np.clip(tracks[d].room_values(t, room[d]), fingers[d].lower, fingers[d].upper)   # zero on the key (FingerTrack._taper)
+            # The correction is sampled apart and spread over its neighbours in time: on a hand moving fast it may
+            # belong to another place and push the finger into the keys it should clear. Taken only as far as it helps.
+            if np.abs(corrected - room[d]).max() < 1e-6:
+                room[d] = corrected
+                continue
+            base = ik.below_floor(d, {**room, d: room[d]}, palm, 0.).max()
+            if ik.below_floor(d, {**room, d: corrected}, palm, 0.).max() > base + ROOM_WORSE / FLOOR_SCALE:
+                share = min(ROOM_SHARES, key=lambda c: ik.below_floor(d, {**room, d: room[d] + c * (corrected - room[d])},
+                                                                    palm, 0.).max())
+                corrected = room[d] + share * (corrected - room[d])
+            room[d] = corrected
     return vector, room, error
 
 
