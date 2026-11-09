@@ -290,20 +290,27 @@ def neighbour_targets(anchors, offsets=None):
 MOTION_CUT_SECONDS = 0.         # a key may sound at most this much shorter so the wrist is not forced to jump
 # A key may lift before its note ends with the damper pedal down holding the sound (the score's sound is kept; the
 # pedal is shown down from shortly before such a lift to the note's end): the hand leaves for its next position at a
-# natural pace instead of flinging across at the last instant. Each key stays down at least PEDAL_MIN_PRESS.
+# natural pace instead of flinging across at the last instant. Each key stays down at least PEDAL_MIN_PRESS, and
+# through every pedal change of the score before its sound ends (and PEDAL_CHANGE_KEEP after it): a key already up
+# when the pedal changes would be cut there, and the change would have to be hidden. A change within PEDAL_CHANGE_SLACK
+# of the note's end is not held through: that is a legato note-off overlapping the next chord, cleared by the change.
 PEDAL_MIN_PRESS = .1
+PEDAL_CHANGE_KEEP = .1
+PEDAL_CHANGE_SLACK = .15
 
 
-def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS, pedal=True):
+def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS, pedal=True, pedal_changes=()):
     """Release keys earlier so the wrist can travel to its next position at a natural pace.
 
     Lifts that keep the sound identical (down to ``pedal_release``) are taken for an unhurried move.
     Where the wrist still could not make even its natural duration, the key is lifted earlier with
     an audible shortening of at most ``max_cut``, as a pianist does before a leap.
     ``anchors``: one hand's anchors with poses; ``strokes``: stroke timing by note.
-    With ``pedal`` the key lifts for an unhurried move whatever the sound (held by the pedal, ``sound_release``).
+    With ``pedal`` the key lifts for an unhurried move whatever the sound (held by the pedal, ``sound_release``),
+    never before the score's last pedal change (``pedal_changes``: seconds of every damper up and down) before its end.
     Returns (sound-identical lifts, audible lifts, pedalled lifts)."""
     anchors = sorted(anchors, key=lambda a: a.time)
+    changes = np.sort(np.asarray(pedal_changes, float))
     identical = audible = pedalled = 0
     for a, b in zip(anchors, anchors[1:]):
         keep = set(b.held)
@@ -317,7 +324,9 @@ def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS, pedal=Tru
                 continue
             lowest = max(n.earliest_release, n.onset + .05)
             if pedal:
-                new = min(n.release, max(unhurried_leave, n.onset + PEDAL_MIN_PRESS))
+                end = n.release - PEDAL_CHANGE_SLACK
+                change = changes[np.searchsorted(changes, end) - 1] if len(changes) and changes[0] < end else -np.inf
+                new = min(n.release, max(unhurried_leave, n.onset + PEDAL_MIN_PRESS, change + PEDAL_CHANGE_KEEP))
                 if new < n.release - 1e-6:
                     if new >= n.pedal_release - 1e-9:
                         identical += 1

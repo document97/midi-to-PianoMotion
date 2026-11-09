@@ -766,7 +766,10 @@ def run(args):
     stroke_of = strokes(notes)
     for n in notes.values():
         n.sound_release = n.release
-    lifts = [free_releases([a for a in anchors if a.hand == h], notes, stroke_of, args.motion_cut) for h in 'LR']
+    score_pedal = pedal_union(damper_intervals(raw['timeline']), [])
+    pedal_changes = score_pedal[np.isfinite(score_pedal)]          # every damper down and up of the score
+    lifts = [free_releases([a for a in anchors if a.hand == h], notes, stroke_of, args.motion_cut, pedal_changes=pedal_changes)
+             for h in 'LR']
     freed = dict(sound_identical=sum(l[0] for l in lifts), audible=sum(l[1] for l in lifts), pedalled=sum(l[2] for l in lifts))
     relaxed = relax_anchors(anchors, notes)
     if relaxed:
@@ -928,8 +931,14 @@ def run(args):
     stages['frames'] = time.perf_counter() - t0
 
     # 6. outputs
-    frames['damper_intervals'] = pedal_union(damper_intervals(raw['timeline']),
-                                             [(n.release - PEDAL_LEAD, n.sound_release) for n in notes.values()
+    # a key lifted early is held by an extra pedal to its sound's end, or to the score's next pedal-up (which clears it)
+    ups = np.sort(score_pedal[:, 1][np.isfinite(score_pedal[:, 1])])
+
+    def held_to(begin, end):
+        i = np.searchsorted(ups, begin, side='right')
+        return min(end, ups[i]) if i < len(ups) else end
+    frames['damper_intervals'] = pedal_union(score_pedal,
+                                             [(n.release - PEDAL_LEAD, held_to(n.release, n.sound_release)) for n in notes.values()
                                               if n.sound_release is not None and n.release < n.sound_release - 1e-3])
     frames['damper'] = damper_depth(frames['damper_intervals'], frames['times'])
     frames['times'] = frames['times'] + intro          # outputs start at the lead-in
