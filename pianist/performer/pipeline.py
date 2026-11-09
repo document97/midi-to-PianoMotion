@@ -89,17 +89,19 @@ def _init(context):
 # than moving in and out (the thumb on a black key, the little finger on a white one beside another black key). The
 # depth family is the whole pose settled at depths around the anchor's, everything but the depth free (the coherence's
 # settle); the wrist path chooses the depth over time (motion.solve_path) and takes the rest of the hand from it.
-FAMILY_STEP = .006               # m between the depths tried ...
-FAMILY_REACH = .06               # ... up to this far each way
+FAMILY_STEP = .008               # m between the depths tried ...
+FAMILY_REACH = .048              # ... up to this far each way
 FAMILY_PULL = np.array([.08, .0005, .015, 4., 4.])    # the depth held where it is tried, the rest settled as the coherence does
 FAMILY_HOLD = .002               # m: a settle that could not keep the depth this close is not that depth
 FAMILY_ITERATIONS = 8           # each depth settled from the one before (a few mm off): a short solve
 FAMILY_GIVE = .5                 # awkwardness units a depth may add to the pose's own (sink beside, swing, web, miss) ...
 FAMILY_OK = 1.                   # ... and up to this a depth is never too awkward: one standard for every chord, so a
-                                 # chord played where a fuller one around it is (as strained as that, at most) is not refused
+                                 # chord played where a fuller one around it is (as strained as that, at most) is not refused;
+FAMILY_SINK = .002               # but no finger sinks into the keys beside its own further than in the pose (or this, m)
+FAMILY_SINK_GIVE = .001          # ... plus this: a place is never bought with a finger in the keys
 # ... and at a depth the hand may turn: a figure is played at one depth and one turn where its chords allow, the
 # thumb on a black key reached by turning the hand rather than by moving it in and out. Turns are tried at every
-# other depth (and the ends), held like the depth.
+# third depth (and the ends), held like the depth.
 TURN_STEP = 8.                   # deg between the turns tried ...
 TURN_STEPS = 2                   # ... this many each way
 TURN_PULL = np.array([.08, .0005, .015, .2, 4.])
@@ -118,10 +120,12 @@ def depth_family(solver, anchor, notes):
     if not contacts:
         return base[None], [pose], np.zeros(1)
     own = awkwardness(solver, contacts, pose)
+    sink = max(FAMILY_SINK, max(sunk(solver, contacts, pose)) / 1000.) + FAMILY_SINK_GIVE
 
     def ok(p, target, hold_yaw):
         return (p.contact_error <= REACH_TOLERANCE / 2 and abs(float(p.wrist[1]) - target[1]) <= FAMILY_HOLD
                 and (not hold_yaw or abs(float(p.yaw) - target[3]) <= TURN_HOLD)
+                and max(sunk(solver, contacts, p)) / 1000. <= sink
                 and awkwardness(solver, contacts, p) <= max(own + FAMILY_GIVE, FAMILY_OK))
 
     def walk(v0, p0, axis, step, steps, pull, hold_yaw):
@@ -144,7 +148,7 @@ def depth_family(solver, anchor, notes):
 
     line = walk(base, pose, 1, FAMILY_STEP, int(round(FAMILY_REACH / FAMILY_STEP)), FAMILY_PULL, False)
     centre = next(i for i, (v, _) in enumerate(line) if v is base)
-    picks = sorted({i for i in range(len(line)) if (i - centre) % 2 == 0} | {0, len(line) - 1})
+    picks = sorted({i for i in range(len(line)) if (i - centre) % 3 == 0} | {0, len(line) - 1})
     places = list(line)
     for i in picks:
         places += [e for e in walk(*line[i], 3, TURN_STEP, TURN_STEPS, TURN_PULL, True) if e[1] is not line[i][1]]
