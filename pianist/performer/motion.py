@@ -406,11 +406,20 @@ def solve_path(anchors, notes, strokes, t0, t1):
         # the rest of their hold it may move on toward the next only among the places its keys are held from (the
         # extent of its family: a stretched chord has none); a key it would lose there is kept by an intermediate
         # anchor (the wrist path check's refinement), which has its places too
-        if t <= max(a.time, start + SETTLE_SECONDS) + 1e-9 or a.family is None:
+        # ... and where every key it still holds is one the next anchor holds too, among that one's places as well:
+        # the hand sets off for the next chord while it keeps the key (a thumb held into an octave above it)
+        if t <= max(a.time, start + SETTLE_SECONDS) + 1e-9:
             lb[k], ub[k] = v, v
+            target[k] = v
+            continue
+        places = v[None] if a.family is None else a.family[0]
+        if i + 1 < len(rows) and all(q in rows[i + 1][3] for q in keys
+                                     if notes[q].touch <= t + 1e-9 and t <= notes[q].release + 1e-9):
+            b, vb = rows[i + 1][0], rows[i + 1][1]
+            places = np.concatenate([places, vb[None] if b.family is None else b.family[0]])
         else:
-            lb[k], ub[k] = a.family[0].min(axis=0), a.family[0].max(axis=0)
-        target[k] = v
+            target[k] = v                # held where it is: pulled to its place; on the way on: free between the two
+        lb[k], ub[k] = places.min(axis=0), places.max(axis=0)
     # free windows: between an anchor's last release and the next anchor's first touch
     for (a, va, _, ka), (b, vb, sb, kb) in zip(rows, rows[1:]):
         if not b.incoming:
