@@ -135,6 +135,13 @@ class KeyRegions:
         ry = max(0., r['y'][0] - y) - max(0., y - r['y'][1])
         return np.array([rx, ry, z - (r['top'] - depth)], dtype=FLOAT)
 
+    def clamp(self, pitch, point):
+        """``point`` moved onto the key's playable part (x, y; z kept)."""
+        r = self.rows[pitch]
+        x = min(max(float(point[0]), r['wide'][0]), r['wide'][1])
+        y = min(max(float(point[1]), r['y'][0]), r['y'][1])
+        return np.array([x, y, point[2]], dtype=FLOAT)
+
     def centre(self, pitch):
         r = self.rows[pitch]
         return np.array([(r['wide'][0] + r['wide'][1]) / 2, (r['y'][0] + r['split']) / 2, r['top']], dtype=FLOAT)

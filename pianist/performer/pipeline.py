@@ -35,8 +35,9 @@ from .kinematics import DIGITS, SWING_LATERAL, Rig
 from .torso import Torso
 from .contacts import HandCapsules, finger_pairs, hands_gap, pointing, raised_between
 from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contact_error, contact_waypoints, finger_track, frame_hand,
-                     refine_points, refine_score, strokes, waypoint, wrist_path, SIDEWAYS_FREE, YieldingPath, yield_offsets)
-from .pedal import damper_depth, damper_intervals
+                     placed, refine_points, refine_score, strokes, waypoint, wrist_path, SIDEWAYS_FREE, YieldingPath,
+                     yield_offsets)
+from .pedal import PEDAL_LEAD, damper_depth, damper_intervals, pedal_union
 from .pose import RELAXED, hand_solvers
 from .progress import progress_map
 from .reach_table import MAX_INTERVAL, REFERENCE_OCTAVE, cache_path, load_or_compute
@@ -81,6 +82,79 @@ def _init(context):
     _ctx['torso'] = torso
     _ctx['capsules'] = {h: HandCapsules(rig, h, rig.arms[h].arm_inverse @ solvers[h].palm(rig.neutral_wrist[h], 0., 0.))
                         for h in 'LR'}
+
+
+# An anchor's pose is the most comfortable place for its own keys, but the keys can be played from other depths into
+# them too: a hand playing a figure stays at one depth, its white keys pressed further in or out, and it turns rather
+# than moving in and out (the thumb on a black key, the little finger on a white one beside another black key). The
+# depth family is the whole pose settled at depths around the anchor's, everything but the depth free (the coherence's
+# settle); the wrist path chooses the depth over time (motion.solve_path) and takes the rest of the hand from it.
+FAMILY_STEP = .006               # m between the depths tried ...
+FAMILY_REACH = .06               # ... up to this far each way
+FAMILY_PULL = np.array([.08, .0005, .015, 4., 4.])    # the depth held where it is tried, the rest settled as the coherence does
+FAMILY_HOLD = .002               # m: a settle that could not keep the depth this close is not that depth
+FAMILY_ITERATIONS = 8           # each depth settled from the one before (a few mm off): a short solve
+FAMILY_GIVE = .5                 # awkwardness units a depth may add to the pose's own (sink beside, swing, web, miss) ...
+FAMILY_OK = 1.                   # ... and up to this a depth is never too awkward: one standard for every chord, so a
+                                 # chord played where a fuller one around it is (as strained as that, at most) is not refused
+# ... and at a depth the hand may turn: a figure is played at one depth and one turn where its chords allow, the
+# thumb on a black key reached by turning the hand rather than by moving it in and out. Turns are tried at every
+# other depth (and the ends), held like the depth.
+TURN_STEP = 8.                   # deg between the turns tried ...
+TURN_STEPS = 2                   # ... this many each way
+TURN_PULL = np.array([.08, .0005, .015, .2, 4.])
+TURN_HOLD = 1.                   # deg
+
+
+def depth_family(solver, anchor, notes):
+    """The anchor's hand at other depths and turns: (wrist vectors, poses, awkwardness) of every place it was settled
+    at and holds its keys from, the pose's own first. The depths: settled at depths into the keys around its own, as
+    far each way as its keys are held without more strain (``awkwardness``, the measure the planner prices); the
+    turns: at every other of those depths, the hand turned each way as far as that holds. The wrist path chooses
+    among them (motion.choose_places)."""
+    pose = anchor.pose
+    contacts = anchor.contacts(notes)
+    base = vector_of(pose)
+    if not contacts:
+        return base[None], [pose], np.zeros(1)
+    own = awkwardness(solver, contacts, pose)
+
+    def ok(p, target, hold_yaw):
+        return (p.contact_error <= REACH_TOLERANCE / 2 and abs(float(p.wrist[1]) - target[1]) <= FAMILY_HOLD
+                and (not hold_yaw or abs(float(p.yaw) - target[3]) <= TURN_HOLD)
+                and awkwardness(solver, contacts, p) <= max(own + FAMILY_GIVE, FAMILY_OK))
+
+    def walk(v0, p0, axis, step, steps, pull, hold_yaw):
+        """Settles from (v0, p0) along ``axis`` by ``step`` each way while they hold: [(vector, pose)] with v0's."""
+        out = [(v0, p0)]
+        for sign in (-1., 1.):
+            last_v, last_values = v0, p0.values
+            for i in range(1, steps + 1):
+                target = v0.copy()
+                target[axis] += sign * i * step
+                start = last_v.copy()
+                start[axis] = target[axis]
+                p = settle(solver, contacts, start, {d: last_values.get(d, RELAXED[d]) for d in DIGITS}, target, pull,
+                           FAMILY_ITERATIONS)
+                if not ok(p, target, hold_yaw):
+                    break
+                last_v, last_values = vector_of(p), p.values
+                out.append((last_v, p))
+        return sorted(out, key=lambda e: float(e[0][axis]))
+
+    line = walk(base, pose, 1, FAMILY_STEP, int(round(FAMILY_REACH / FAMILY_STEP)), FAMILY_PULL, False)
+    centre = next(i for i, (v, _) in enumerate(line) if v is base)
+    picks = sorted({i for i in range(len(line)) if (i - centre) % 2 == 0} | {0, len(line) - 1})
+    places = list(line)
+    for i in picks:
+        places += [e for e in walk(*line[i], 3, TURN_STEP, TURN_STEPS, TURN_PULL, True) if e[1] is not line[i][1]]
+    places.sort(key=lambda e: e[1] is not pose)          # the pose's own first
+    return (np.array([e[0] for e in places]), [e[1] for e in places],
+            np.array([awkwardness(solver, contacts, e[1]) for e in places]))
+
+
+def _family(job):
+    return [depth_family(_ctx['solvers'][a.hand], a, _ctx['notes']) for a in job]
 
 
 def _check(job):
@@ -220,17 +294,17 @@ def _pair_awkward(case):
 def pair_awkwardness(table, workers):
     """The shape awkwardness (``awkwardness``) of every feasible finger pair of the pair table, shaped like it (inf
     where infeasible): the planner prices a shape's strain with the measure the performer judges it by. Cached next
-    to the pair table, for its geometry and the code that measures it."""
+    to the pair table, for its geometry and the code that measures it: only the code the measure can reach (codekey),
+    so an edit to another stage (the wrist path, the motion) leaves it valid."""
     import hashlib
     import inspect
-    code = hashlib.sha256(np.ascontiguousarray(table).tobytes())
-    for name in ('coherence.py', 'motion.py', 'pose.py', 'kinematics.py', 'checks.py'):
-        code.update((HERE / name).read_bytes())
-    # of this module only what the measure runs (other edits here leave it valid)
-    code.update(repr((AWKWARD_SINK, AWKWARD_OUTER_SINK, AWKWARD_SIDEWAYS, AWKWARD_MISS)).encode())
-    for fn in (awkwardness, _pair_awkward):
-        code.update(inspect.getsource(fn).encode())
-    path = cache_path(RIG).with_name(f'pair_awkward_{cache_path(RIG).stem[6:]}_{code.hexdigest()[:8]}.npz')
+    from . import arm, checks, kinematics, pose, regions
+    from .codekey import code_key
+    classes = [v for m in (kinematics, arm, pose, checks, regions) for v in vars(m).values()
+               if inspect.isclass(v) and v.__module__ == m.__name__]       # the solvers, rig and keys it runs on
+    code = code_key(_pair_awkward, awkwardness, performer_solvers, *classes,
+                    extra=hashlib.sha256(np.ascontiguousarray(table).tobytes()).digest())
+    path = cache_path(RIG).with_name(f'pair_awkward_{cache_path(RIG).stem[6:]}_{code[:8]}.npz')
     if path.exists():
         return np.load(path)['units']
     units = np.full(table.shape, np.inf)
@@ -644,6 +718,12 @@ def run(args):
     t0 = time.perf_counter()
     inputs = piece_inputs(args.inputs)
     raw = load_raw(inputs)
+    # the piece's own motion settings (optional): {"lift": share of the strike lifts, 1 = default}
+    settings = Path(args.inputs) / 'motion.json'
+    if settings.exists():
+        from . import motion
+        motion.LIFT_SCALE = float(json.loads(settings.read_text(encoding='utf-8')).get('lift', 1.))
+        print(f'[motion] {settings.name}: lift x{motion.LIFT_SCALE}', flush=True)
     planner_kwargs = dict(beam_width=args.beam, outer_voice_bonus=1.5, pair_table=table, pair_strain=pair_awkwardness(table, workers),
                           rest_x={h: float(Rig(RIG).neutral_wrist[h][0]) for h in 'LR'},
                           weights=Weights(**({} if args.finger_spacing is None else dict(finger_spacing=args.finger_spacing)),
@@ -680,8 +760,10 @@ def run(args):
     # 2b. free early releases (identical sound), then orientation coherence between neighbouring anchors
     t0 = time.perf_counter()
     stroke_of = strokes(notes)
+    for n in notes.values():
+        n.sound_release = n.release
     lifts = [free_releases([a for a in anchors if a.hand == h], notes, stroke_of, args.motion_cut) for h in 'LR']
-    freed = dict(sound_identical=sum(l[0] for l in lifts), audible=sum(l[1] for l in lifts))
+    freed = dict(sound_identical=sum(l[0] for l in lifts), audible=sum(l[1] for l in lifts), pedalled=sum(l[2] for l in lifts))
     relaxed = relax_anchors(anchors, notes)
     if relaxed:
         anchors = anchors + solve_anchors(relaxed, notes, RIG, workers, cache=anchor_cache)
@@ -734,7 +816,14 @@ def run(args):
         return {h: wrist_path([a for a in anchors if a.hand == h], hand_notes[h], stroke_of, rest[h], duration)
                 for h in 'LR'}
 
-    paths, waypoints = paths_for(anchors), contact_waypoints(anchors, notes)
+    with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
+        played = [a for a in anchors if a.pose is not None]
+        parts = progress_map(pool, _family, [list(c) for c in np.array_split(np.array(played, dtype=object), workers * 4) if len(c)],
+                             'depth families')
+        for a, s in zip(played, [s for part in parts for s in part]):
+            a.family = s
+    paths = paths_for(anchors)
+    waypoints = contact_waypoints(placed(anchors, paths, posture_solvers, notes), notes)
     samples = np.arange(0., duration, REFINE_STEP)
     intermediate = dropped_snaps = 0
     for refine_round in range(REFINE_ROUNDS):
@@ -763,14 +852,21 @@ def run(args):
                 starts = ((vector_of(took.pose), took.pose.values),) if took else ()
                 jobs.append((a.hand, a.contacts(notes), v, values, v, (NEAR_PATH,), REACH_TOLERANCE, False, starts))
             poses = progress_map(pool, _settle, jobs, 'intermediate poses', 2)
-        kept = [replace(a, pose=p) for a, p in zip(new, poses)
-                if p is not None and gentle(a, p, paths[a.hand], [o for o in anchors + new if o.hand == a.hand])]
+            kept = [replace(a, pose=p) for a, p in zip(new, poses)
+                    if p is not None and gentle(a, p, paths[a.hand], [o for o in anchors + new if o.hand == a.hand])]
+            # an intermediate pose is a place the keys can be held from, not a nail: it has its depths too
+            if kept:
+                parts = progress_map(pool, _family, [list(c) for c in np.array_split(np.array(kept, dtype=object), workers * 4)
+                                                      if len(c)], 'depth families')
+                for a, sl in zip(kept, [sl for part in parts for sl in part]):
+                    a.family = sl
         dropped_snaps += sum(p is not None for p in poses) - len(kept)
         if not kept:
             break
         anchors = anchors + kept
         intermediate += len(kept)
-        paths, waypoints = paths_for(anchors), contact_waypoints(anchors, notes)
+        paths = paths_for(anchors)
+        waypoints = contact_waypoints(placed(anchors, paths, posture_solvers, notes), notes)
     # An idle hand moves out of the playing hand's way (the planner only keeps recently played keys apart).
     offsets = yield_offsets(paths, notes, duration, HANDS_APART, YIELD_SPEED, YIELD_BUSY)
     yielded = {h: round(float(np.abs(offsets[h][1]).max()) * 1000, 1) for h in 'LR'}
@@ -813,7 +909,7 @@ def run(args):
     context['tracks'] = tracks
     if args.dump:
         import pickle
-        pickle.dump(context, open(args.dump, 'wb'))
+        pickle.dump(dict(context, anchors=anchors, rest=rest, duration=duration), open(args.dump, 'wb'))
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(context,)) as pool:
         parts = progress_map(pool, _frames, chunks(times, workers * CHUNKS_PER_WORKER), 'frames')
     frames = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
@@ -828,15 +924,18 @@ def run(args):
     stages['frames'] = time.perf_counter() - t0
 
     # 6. outputs
-    frames['damper_intervals'] = damper_intervals(raw['timeline'])
+    frames['damper_intervals'] = pedal_union(damper_intervals(raw['timeline']),
+                                             [(n.release - PEDAL_LEAD, n.sound_release) for n in notes.values()
+                                              if n.sound_release is not None and n.release < n.sound_release - 1e-3])
     frames['damper'] = damper_depth(frames['damper_intervals'], frames['times'])
     frames['times'] = frames['times'] + intro          # outputs start at the lead-in
     frames['damper_intervals'] = frames['damper_intervals'] + intro
     np.savez_compressed(out / 'motion.npz', fps_source=rig.fps, rate=FRAME_RATE, **frames)
     played = {n.id for n in notes.values()}
     source = [n for n in raw['timeline']['notes'] if args.end is None or n['start'] <= args.end + 1e-9]
-    cuts = {n.id: n.release for n in notes.values()}
-    final_rows = [dict(r, physical_release=notes[r['id']].release) for r in rows]
+    sounding = {n.id: n.release if n.sound_release is None else n.sound_release for n in notes.values()}
+    cuts = sounding
+    final_rows = [dict(r, physical_release=sounding[r['id']], key_release=notes[r['id']].release) for r in rows]
     shortened = [(r, score.audible_shortening(r['index'], r['physical_release'])) for r in final_rows]
     shortened = [(r, s) for r, s in shortened if s > 1e-9]
     fidelity, _ = compare(raw['timeline'], sorted(played), cuts, source_ids=[n['id'] for n in source])

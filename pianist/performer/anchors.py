@@ -64,6 +64,7 @@ class NoteMotion:
     earliest_release: float
     pedal_release: float        # earliest lift with identical sound
     group: int
+    sound_release: float = None  # when the note stops sounding (the key may lift earlier, the damper pedal down)
 
     @property
     def returned(self):
@@ -94,6 +95,7 @@ class Anchor:
     pose: object = None
     lifted: tuple = ()          # held notes released early to make the pose feasible
     attempts: list = field(default_factory=list)
+    family: tuple = None        # the hand at other depths into the keys: (offsets, vectors, poses) (pipeline.depth_family)
 
     def contacts(self, notes):
         """Incoming keys are solved pressed (their longest phase); the touch is a small lift from it."""

@@ -18,6 +18,22 @@ def damper_intervals(timeline):
     return np.array(sorted(rows), float).reshape(-1, 2)
 
 
+PEDAL_LEAD = .05                 # the pedal is down this long before a key lifts that it holds the sound of
+PEDAL_GAP = .2                   # pedal-ups shorter than this are not made (the pedal stays down)
+
+
+def pedal_union(intervals, extra):
+    """The score's damper intervals with ``extra`` (begin, end) ones for keys lifted early, merged."""
+    rows = sorted([tuple(r) for r in np.asarray(intervals, float).reshape(-1, 2)] + [tuple(map(float, r)) for r in extra])
+    out = []
+    for begin, end in rows:
+        if out and begin <= out[-1][1] + PEDAL_GAP:
+            out[-1][1] = max(out[-1][1], end)
+        else:
+            out.append([begin, end])
+    return np.array(out, float).reshape(-1, 2)
+
+
 def _stroke(x):
     s = np.clip(x, 0., 1.)
     return s * s * (3. - 2. * s)

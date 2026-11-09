@@ -60,7 +60,10 @@ LEGATO_MARGIN = .03              # a release this close before the next touch (o
 STRIKE_REST = .3                 # a free hand this long before its next touch lifts even for a single note
 STRIKE_SHIFT = .025              # wrist travel (m) that counts as a position change
 LIFT_WINDOWS = (.12, .25, .4, .7, 1.)          # free time (s) ...
-LIFT_HEIGHTS = (0., .002, .007, .03, .05)      # ... and the wrist's rise (m): knuckle lift on the reference
+LIFT_HEIGHTS = (0., .003, .01, .04, .065)      # ... and the wrist's rise (m) at a middle loudness: about a third above the
+                                               # reference's knuckle lift, which read as too timid on the character
+LIFT_LOUDNESS = ((40., 110.), (.75, 1.35))     # velocity of the chord struck -> share of that rise (a loud chord from higher)
+LIFT_SCALE = 1.                  # the piece's own share (inputs/<piece>/motion.json "lift"): its character, lyrical to spirited
 LEAD_IN_SECONDS = 1.2            # from the rest pose to the first anchor
 LIFT_HEIGHT = .008               # pad above the key top at the end of a lift (m)
 HOVER_HEIGHT = (.002, .025)      # pad above the key before the stroke: soft starts on the key, loud from above
@@ -256,80 +259,262 @@ def strike_lift(a, b, notes, free, keep, travel):
     chord = len(b.incoming) > 1
     if not (same or chord or shift or window >= STRIKE_REST):
         return 0.
-    return float(np.interp(window, LIFT_WINDOWS, LIFT_HEIGHTS))
+    loud = np.interp(max(notes[k].velocity for k in b.incoming), *LIFT_LOUDNESS)
+    return float(np.interp(window, LIFT_WINDOWS, LIFT_HEIGHTS) * loud * LIFT_SCALE)
+
+
+# ---------- wrist path: one smoothest movement within the hand's constraints ----------
+# The wrist path is the least-jerk movement (damped by acceleration and speed costs) through the anchors' poses.
+# While keys are down the wrist stays within reach of them: at the place chosen for their anchor (choose_places, among
+# the places its keys are held from, pipeline.depth_family) while they go down, within those places while they are
+# held. With every key up it is free and rises over its free
+# time by the strike / arc rules (strike_lift, _arc: the lowest height at the middle of the free time; the shape of
+# the rise follows from smoothness). It lands softly (LAND_*). Departure, speed and arrival follow from the distance
+# and the time the music leaves (keys lifted early under the pedal: coherence.free_releases), not from written curves.
+# Solved as bounded least squares on a PATH_STEP grid, per dimension x, y, z (m), yaw, roll (deg).
+PATH_STEP = 1 / 40.
+# per dimension x, y, z (m), yaw, roll (deg)
+JERK_SCALE = np.array([200., 200., 200., 12000., 12000.])          # per s^3: one unit of cost
+ACC_SCALE = np.array([1., 1., 1., 70., 70.])                # per s^2: damps the ringing of a least-jerk path
+VEL_SCALE = np.array([.3, .3, .03, 30., 30.])                             # per s: no needless motion
+PULL_SCALE = np.array([.006, .06, .008, 6., 6.])               # the held pose's pull: one unit this far off it
+FREE_DROP = .004                                                 # a free wrist sinks at most this below its poses
+LIFT_SPAN = .25                                                  # share of the free time around its middle held at the lift
+# Landing: the hand slows down onto the keys, it is set down rather than dropped like a hammer. Over LAND_SECONDS
+# before a touch the wrist's speed is held near a landing speed: downward by the loudness (a soft note is placed,
+# a loud one carries some arm weight), sideways near still (no skid into the keys). Soft: one unit at that speed.
+LAND_SECONDS = .08
+LAND_DOWN = (.03, .25)           # m/s at velocity 30 .. 110
+LAND_SIDEWAYS = .04              # m/s
+SETTLE_SECONDS = .08             # ... and the hand stays put sideways this long after the touch (no skid on the keys)
+
+
+def moved_targets(solver, pose, vector, keys):
+    """{digit: key point} of a pose's keys ``[(digit, pitch)]`` with its wrist at ``vector`` instead: each pad keeps
+    its place on the hand (the fingers keep their shape) and presses its own key's playable part nearest to that. A
+    key is long: a hand further in presses its white keys further in, rather than the keys pulling the hand out."""
+    p0 = solver.palm(np.asarray(pose.wrist, FLOAT), float(pose.yaw), float(pose.roll))
+    p1 = solver.palm(np.asarray(vector[:3], FLOAT), float(vector[3]), float(vector[4]))
+    m = p1 @ np.linalg.inv(p0)
+    out = {}
+    for d, pitch in keys:
+        t = np.asarray(pose.targets[d], FLOAT)
+        out[d] = solver.regions.clamp(pitch, m[:3, :3] @ t + m[:3, 3])
+        out[d][2] = t[2]
+    return out
+
+
+# ---------- where each anchor is played from (pipeline.depth_family) ----------
+# An anchor's pose is the most comfortable place for its own keys; its family is every place its keys are held from
+# without strain (other depths into the keys, other turns). Over the anchors of a hand in time the places are chosen
+# together, for the least movement between consecutive anchors (for the time between them) and the least strain: a
+# hand playing a figure stays where all its chords can be played, no one chord pulls it to its own best place.
+PLACE_SCALE = np.array([.01, .01, .01, 3., 3.])       # one unit of a move (m, deg: turning is seen as much as moving) ...
+PLACE_STRAIN = 5.                # ... (squared, per second it is made in); an awkwardness unit costs this many
+PLACE_MIN_SECONDS = .05          # moves between anchors closer in time count as made in this long
+PLACE_OWN = .3                   # a place off the anchor's own most comfortable pose: per squared unit (PLACE_SCALE)
+
+
+def choose_places(anchors):
+    """{id(anchor): index into its family} for ``anchors`` (one hand) by dynamic programming over time."""
+    order = sorted([a for a in anchors if a.family is not None], key=lambda a: a.time)
+    if not order:
+        return {}
+    def strain(a):
+        own = (((a.family[0] - a.family[0][0]) / PLACE_SCALE) ** 2).sum(axis=1)      # the pose's own is first
+        return a.family[2] * PLACE_STRAIN + PLACE_OWN * own
+
+    cost = strain(order[0])
+    back = []
+    for prev, a in zip(order, order[1:]):
+        dt = max(a.time - prev.time, PLACE_MIN_SECONDS)
+        d = (a.family[0][:, None, :] - prev.family[0][None, :, :]) / PLACE_SCALE
+        move = (d ** 2).sum(axis=2) / dt                 # [this place, previous place]
+        total = move + cost[None, :]
+        back.append(np.argmin(total, axis=1))
+        cost = total[np.arange(len(total)), back[-1]] + strain(a)
+    out, i = {}, int(np.argmin(cost))
+    for k in range(len(order) - 1, -1, -1):
+        out[id(order[k])] = i
+        if k:
+            i = int(back[k - 1][i])
+    return out
+
+
+def family_pose(anchor, vector):
+    """The anchor's settled pose (its family's) nearest to the wrist at ``vector``."""
+    if anchor.family is None:
+        return anchor.pose
+    vectors, poses, _ = anchor.family
+    return poses[int(np.argmin((((vectors - vector) / PLACE_SCALE) ** 2).sum(axis=1)))]
+
+
+def placed(anchors, paths, solvers, notes):
+    """The anchors with the poses of the places chosen for them (``choose_places``, as the wrist paths are), their
+    key points where the path's wrist puts them (``moved_targets``: the path holds the place while the keys go down)."""
+    chosen = {}
+    for h in 'LR':
+        chosen.update(choose_places([a for a in anchors if a.hand == h]))
+    out = []
+    for a in anchors:
+        keys = [] if a.pose is None else [(notes[k].digit, notes[k].pitch) for k in a.incoming + a.held
+                                          if notes[k].digit in a.pose.targets]
+        if not keys:
+            out.append(a)
+            continue
+        pose = a.family[1][chosen[id(a)]] if id(a) in chosen else a.pose
+        v = np.asarray(paths[a.hand](a.time)[:5], float)
+        keys = [(d, p) for d, p in keys if d in pose.targets]
+        targets = {**pose.targets, **moved_targets(solvers[a.hand], pose, v, keys)}
+        out.append(replace(a, pose=replace(pose, wrist=v[:3].astype(FLOAT), yaw=float(v[3]), roll=float(v[4]),
+                                           targets=targets)))
+    return out
+
+
+def segments(anchors, notes, strokes):
+    """Per anchor (sorted): its vector, when it starts holding, its down keys; and free windows between."""
+    anchors = sorted(anchors, key=lambda a: a.time)
+    chosen = choose_places(anchors)
+    rows = []
+    for a in anchors:
+        keys = list(a.incoming) + list(a.held)
+        start = min((notes[k].touch for k in a.incoming), default=a.time)
+        v = a.family[0][chosen[id(a)]].copy() if id(a) in chosen else _vector(a)
+        rows.append((a, v, start, keys))
+    return rows
+
+
+def solve_path(anchors, notes, strokes, t0, t1):
+    from scipy import sparse             # pipeline only (Blender's Python imports this module without scipy)
+    rows = segments(anchors, notes, strokes)
+    times = np.arange(t0, t1 + 1e-9, PATH_STEP)
+    n = len(times)
+    lb = np.full((n, 5), -np.inf); ub = np.full((n, 5), np.inf)
+    target = np.full((n, 5), np.nan)
+    holding = np.full(n, -1)                     # the anchor whose keys are down at a sample
+    starts = np.array([r[2] for r in rows])
+    for k, t in enumerate(times):
+        i = int(np.searchsorted(starts, t + 1e-9, side='right')) - 1
+        if i < 0:
+            i = 0
+        a, v, start, keys = rows[i]
+        down = [notes[q] for q in keys if notes[q].touch <= t + 1e-9 and t <= notes[q].release + 1e-9]
+        if t < start - 1e-9 or not down:
+            continue
+        holding[k] = i
+        # the hand is at its place while the anchor's keys go down (from the touch until they are down), and over
+        # the rest of their hold it may move on toward the next only among the places its keys are held from (the
+        # extent of its family: a stretched chord has none); a key it would lose there is kept by an intermediate
+        # anchor (the wrist path check's refinement), which has its places too
+        if t <= max(a.time, start + SETTLE_SECONDS) + 1e-9 or a.family is None:
+            lb[k], ub[k] = v, v
+        else:
+            lb[k], ub[k] = a.family[0].min(axis=0), a.family[0].max(axis=0)
+        target[k] = v
+    # free windows: between an anchor's last release and the next anchor's first touch
+    for (a, va, _, ka), (b, vb, sb, kb) in zip(rows, rows[1:]):
+        if not b.incoming:
+            continue
+        keep = set(b.held)
+        free = max([notes[q].release for q in ka if q not in keep], default=a.time)
+        touch = min(notes[q].touch for q in b.incoming)
+        window = touch - free
+        sel = (times > free) & (times < touch)
+        if not sel.any():
+            continue
+        lb[sel, 2] = np.maximum(lb[sel, 2], min(va[2], vb[2]) - FREE_DROP)
+        travel = float(np.linalg.norm(vb[:2] - va[:2]))
+        lift = max(_arc(va, vb, not keep), strike_lift(a, b, notes, free, keep, travel))
+        lift = min(lift, LIFT_RATE * window)
+        if lift > 1e-4:
+            mid = (free + touch) / 2
+            core = sel & (np.abs(times - mid) <= LIFT_SPAN * window / 2 + PATH_STEP / 2)
+            lb[core, 2] = np.maximum(lb[core, 2], (va[2] + vb[2]) / 2 + lift)
+    # landings: (sample, speed scale per dimension) for each first touch of an anchor after a free time or a move
+    land = []
+    for a, va, sa, ka in rows[1:]:
+        if not a.incoming:
+            continue
+        touch = min(notes[q].touch for q in a.incoming)
+        loud = min(max((max(notes[q].velocity for q in a.incoming) - 30) / 80., 0.), 1.)
+        down = LAND_DOWN[0] + (LAND_DOWN[1] - LAND_DOWN[0]) * loud
+        for k in np.nonzero((times >= touch - LAND_SECONDS) & (times < touch + SETTLE_SECONDS))[0]:
+            if k + 1 < n:
+                before = times[k] < touch
+                land.append((k, np.array([LAND_SIDEWAYS, LAND_SIDEWAYS, down if before else np.inf, 40., 40.])))
+    # ends pinned to the first / last pose
+    first, last = rows[0][1], rows[-1][1]
+    out = np.empty((n, 5))
+    d3 = sparse.diags([-1., 3., -3., 1.], [0, 1, 2, 3], shape=(n - 3, n)) / PATH_STEP ** 3
+    d2 = sparse.diags([1., -2., 1.], [0, 1, 2], shape=(n - 2, n)) / PATH_STEP ** 2
+    d1 = sparse.diags([-1., 1.], [0, 1], shape=(n - 1, n)) / PATH_STEP
+    for d in range(5):
+        has = ~np.isnan(target[:, d])
+        pull = sparse.diags(has.astype(float) / PULL_SCALE[d], 0, shape=(n, n)).tocsr()[has]
+        rows_l = [(k, sc[d]) for k, sc in land]
+        if rows_l:
+            r = np.arange(len(rows_l)); ks = np.array([k for k, _ in rows_l]); sc = np.array([c for _, c in rows_l])
+            vel = sparse.csr_matrix((np.r_[-1. / (PATH_STEP * sc), 1. / (PATH_STEP * sc)], (np.r_[r, r], np.r_[ks, ks + 1])),
+                                    shape=(len(rows_l), n))
+        else:
+            vel = sparse.csr_matrix((0, n))
+        A = sparse.vstack([d3 / JERK_SCALE[d], d2 / ACC_SCALE[d], d1 / VEL_SCALE[d], pull, vel]).tocsr()
+        b = np.r_[np.zeros(n - 3), np.zeros(n - 2), np.zeros(n - 1), (target[has, d] / PULL_SCALE[d]), np.zeros(vel.shape[0])]
+        lo, hi = lb[:, d].copy(), ub[:, d].copy()
+        lo[0] = hi[0] = first[d]; lo[-1] = hi[-1] = last[d]
+        hi = np.maximum(hi, lo + 1e-9)
+        out[:, d] = chunked(A, b, lo, hi)
+    return times, out
+
+
+CHUNK_SECONDS, CHUNK_KEEP = 6., 4.    # solved exactly in overlapping windows, each fixed to the last at its start
+
+
+def chunked(A, b, lo, hi):
+    """Bounded least squares, exactly (bvls) over overlapping windows of samples; the first three samples of a
+    window are fixed to the previous window's solution (position, speed, acceleration carry over)."""
+    from scipy.optimize import lsq_linear
+    A = A.tocsr()
+    n = A.shape[1]
+    first = np.array([A.indices[A.indptr[r]:A.indptr[r + 1]].min() if A.indptr[r + 1] > A.indptr[r] else 0 for r in range(A.shape[0])])
+    last = np.array([A.indices[A.indptr[r]:A.indptr[r + 1]].max() if A.indptr[r + 1] > A.indptr[r] else 0 for r in range(A.shape[0])])
+    size, keep = int(CHUNK_SECONDS / PATH_STEP), int(CHUNK_KEEP / PATH_STEP)
+    x = np.zeros(n)
+    i0 = 0
+    while True:
+        i1 = min(n, i0 + size)
+        rows = np.nonzero((first >= i0) & (last < i1))[0]
+        lo_w, hi_w = lo[i0:i1].copy(), hi[i0:i1].copy()
+        if i0 > 0:
+            lo_w[:3] = hi_w[:3] = x[i0:i0 + 3]
+        res = lsq_linear(A[rows][:, i0:i1].toarray(), b[rows], bounds=(lo_w, np.maximum(hi_w, lo_w + 1e-12)), method='bvls')
+        stop = i1 >= n
+        x[i0:i1 if stop else i0 + keep] = res.x[:(i1 - i0) if stop else keep]
+        if stop:
+            return x
+        i0 += keep - 3 if keep > 3 else keep
 
 
 def wrist_path(anchors, notes, strokes, rest, duration):
-    """``anchors`` of one hand (with poses); intermediate poses have no incoming keys and are passed through."""
+    """``anchors`` of one hand (with poses and their depth families, pipeline.depth_family; without: held in place)."""
     anchors = sorted(anchors, key=lambda a: a.time)
     if not anchors:
         return WristPath([(0., rest, 0.), (duration, rest, 0.)])
 
-    def ready(a):        # the wrist is settled when the first stroke of the anchor begins
+    def ready(a):
         return min((strokes[k].hover for k in a.incoming), default=a.time)
 
     first, v0 = anchors[0], _vector(anchors[0])
     settle = ready(first)
     leave = settle - LEAD_IN_SECONDS
-    knots = [(min(0., leave - 1e-3), rest, 0.), (leave, rest, _arc(rest, v0, True)), (settle, v0, 0.)]
-    arrived = {}         # anchor index -> when the wrist is at its pose (after the touch, for a hurried leap)
-    for i, (a, b) in enumerate(zip(anchors, anchors[1:])):
-        va, vb = _vector(a), _vector(b)
-        at = arrived.get(i, a.time)
-        knots.append((at, va, 0.))
-        if not b.incoming:
-            # An intermediate pose holds fewer keys: the wrist stays where the others are reached until
-            # they are released (a stretched chord has no slack for an early drift).
-            keep = set(b.held)
-            free = min(b.time - MIN_MOVE_SECONDS,
-                       max([at] + [notes[k].release for k in a.incoming + a.held if k not in keep]))
-            if free > at + 1e-3:
-                knots.append((free, va, 0.))
-            continue
-        keep = set(b.held)
-        free = min(b.time, max([at] + [notes[k].release for k in a.incoming + a.held if k not in keep]))
-        natural = MOVE_BASE_SECONDS + float(np.linalg.norm(vb[:3] - va[:3])) / MOVE_SPEED
-        travel = max(UNHURRIED * natural, MIN_TRAVEL_SECONDS)
-        arrive = max(ready(b), free)
-        start = free + DEPART_DELAY
-        end = start + travel
-        if end > arrive:
-            end = max(arrive, min(b.time, start + natural))
-            start = max(free, end - travel)
-        if end - start < natural:
-            # A leap the score leaves no time for: the wrist sets off while the finger still holds
-            # the key and lands while the next finger is already pressing (as a pianist does).
-            after = anchors[i + 2].time - 1e-3 if i + 2 < len(anchors) else np.inf
-            onset = min(notes[k].onset for k in b.incoming)
-            start = max(at, min(start, free - ANTICIPATE_SECONDS))
-            end = min(max(end, min(b.time + ARRIVE_LATE_SECONDS, onset, start + natural)), after)
-        if end - start < MIN_MOVE_SECONDS:
-            start = max(at, end - MIN_MOVE_SECONDS)
-        arc = _arc(va, vb, not keep)
-        lift = strike_lift(a, b, notes, free, keep, float(np.linalg.norm(vb[:2] - va[:2])))
-        if lift > arc and start >= free:
-            # a strike: the arm lifts the hand as it lets go and lowers it onto the next chord, carrying
-            # it across over the whole free time (the hand lands as the first finger starts its stroke)
-            start = max(at, free + DEPART_DELAY)
-            end = max(end, min(arrive, b.time))
-            if end - start >= LIFT_WINDOWS[0]:
-                arc = lift
-        if start < free and arc:
-            # set off while a key is still held: the hand hops from its release to the next touch
-            touch = min(end, min(notes[k].touch for k in b.incoming))
-            arc = (min(arc, LIFT_RATE * max(touch - free, 0.)), free, touch)
-        if start > at + 1e-3:
-            knots.append((start, va, arc))
-        else:
-            knots[-1] = (at, va, arc)
-        if end < b.time - 1e-3:
-            knots.append((end, vb, 0.))
-        elif end > b.time + 1e-3:
-            arrived[i + 1] = end
     last = anchors[-1]
     vl = _vector(last)
     end = max([last.time] + [n.release for n in notes.values()]) + KEY_RETURN_SECONDS
-    knots += [(last.time, vl, 0.), (end, vl, _arc(vl, rest, True)), (end + LEAD_IN_SECONDS, rest, 0.)]
+    times, values = solve_path(anchors, notes, strokes, settle, end)
+    knots = [(min(0., leave - 1e-3), rest, 0.), (leave, rest, _arc(rest, v0, True))]
+    knots += [(t, v, 0.) for t, v in zip(times, values)]
+    knots[-1] = (times[-1], values[-1], _arc(vl, rest, True))
+    knots.append((end + LEAD_IN_SECONDS, rest, 0.))
     if end + LEAD_IN_SECONDS < duration:
         knots.append((duration, rest, 0.))
     path = WristPath(knots)

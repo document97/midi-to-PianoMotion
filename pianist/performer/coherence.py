@@ -288,18 +288,23 @@ def neighbour_targets(anchors, offsets=None):
 
 
 MOTION_CUT_SECONDS = 0.         # a key may sound at most this much shorter so the wrist is not forced to jump
+# A key may lift before its note ends with the damper pedal down holding the sound (the score's sound is kept; the
+# pedal is shown down from shortly before such a lift to the note's end): the hand leaves for its next position at a
+# natural pace instead of flinging across at the last instant. Each key stays down at least PEDAL_MIN_PRESS.
+PEDAL_MIN_PRESS = .1
 
 
-def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS):
+def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS, pedal=True):
     """Release keys earlier so the wrist can travel to its next position at a natural pace.
 
     Lifts that keep the sound identical (down to ``pedal_release``) are taken for an unhurried move.
     Where the wrist still could not make even its natural duration, the key is lifted earlier with
     an audible shortening of at most ``max_cut``, as a pianist does before a leap.
     ``anchors``: one hand's anchors with poses; ``strokes``: stroke timing by note.
-    Returns (sound-identical lifts, audible lifts)."""
+    With ``pedal`` the key lifts for an unhurried move whatever the sound (held by the pedal, ``sound_release``).
+    Returns (sound-identical lifts, audible lifts, pedalled lifts)."""
     anchors = sorted(anchors, key=lambda a: a.time)
-    identical = audible = 0
+    identical = audible = pedalled = 0
     for a, b in zip(anchors, anchors[1:]):
         keep = set(b.held)
         ready = min((strokes[k].hover for k in b.incoming), default=b.time)
@@ -311,6 +316,15 @@ def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS):
             if k in keep or n.release <= unhurried_leave:
                 continue
             lowest = max(n.earliest_release, n.onset + .05)
+            if pedal:
+                new = min(n.release, max(unhurried_leave, n.onset + PEDAL_MIN_PRESS))
+                if new < n.release - 1e-6:
+                    if new >= n.pedal_release - 1e-9:
+                        identical += 1
+                    else:
+                        pedalled += 1
+                    n.release = new
+                continue
             new = min(n.release, max(n.pedal_release, unhurried_leave, lowest))
             if new > needed_leave + 1e-6 and max_cut > 0:
                 new = min(new, max(needed_leave, n.release - max_cut, lowest))
@@ -322,4 +336,4 @@ def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS):
                 n.release = new
     for a in anchors:
         a.held = tuple(k for k in a.held if notes[k].held_at(a.time))
-    return identical, audible
+    return identical, audible, pedalled
