@@ -169,7 +169,9 @@ def load_or_compute(rig_path, workers=8, stop_fraction=1.):
 if __name__ == '__main__':
     # python -m performer.reach_table [workers] [stop_fraction]   (cwd: pianist)
     import sys
+    from .cores import use_big_cores
     from .pipeline import RIG
+    big = use_big_cores()
     load_or_compute(RIG,
-                    int(sys.argv[1]) if len(sys.argv) > 1 else 16, float(sys.argv[2]) if len(sys.argv) > 2 else 1.)
+                    int(sys.argv[1]) if len(sys.argv) > 1 and int(sys.argv[1]) else big, float(sys.argv[2]) if len(sys.argv) > 2 else 1.)
     print('pair table complete', flush=True)

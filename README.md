@@ -74,8 +74,10 @@ python -m performer.hand_ranges
 python inputs/build_piece.py path/to/your_piece.mid your_piece --right 1 --left 2
 # 规划 + 动作 + 写入 Blender（输出文件夹里的 performer.blend）
 blender -b your_scene.blend --python-exit-code 1 --python performer/blender_main.py -- \
-    --inputs inputs/your_piece --output ../output/your_piece --workers 16
+    --inputs inputs/your_piece --output ../output/your_piece
 ```
+
+求解默认只用 CPU 的大核，并占满大核的全部线程：Intel 大小核（P 核 / E 核）和 Arm big.LITTLE 只用性能核，所有核都相同时就用全部线程。进程会绑定到这些核上（Windows、Linux 读系统的核类型信息；macOS 只取性能核数量，不绑定）。`--workers N` 可以改进程数。
 
 第一次运行时会为这个骨架计算手指配对表（`performer/reach_table.py`），缓存在 `performer/rig_cache/`。CPU 16 进程约 10 分钟；有 GPU 时用 `performer/batch_pose.py` 把 7680 个求解放进同一批次计算，Radeon 780M 核显上约 2.5 分钟，GPU 占用基本保持满载。`blender_main.py` 会用 `PATH` 上找到的 Python 求解，也可以用环境变量 `PIANOMOTION_PYTHON` 指定（要用 GPU，就指定装了 PyTorch 的那个 Python）。
 

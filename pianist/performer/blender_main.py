@@ -1,7 +1,7 @@
 """Blender entry of the merged performer: solve (multi-process, outside Blender), write, save, check.
 
 blender -b <scene with character and piano>.blend --python-exit-code 1 \
-    --python pianist/performer/blender_main.py -- --inputs inputs/fur_elise --output output/fur_elise_vNN --workers 16
+    --python pianist/performer/blender_main.py -- --inputs inputs/fur_elise --output output/fur_elise_vNN
 
 This is the only Blender process of a run. It prepares the bake's neutral scene,
 starts the solve (performer.pipeline) as an ordinary Python process with its own
@@ -148,7 +148,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True)
     parser.add_argument('--inputs', help='the piece folder (pipeline --inputs); not needed with --skip-solve')
-    parser.add_argument('--workers', type=int, default=16, choices=(8, 16))
+    parser.add_argument('--workers', type=int, help='worker processes (default: every thread of the big cores)')
     parser.add_argument('--end', type=float)
     parser.add_argument('--skip-solve', action='store_true', help='write an existing motion.npz')
     args = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
@@ -164,7 +164,7 @@ def main():
             parser.error('--inputs is required unless --skip-solve')
         if not PYTHON:
             parser.error('no python on PATH for the solve: set PIANOMOTION_PYTHON to a Python with numpy and scipy')
-        command = [PYTHON, '-m', 'performer.pipeline', '--inputs', args.inputs, '--output', str(out), '--workers', str(args.workers)]
+        command = [PYTHON, '-m', 'performer.pipeline', '--inputs', args.inputs, '--output', str(out)] + (['--workers', str(args.workers)] if args.workers else [])
         if args.end is not None:
             command += ['--end', str(args.end)]
         subprocess.run(command, cwd=ROOT, check=True)

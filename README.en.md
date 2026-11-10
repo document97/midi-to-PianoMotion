@@ -74,8 +74,10 @@ python -m performer.hand_ranges
 python inputs/build_piece.py path/to/your_piece.mid your_piece --right 1 --left 2
 # planning + motion + writing into Blender (performer.blend in the output folder)
 blender -b your_scene.blend --python-exit-code 1 --python performer/blender_main.py -- \
-    --inputs inputs/your_piece --output ../output/your_piece --workers 16
+    --inputs inputs/your_piece --output ../output/your_piece
 ```
+
+By default the solve runs on the CPU's big cores only, with every one of their threads busy: on Intel hybrid (P-cores / E-cores) and Arm big.LITTLE only the performance cores, on a CPU with one kind of core every thread. The process is pinned to those cores (Windows and Linux read the core types from the system; macOS only takes the number of performance cores, without pinning). `--workers N` sets another process count.
 
 The first run computes the finger pair table for the skeleton (`performer/reach_table.py`) and caches it in `performer/rig_cache/`: about 10 minutes on 16 CPU processes, or, with a GPU, about 2.5 minutes on a Radeon 780M iGPU, where `performer/batch_pose.py` solves all 7680 cases as one batch and keeps the GPU close to fully busy. `blender_main.py` runs the solve with the Python found on `PATH`; the environment variable `PIANOMOTION_PYTHON` can name another one (for the GPU, the Python that has PyTorch).
 

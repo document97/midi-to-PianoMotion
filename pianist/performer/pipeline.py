@@ -22,7 +22,7 @@ import numpy as np
 
 from planner.audio import render
 from planner.fidelity import compare
-from planner.parallel import SUPPORTED_WORKERS, plan_parallel
+from planner.parallel import plan_parallel
 from planner.problem import PIECE_FILES, build, load_raw, plan_notes, register_report
 from planner.search import Weights
 from planner.validate import validate
@@ -846,7 +846,7 @@ def run(args):
 
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
         played = [a for a in anchors if a.pose is not None]
-        parts = progress_map(pool, _family, [list(c) for c in np.array_split(np.array(played, dtype=object), workers * 4) if len(c)],
+        parts = progress_map(pool, _family, [list(c) for c in np.array_split(np.array(played, dtype=object), max(1, len(played) // 2)) if len(c)],
                              'depth families')
         for a, s in zip(played, [s for part in parts for s in part]):
             a.family = s
@@ -884,7 +884,7 @@ def run(args):
                     if p is not None and gentle(a, p, paths[a.hand], [o for o in anchors + new if o.hand == a.hand])]
             # an intermediate pose is a place the keys can be held from, not a nail: it has its depths too
             if kept:
-                parts = progress_map(pool, _family, [list(c) for c in np.array_split(np.array(kept, dtype=object), workers * 4)
+                parts = progress_map(pool, _family, [list(c) for c in np.array_split(np.array(kept, dtype=object), max(1, len(kept) // 2))
                                                       if len(c)], 'depth families')
                 for a, sl in zip(kept, [sl for part in parts for sl in part]):
                     a.family = sl
@@ -1009,7 +1009,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True)
-    parser.add_argument('--workers', type=int, default=8, choices=SUPPORTED_WORKERS)
+    parser.add_argument('--workers', type=int, help='worker processes (default: every thread of the big cores)')
     parser.add_argument('--beam', type=int, default=48)
     parser.add_argument('--end', type=float)
     parser.add_argument('--inputs', required=True, help='the piece: a folder with timeline.json and demands.json')
@@ -1022,6 +1022,9 @@ def main():
     parser.add_argument('--dump', help='pickle the frame context (debugging)')
     parser.add_argument('--no-checks', action='store_true')
     args = parser.parse_args()
+    from .cores import use_big_cores
+    big = use_big_cores()
+    args.workers = args.workers or big
     report = run(args)
     print(json.dumps(report, ensure_ascii=True, indent=2))      # any console encoding
 

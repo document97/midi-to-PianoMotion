@@ -313,23 +313,61 @@ PLACE_SCALE = np.array([.01, .01, .01, 3., 3.])       # one unit of a move (m, d
 PLACE_STRAIN = 5.                # ... (squared, per second it is made in); an awkwardness unit costs this many
 PLACE_MIN_SECONDS = .05          # moves between anchors closer in time count as made in this long
 PLACE_OWN = .3                   # a place off the anchor's own most comfortable pose: per squared unit (PLACE_SCALE)
+# A figure is stroked in one direction: along a run of notes the hand goes the way the notes go and comes back in the
+# air (the cat's back, a pipa's sweep), it does not rock to and fro on the keys. A move against the way the notes go
+# costs this many times a move, except the step that turns the run back (``sweeps``).
+PLACE_AGAINST = 4.
+TURN_BACK = 5                    # semitones: a step against the run at least this far turns the figure back
+RETURN_LIFT = .006               # m: the hand turning a figure back comes back this far above its keys (in the air)
 
 
-def choose_places(anchors):
-    """{id(anchor): index into its family} for ``anchors`` (one hand) by dynamic programming over time."""
+def sweeps(order, notes):
+    """Per step between consecutive anchors: (direction of the notes, -1/0/1; True where the step turns a run back),
+    the direction from the mean pitch of each anchor's new keys; a turn back reverses a run of at least two steps one
+    way, by at least ``TURN_BACK``, all from one hand position (the planner's wrist unchanged from the run's start to
+    the turn): a figure under the hand. A run that carries the hand along (an arpeggio over octaves, then the next
+    bass) is a leap back, not a stroke."""
+    pitch = [np.mean([notes[k].pitch for k in a.incoming]) if a.incoming else np.nan for a in order]
+    out, run, first = [], 0, 0
+    for i, (p0, p1) in enumerate(zip(pitch, pitch[1:])):
+        step = 0 if np.isnan(p0) or np.isnan(p1) else int(np.sign(p1 - p0))
+        back = (step != 0 and run != 0 and step != np.sign(run) and abs(run) >= 2 and abs(p1 - p0) >= TURN_BACK
+                and np.ptp([a.x_hint for a in order[first:i + 2]]) <= 1e-4)
+        out.append((0 if back else step, back))
+        if back or step == 0 or (run and step != np.sign(run)):
+            run, first = step, (i + 1 if step == 0 else i)
+        else:
+            run += step
+    # a direction counts only inside a cycle: a run that ends turning back
+    swept, way = [], 0
+    for (step, back), p0, p1 in zip(out[::-1], pitch[-2::-1], pitch[:0:-1]):
+        if back:
+            way = -int(np.sign(p1 - p0))
+        elif step != way:
+            way = 0
+        swept.append((step if step == way else 0, back))
+    return swept[::-1]
+
+
+def choose_places(anchors, notes=None):
+    """{id(anchor): index into its family} for ``anchors`` (one hand) by dynamic programming over time; with
+    ``notes``, moving against the way the notes go costs more (``PLACE_AGAINST``, ``sweeps``)."""
     order = sorted([a for a in anchors if a.family is not None], key=lambda a: a.time)
     if not order:
         return {}
+    ways = sweeps(order, notes) if notes is not None else [(0, False)] * (len(order) - 1)
     def strain(a):
         own = (((a.family[0] - a.family[0][0]) / PLACE_SCALE) ** 2).sum(axis=1)      # the pose's own is first
         return a.family[2] * PLACE_STRAIN + PLACE_OWN * own
 
     cost = strain(order[0])
     back = []
-    for prev, a in zip(order, order[1:]):
+    for (prev, a), (way, _) in zip(zip(order, order[1:]), ways):
         dt = max(a.time - prev.time, PLACE_MIN_SECONDS)
         d = (a.family[0][:, None, :] - prev.family[0][None, :, :]) / PLACE_SCALE
         move = (d ** 2).sum(axis=2) / dt                 # [this place, previous place]
+        if way:
+            move = move + PLACE_AGAINST * np.maximum(0., -way * d[:, :, 0]) ** 2 / dt
         total = move + cost[None, :]
         back.append(np.argmin(total, axis=1))
         cost = total[np.arange(len(total)), back[-1]] + strain(a)
@@ -354,7 +392,7 @@ def placed(anchors, paths, solvers, notes):
     key points where the path's wrist puts them (``moved_targets``: the path holds the place while the keys go down)."""
     chosen = {}
     for h in 'LR':
-        chosen.update(choose_places([a for a in anchors if a.hand == h]))
+        chosen.update(choose_places([a for a in anchors if a.hand == h], notes))
     out = []
     for a in anchors:
         keys = [] if a.pose is None else [(notes[k].digit, notes[k].pitch) for k in a.incoming + a.held
@@ -374,7 +412,7 @@ def placed(anchors, paths, solvers, notes):
 def segments(anchors, notes, strokes):
     """Per anchor (sorted): its vector, when it starts holding, its down keys; and free windows between."""
     anchors = sorted(anchors, key=lambda a: a.time)
-    chosen = choose_places(anchors)
+    chosen = choose_places(anchors, notes)
     rows = []
     for a in anchors:
         keys = list(a.incoming) + list(a.held)
@@ -421,7 +459,8 @@ def solve_path(anchors, notes, strokes, t0, t1):
             target[k] = v                # held where it is: pulled to its place; on the way on: free between the two
         lb[k], ub[k] = places.min(axis=0), places.max(axis=0)
     # free windows: between an anchor's last release and the next anchor's first touch
-    for (a, va, _, ka), (b, vb, sb, kb) in zip(rows, rows[1:]):
+    turns = [back for _, back in sweeps([r[0] for r in rows], notes)]
+    for ((a, va, _, ka), (b, vb, sb, kb)), turn in zip(zip(rows, rows[1:]), turns):
         if not b.incoming:
             continue
         keep = set(b.held)
@@ -433,7 +472,7 @@ def solve_path(anchors, notes, strokes, t0, t1):
             continue
         lb[sel, 2] = np.maximum(lb[sel, 2], min(va[2], vb[2]) - FREE_DROP)
         travel = float(np.linalg.norm(vb[:2] - va[:2]))
-        lift = max(_arc(va, vb, not keep), strike_lift(a, b, notes, free, keep, travel))
+        lift = max(_arc(va, vb, not keep), strike_lift(a, b, notes, free, keep, travel), RETURN_LIFT if turn else 0.)
         lift = min(lift, LIFT_RATE * window)
         if lift > 1e-4:
             mid = (free + touch) / 2

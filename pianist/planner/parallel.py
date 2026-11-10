@@ -1,6 +1,6 @@
 """Segment-parallel planning with exact sequential stitching.
 
-Target machines: 8 or 16 equal-performance cores. The score is cut into
+Run on equal-performance cores (performer.cores: the big cores of a hybrid CPU). The score is cut into
 ``workers * segments_per_worker`` segments of equal note count (work is close
 to proportional to notes), each planned from a free state after a warm-up
 span and on through a look-ahead span (its last notes are fingered for what follows them, as the sequential
@@ -14,7 +14,6 @@ import time
 
 from .search import Planner, initial_state
 
-SUPPORTED_WORKERS = (8, 16)
 _WORKER = {}
 
 
@@ -74,8 +73,6 @@ def stitch(planner, decisions, repair_groups=24):
 
 def plan_parallel(factory, factory_args, planner_kwargs=None, workers=8,
                   segments_per_worker=2, warm_seconds=4.):
-    if workers not in SUPPORTED_WORKERS:
-        raise ValueError(f'Planned for {SUPPORTED_WORKERS} equal cores, got {workers}')
     planner_kwargs = planner_kwargs or {}
     started = time.perf_counter()
     score, instrument = factory(*factory_args)

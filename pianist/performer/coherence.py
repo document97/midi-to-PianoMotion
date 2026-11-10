@@ -19,7 +19,7 @@ from .checks import stretched
 from .anchors import KEY_TRAVEL
 from .kinematics import DIGITS, FLOAT
 from .posture import natural_orientation
-from .motion import SIDEWAYS_FREE, pad_residual, DEPART_DELAY, FLOOR_SCALE, MOVE_BASE_SECONDS, MOVE_SPEED, UNHURRIED, KeyFloor, KeySurface
+from .motion import SIDEWAYS_FREE, pad_residual, sweeps, DEPART_DELAY, FLOOR_SCALE, MOVE_BASE_SECONDS, MOVE_SPEED, UNHURRIED, KeyFloor, KeySurface
 from .pose import CONTACT_TOLERANCE, RELAXED, hand_shape, ROLL_BOUNDS, VALUE_SCALE, WEB_SCALE, YAW_BOUNDS, HandPose, PoseSolver, wrist_steps
 
 NEIGHBOUR_SECONDS = .6          # gaussian width of the orientation smoothing over anchors
@@ -295,6 +295,8 @@ MOTION_CUT_SECONDS = 0.         # a key may sound at most this much shorter so t
 # when the pedal changes would be cut there, and the change would have to be hidden. A change within PEDAL_CHANGE_SLACK
 # of the note's end is not held through: that is a legato note-off overlapping the next chord, cleared by the change.
 PEDAL_MIN_PRESS = .1
+RETURN_MIN_PRESS = .04           # ... but before the hand turns a figure back (motion.sweeps) it lets go this soon: the pedal
+                                 # holds the sound and the hand comes back in the air, not over the keys
 PEDAL_CHANGE_KEEP = .1
 PEDAL_CHANGE_SLACK = .15
 
@@ -312,7 +314,8 @@ def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS, pedal=Tru
     anchors = sorted(anchors, key=lambda a: a.time)
     changes = np.sort(np.asarray(pedal_changes, float))
     identical = audible = pedalled = 0
-    for a, b in zip(anchors, anchors[1:]):
+    turns = [back for _, back in sweeps(anchors, notes)]
+    for (a, b), turn in zip(zip(anchors, anchors[1:]), turns):
         keep = set(b.held)
         ready = min((strokes[k].hover for k in b.incoming), default=b.time)
         natural = MOVE_BASE_SECONDS + float(np.linalg.norm(b.pose.wrist - a.pose.wrist)) / MOVE_SPEED
@@ -320,13 +323,14 @@ def free_releases(anchors, notes, strokes, max_cut=MOTION_CUT_SECONDS, pedal=Tru
         needed_leave = ready - natural - DEPART_DELAY
         for k in a.incoming + a.held:
             n = notes[k]
-            if k in keep or n.release <= unhurried_leave:
+            if (k in keep and not (turn and pedal)) or n.release <= unhurried_leave:   # turning back: all let go
                 continue
             lowest = max(n.earliest_release, n.onset + .05)
             if pedal:
                 end = n.release - PEDAL_CHANGE_SLACK
                 change = changes[np.searchsorted(changes, end) - 1] if len(changes) and changes[0] < end else -np.inf
-                new = min(n.release, max(unhurried_leave, n.onset + PEDAL_MIN_PRESS, change + PEDAL_CHANGE_KEEP))
+                press = RETURN_MIN_PRESS if turn else PEDAL_MIN_PRESS
+                new = min(n.release, max(unhurried_leave, n.onset + press, change + PEDAL_CHANGE_KEEP))
                 if new < n.release - 1e-6:
                     if new >= n.pedal_release - 1e-9:
                         identical += 1
