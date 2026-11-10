@@ -47,7 +47,7 @@ def vec(v):
 # The performer's seat: world offset of the character and bench from where the scene has them. Tuned for the
 # development character: (0, .06, .17) put the thighs 13.5 mm into the keybed with the elbows bent tight; 9 cm
 # further back and 2.5 cm lower leaves 16 mm under the keybed, a more open elbow and a flatter forearm.
-PERFORMER_SEATING = (0., -.03, .145)
+PERFORMER_SEATING = (0., -.05, .145)       # 11-10: 2 cm further back, the elbows off the waist
 # Uniform scale of the character. Set it for your model: the hand's size decides what it can reach. The development
 # model (barefoot 1.52 m) missed black-key octaves (thumb to little finger) by 3.4 mm; at 1.05 (about 1.60 m) its
 # hand holds them. The character is scaled about the middle of the bench top so it stays seated; the feet move with
@@ -107,6 +107,68 @@ def scaled_hands(arm):
     for s in SIDE.values():
         arm.pose.bones[s + '手首'].scale = (HAND_SCALE,) * 3
     root['performer_hand_scale'] = HAND_SCALE
+
+
+# The trunk the arms keep out of (performer.torso.Trunk): the skin weighted mostly to the upper-body bone or below it,
+# not the arms, neck, head or pieces the physics swings, as convex horizontal slices; the arms' radii from their own skin (sleeves included).
+TRUNK_BONE = '上半身'
+TRUNK_SLICE = .01
+
+
+def trunk_shape(arm, skin, coords):
+    names = [g.name for g in skin.vertex_groups]
+    root = arm.data.bones[TRUNK_BONE]
+    cut = {b.name for b in root.children_recursive if b.name.endswith(('肩P', '肩', '首'))}
+    away = {c.name for b in root.children_recursive if b.name in cut for c in [b] + list(b.children_recursive)}
+    # physics-driven pieces (an MMD rigid body that is not kinematic names its bone after the index: 055_SZY親) swing
+    # aside: not the trunk
+    swinging = {o.name.split('_', 1)[1] for o in bpy.data.objects
+                if o.rigid_body is not None and not o.rigid_body.kinematic and '_' in o.name}
+    away |= {c.name for b in root.children_recursive if b.name in swinging for c in [b] + list(b.children_recursive)}
+    trunk = ({root.name} | {b.name for b in root.children_recursive}) - away
+    deform = set(arm.data.bones.keys())
+    dominant = []
+    for v in skin.data.vertices:
+        gs = [g for g in v.groups if names[g.group] in deform and g.weight > 0]
+        dominant.append(names[max(gs, key=lambda g: g.weight).group] if gs else '')
+    pts = [c for c, d in zip(coords, dominant) if d in trunk]
+    z0 = min(p[2] for p in pts)
+    slices = {}
+    for p in pts:
+        slices.setdefault(int((p[2] - z0) / TRUNK_SLICE), []).append((p[0], p[1]))
+    hulls = {}
+    for k, s in slices.items():
+        if len(s) >= 6:
+            hulls[k] = [list(map(float, q)) for q in _hull(s)]
+
+    def radius(bones, a, b):
+        a, b = Vector(a), Vector(b)
+        d = []
+        for c, n in zip(coords, dominant):
+            if n in bones:
+                t = max(0., min(1., (Vector(c) - a).dot(b - a) / (b - a).length_squared))
+                d.append((Vector(c) - (a + t * (b - a))).length)
+        d.sort()
+        return float(d[len(d) // 2])
+    radii = {}
+    for h, s in (('L', '左'), ('R', '右')):
+        sh, el, wr = (arm.matrix_world @ arm.pose.bones[s + n].head for n in ('腕', 'ひじ', '手首'))
+        radii[h] = (radius({s + '腕'} | {s + '腕捩' + i for i in ('', '1', '2', '3')}, sh, el),
+                    radius({s + 'ひじ'} | {s + '手捩' + i for i in ('', '1', '2', '3')}, el, wr))
+    return dict(z0=float(z0), slice=TRUNK_SLICE, hulls={str(k): v for k, v in sorted(hulls.items())}, radii=radii)
+
+
+def _hull(points):
+    p = sorted(set((round(x, 6), round(y, 6)) for x, y in points))
+
+    def half(seq):
+        h = []
+        for q in seq:
+            while len(h) >= 2 and ((h[-1][0] - h[-2][0]) * (q[1] - h[-2][1]) - (h[-1][1] - h[-2][1]) * (q[0] - h[-2][0])) <= 0:
+                h.pop()
+            h.append(q)
+        return h
+    return half(p)[:-1] + half(p[::-1])[:-1]
 
 
 def neutral_scene(cal):
@@ -323,7 +385,7 @@ def main():
     torso = None
     if body.bone is not None:
         torso = dict(bone=body.bone.name, pivot=vec(body.pivot), pre=mat(body.pre), world=mat(body.world),
-                     reference={h: mat(m) for h, m in body.reference.items()})
+                     reference={h: mat(m) for h, m in body.reference.items()}, trunk=trunk_shape(arm, skin, coords))
     neutral_bones = {b.name: mat(b.matrix) for b in arm.pose.bones}
     rig = dict(schema='performer-rig', neutral_bones=neutral_bones, scene=bpy.data.filepath,
                scene_sha256=hashlib.sha256(Path(bpy.data.filepath).read_bytes()).hexdigest(),

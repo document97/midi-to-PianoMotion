@@ -457,6 +457,8 @@ def _frames(times):
             if d > 0:
                 depths[p] = d
         torso_q, pre = (None, None) if _ctx['torso'] is None else _ctx['torso'].pose(t)
+        body = None if _ctx['torso'] is None or _ctx['torso'].trunk is None else _ctx['torso'].trunk
+        inverse = None if body is None else np.linalg.inv(_ctx['torso'].transform(t))
         segments = {}
         if torso_q is not None:
             out['torso'][i] = torso_q
@@ -480,7 +482,8 @@ def _frames(times):
                 j = pitches.index(p)
                 out['key_depth'][i, j] = min(out['key_depth'][i, j], max(reached, 0.))
             try:
-                pose = arm.pose(vector[:3], vector[3], vector[4], None if pre is None else pre[h])
+                pose = arm.pose(vector[:3], vector[3], vector[4], None if pre is None else pre[h],
+                                None if body is None else (body, inverse, body.radii[h]))
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
             except ValueError:          # wrist beyond the unstretched arm
                 # Never leave the arm's rotations at zero (Blender collapses such a bone and the arm vanishes):
@@ -490,7 +493,8 @@ def _frames(times):
                 reach = shoulder_pre[:3, 3]
                 aim = np.asarray(vector[:3], float) - reach
                 stretched = reach + aim * (ARM_STRETCH * (arm.l1 + arm.l2) / np.linalg.norm(aim))
-                pose = arm.pose(stretched, vector[3], vector[4], shoulder_pre)
+                pose = arm.pose(stretched, vector[3], vector[4], shoulder_pre,
+                                None if body is None else (body, inverse, body.radii[h]))
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
             caps = _ctx['capsules'][h]
             segments[h] = caps.segments(values, pose['armature'])
@@ -909,7 +913,8 @@ def run(args):
         reference = {h: np.array(m) for h, m in rig.data['torso']['reference'].items()}
         for n in notes.values():
             delta = paths[n.hand](n.onset)[0] - reference[n.hand][0, 3]
-            torso_rows.append((n.onset, math.copysign(max(0., abs(delta) - .15), delta), (n.velocity / 127) ** .6))
+            torso_rows.append((n.onset, math.copysign(max(0., abs(delta) - .15), delta), (n.velocity / 127) ** .6,
+                               paths[n.hand](n.onset)[0] - rig.data['torso']['pivot'][0]))
     first = min(n.onset for n in notes.values())
     last = max(n.release for n in notes.values())
     by_pitch = {}

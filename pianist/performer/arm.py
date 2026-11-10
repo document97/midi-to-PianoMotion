@@ -17,8 +17,28 @@ ELBOW_OUT = .035                # elbow rest: this far outside the shoulder (elb
 ELBOW_FOLLOW = .4               # share of the hand's sideways position the elbow follows
 
 
-def closest_elbow(shoulder, wrist, l1, l2, side, reference=None):
-    """arm_driver.closest_elbow."""
+# The elbow is chosen on its circle with the arm kept out of the trunk (torso.Trunk): the upper arm's outer part and the
+# forearm, as capsules of the arm's own radii, cost TRUNK_WEIGHT per squared metre inside, far above any preference.
+TRUNK_WEIGHT = 5000.
+UPPER_SAMPLES = np.linspace(1 / 3, 1, 8)        # not at the armpit, where arm and trunk skin meet
+FORE_SAMPLES = np.linspace(0, 1, 12)
+
+
+def trunk_cost(shoulder, elbows, wrist, trunk):
+    """Per candidate elbow (rows): TRUNK_WEIGHT x (deepest arm capsule inside the trunk)^2. ``trunk``: (Trunk, world ->
+    rest matrix, (upper radius, forearm radius))."""
+    body, inverse, (r_up, r_fo) = trunk
+    e = np.atleast_2d(elbows)
+    up = shoulder + UPPER_SAMPLES[None, :, None] * (e[:, None] - shoulder)
+    fo = e[:, None] + FORE_SAMPLES[None, :, None] * (wrist - e[:, None])
+    d_up = body.depth(up.reshape(-1, 3), inverse).reshape(len(e), -1) + r_up
+    d_fo = body.depth(fo.reshape(-1, 3), inverse).reshape(len(e), -1) + r_fo
+    deep = np.maximum(0., np.maximum(d_up.max(1), d_fo.max(1)))
+    return TRUNK_WEIGHT * deep ** 2
+
+
+def closest_elbow(shoulder, wrist, l1, l2, side, reference=None, trunk=None):
+    """arm_driver.closest_elbow; with ``trunk`` (trunk_cost) the arm stays out of the body."""
     s, w = np.asarray(shoulder, FLOAT), np.asarray(wrist, FLOAT)
     d = w - s
     distance = float(np.linalg.norm(d))
@@ -46,6 +66,8 @@ def closest_elbow(shoulder, wrist, l1, l2, side, reference=None):
         value += 20 * max(0, point[2] - w[2] - .025) ** 2
         if reference is not None:
             value += .4 * float(np.sum((point - np.asarray(reference)) ** 2))
+        if trunk is not None:
+            value += float(trunk_cost(s, point, w, trunk)[0])
         return value, point
     grid = np.linspace(-math.pi, math.pi, 81, dtype=FLOAT)
     candidates = center + radius * (np.cos(grid)[:, None] * t + np.sin(grid)[:, None] * q)
@@ -53,6 +75,8 @@ def closest_elbow(shoulder, wrist, l1, l2, side, reference=None):
     costs = (errors * errors) @ np.array([8., 1., 2.], dtype=FLOAT) + 20 * np.maximum(0, candidates[:, 2] - w[2] - .025) ** 2
     if reference is not None:
         costs += .4 * np.sum((candidates - np.asarray(reference)) ** 2, axis=1)
+    if trunk is not None:
+        costs += trunk_cost(s, candidates, w, trunk)
     angle = grid[int(np.argmin(costs))]
     step = math.pi / 40
     for _ in range(12):
@@ -85,12 +109,12 @@ class Arm:
     def palm_q(self, yaw, roll):
         return q_mul(q_axis((0, 0, 1), yaw), q_mul(q_axis(self.palm_forward, roll), self.palm))
 
-    def pose(self, wrist, yaw=0., roll=0., pre_upper_world=None):
-        """World wrist matrix, armature-space wrist matrix and the bones' local quaternions."""
+    def pose(self, wrist, yaw=0., roll=0., pre_upper_world=None, trunk=None):
+        """World wrist matrix, armature-space wrist matrix and the bones' local quaternions; ``trunk``: closest_elbow."""
         pre_upper = self.pre_upper_world if pre_upper_world is None else pre_upper_world
         shoulder = pre_upper[:3, 3]
         wrist = np.asarray(wrist, FLOAT)
-        elbow = closest_elbow(shoulder, wrist, self.l1, self.l2, self.side)
+        elbow = closest_elbow(shoulder, wrist, self.l1, self.l2, self.side, trunk=trunk)
         upper_dir = (elbow - shoulder) / np.linalg.norm(elbow - shoulder)
         forearm_dir = (wrist - elbow) / np.linalg.norm(wrist - elbow)
         hinge = np.cross(upper_dir, forearm_dir)
