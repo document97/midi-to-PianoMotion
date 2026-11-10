@@ -72,6 +72,17 @@ class Heightfield:
                 higher = z[inside] > self.top[cells]
                 self.top[cells[0][higher], cells[1][higher]] = z[inside][higher]
                 self.pitch[cells[0][higher], cells[1][higher]] = pitch
+        # per cell: metres to the nearest cell of another key (or none) sideways or toward the player, the shortest way
+        # out of the key for a finger beside it (the ``escape`` measure)
+        same = lambda a, b: (self.pitch[a] == self.pitch[b]) & np.isfinite(self.top[a]) & np.isfinite(self.top[b])
+        left, right, front = (np.zeros(size, np.int32) for _ in range(3))
+        for i in range(1, size[0]):
+            left[i] = np.where(same(i, i - 1), left[i - 1] + 1, 0)
+        for i in range(size[0] - 2, -1, -1):
+            right[i] = np.where(same(i, i + 1), right[i + 1] + 1, 0)
+        for j in range(1, size[1]):
+            front[:, j] = np.where(same((slice(None), j), (slice(None), j - 1)), front[:, j - 1] + 1, 0)
+        self.side = (np.minimum(np.minimum(left, right), front) + .5).astype(FLOAT) * CELL
 
     def penetration(self, points, depths, own=None, brush=False):
         """Per point: metres below the (pressed) key surface under it; ``own``: (pitch, mask) allowance;
@@ -92,6 +103,17 @@ class Heightfield:
                 pen = brushed(np.maximum(pen, 0.), self.brushable(pitch, depths, own_pitch) & np.isfinite(top))
         out[ok] = np.maximum(pen, 0.)
         return out
+
+    def escape(self, points, depths, own=None):
+        """Per point: metres it is inside a key other than its own (``penetration``), but at most the way out sideways
+        or toward the player: a finger beside a black key that overlaps its side by 2 mm is 2 mm in, however far below
+        the key's top the overlap reaches."""
+        pen = self.penetration(points, depths, own)
+        hit = pen > 0.
+        if hit.any():
+            idx = np.floor((points[hit, :2] - self.origin) / CELL).astype(int)
+            pen[hit] = np.minimum(pen[hit], self.side[idx[:, 0], idx[:, 1]])
+        return pen
 
     @staticmethod
     def brushable(pitch, depths, own_pitch):

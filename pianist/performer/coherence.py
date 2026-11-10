@@ -182,13 +182,13 @@ WIDE_CLEAN_CONTACT = .0005      # m: ... when it is this close to its keys (off 
 
 
 def sunk(solver, contacts, pose):
-    """Per contact: mm its finger's skin sinks into keys other than its own."""
+    """Per contact: mm its finger's skin is inside keys other than its own (``Heightfield.escape``)."""
     palm = solver.palm(pose.wrist, pose.yaw, pose.roll)
     depths = {c.pitch: c.depth for c in contacts}
     out = []
     for c in contacts:
         skin = (palm @ solver.local_clearance(c.digit, pose.values))[:3].T
-        out.append(float(solver.heightfield.penetration(skin, depths, (c.pitch, np.ones(len(skin), bool))).max(initial=0.)) * 1000)
+        out.append(float(solver.heightfield.escape(skin, depths, (c.pitch, np.ones(len(skin), bool))).max(initial=0.)) * 1000)
     return out
 
 

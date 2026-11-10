@@ -106,13 +106,21 @@ TURN_STEP = 8.                   # deg between the turns tried ...
 TURN_STEPS = 2                   # ... this many each way
 TURN_PULL = np.array([.08, .0005, .015, .2, 4.])
 TURN_HOLD = 1.                   # deg
+# ... and at those depths the hand may also stand to either side: a figure's keys played from one place, each finger
+# reaching for its key (the thumb on its key from a hand standing over the figure's middle) rather than the hand
+# moving over every key in turn. Held sideways only: standing to one side, the hand goes in or out as its keys need.
+SIDE_STEP = .008                 # m between the side places tried ...
+SIDE_STEPS = 4                   # ... this many each way
+SIDE_PULL = np.array([.0005, .08, .015, 4., 4.])
+SIDE_ITERATIONS = 25             # a side step moves the fingers on their keys more than a depth step: a full settle
 
 
 def depth_family(solver, anchor, notes):
-    """The anchor's hand at other depths and turns: (wrist vectors, poses, awkwardness) of every place it was settled
-    at and holds its keys from, the pose's own first. The depths: settled at depths into the keys around its own, as
-    far each way as its keys are held without more strain (``awkwardness``, the measure the planner prices); the
-    turns: at every other of those depths, the hand turned each way as far as that holds. The wrist path chooses
+    """The anchor's hand at other depths, turns and sides: (wrist vectors, poses, awkwardness) of every place it was
+    settled at and holds its keys from, the pose's own first. The depths: settled at depths into the keys around its
+    own, as far each way as its keys are held without more strain (``awkwardness``, the measure the planner prices);
+    the turns and sides: at every third of those depths, the hand turned or moved sideways each way as far as that
+    holds. The wrist path chooses
     among them (motion.choose_places)."""
     pose = anchor.pose
     contacts = anchor.contacts(notes)
@@ -122,13 +130,14 @@ def depth_family(solver, anchor, notes):
     own = awkwardness(solver, contacts, pose)
     sink = max(FAMILY_SINK, max(sunk(solver, contacts, pose)) / 1000.) + FAMILY_SINK_GIVE
 
-    def ok(p, target, hold_yaw):
-        return (p.contact_error <= REACH_TOLERANCE / 2 and abs(float(p.wrist[1]) - target[1]) <= FAMILY_HOLD
-                and (not hold_yaw or abs(float(p.yaw) - target[3]) <= TURN_HOLD)
+    def ok(p, target, axis):
+        return (p.contact_error <= REACH_TOLERANCE / 2
+                and all(abs(float(p.wrist[a]) - target[a]) <= FAMILY_HOLD for a in ({0} if axis == 0 else {1, axis}) if a < 3)
+                and (axis != 3 or abs(float(p.yaw) - target[3]) <= TURN_HOLD)
                 and max(sunk(solver, contacts, p)) / 1000. <= sink
                 and awkwardness(solver, contacts, p) <= max(own + FAMILY_GIVE, FAMILY_OK))
 
-    def walk(v0, p0, axis, step, steps, pull, hold_yaw):
+    def walk(v0, p0, axis, step, steps, pull, iterations=FAMILY_ITERATIONS):
         """Settles from (v0, p0) along ``axis`` by ``step`` each way while they hold: [(vector, pose)] with v0's."""
         out = [(v0, p0)]
         for sign in (-1., 1.):
@@ -139,19 +148,21 @@ def depth_family(solver, anchor, notes):
                 start = last_v.copy()
                 start[axis] = target[axis]
                 p = settle(solver, contacts, start, {d: last_values.get(d, RELAXED[d]) for d in DIGITS}, target, pull,
-                           FAMILY_ITERATIONS)
-                if not ok(p, target, hold_yaw):
+                           iterations)
+                if not ok(p, target, axis):
                     break
                 last_v, last_values = vector_of(p), p.values
                 out.append((last_v, p))
         return sorted(out, key=lambda e: float(e[0][axis]))
 
-    line = walk(base, pose, 1, FAMILY_STEP, int(round(FAMILY_REACH / FAMILY_STEP)), FAMILY_PULL, False)
+    line = walk(base, pose, 1, FAMILY_STEP, int(round(FAMILY_REACH / FAMILY_STEP)), FAMILY_PULL)
     centre = next(i for i, (v, _) in enumerate(line) if v is base)
     picks = sorted({i for i in range(len(line)) if (i - centre) % 3 == 0} | {0, len(line) - 1})
     places = list(line)
     for i in picks:
-        places += [e for e in walk(*line[i], 3, TURN_STEP, TURN_STEPS, TURN_PULL, True) if e[1] is not line[i][1]]
+        for axis, step, steps, pull, iterations in ((3, TURN_STEP, TURN_STEPS, TURN_PULL, FAMILY_ITERATIONS),
+                                                     (0, SIDE_STEP, SIDE_STEPS, SIDE_PULL, SIDE_ITERATIONS)):
+            places += [e for e in walk(*line[i], axis, step, steps, pull, iterations) if e[1] is not line[i][1]]
     places.sort(key=lambda e: e[1] is not pose)          # the pose's own first
     return (np.array([e[0] for e in places]), [e[1] for e in places],
             np.array([awkwardness(solver, contacts, e[1]) for e in places]))
@@ -289,6 +300,16 @@ def _pair_awkward(case):
     contacts = [Contact(f1, p1, KEY_TRAVEL), Contact(f2, p2, KEY_TRAVEL)]
     pose = solver.solve(contacts, seeds=WIDE_SEEDS, clearance=False)
     if not pose.ok:
+        # the performer's wrist sits further back than the pair table's (regions.PLAYING_WRIST_OFFSET), so its seeds
+        # can all fall short of a wide reach the table found (black-key octaves): start from the table's own pose
+        if 'table_solvers' not in _ctx:
+            from .pose import hand_solvers
+            _ctx['table_solvers'] = hand_solvers(_ctx['rig'])
+        seed = _ctx['table_solvers'][hand].solve(contacts, seeds=WIDE_SEEDS, clearance=False)
+        if seed.ok:
+            pose = solver.solve(contacts, values=seed.values, wrist=seed.wrist.copy(), yaw=seed.yaw, roll=seed.roll,
+                                seeds=WIDE_SEEDS, clearance=False)
+    if not pose.ok:
         return case, float('inf')
     pose = settle(solver, contacts, vector_of(pose), {d: pose.values.get(d, RELAXED[d]) for d in DIGITS}, vector_of(pose),
                   ORIENTATION_PULLS[0])
@@ -341,7 +362,7 @@ def awkward_shapes(anchors, notes, base, workers, cache=None, starts=None):
     chords = [a for a in anchors if len(a.incoming) + len(a.held) >= 2]
     starts = {} if starts is None else starts
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
-        shapes = [(a.hand, a.contacts(notes)) for a in chords]
+        shapes = [(a.hand, a.contacts(notes, hover=False)) for a in chords]    # the planner prices the keys it plays
         free_starts(pool, shapes, starts)
         jobs = [(h, c, vector_of(a.pose), a.pose.values, float(a.pose.contact_error), starts.get((h, tuple(c))))
                 for a, (h, c) in zip(chords, shapes)]

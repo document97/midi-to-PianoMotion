@@ -30,6 +30,10 @@ REPAIR_FAR = .006               # an anchor missing by more than this may cut up
 REPAIR_FAR_CUT_SECONDS = .3
 SILENT_LIFT_LEAD = .3           # a lift that costs no sound happens this long before the touch (or at pedal catch)
 KEY_TRAVEL = .010               # full key depth: a grand's white key dips ~10 mm at its front
+# A hand playing a figure from one position (the planner's wrist stays) keeps its free fingers over the figure's other
+# keys: the pose of every note in it is the figure's shape, each finger over its key, only the sounding ones down.
+HOVER = .004                    # m a free finger waits above its key
+HOVER_SECONDS = .6              # the figure's keys this close in time (the position unchanged in between) are waited over
 
 
 def ease(x):
@@ -96,11 +100,14 @@ class Anchor:
     lifted: tuple = ()          # held notes released early to make the pose feasible
     attempts: list = field(default_factory=list)
     family: tuple = None        # the hand at other depths into the keys: (offsets, vectors, poses) (pipeline.depth_family)
+    hover: tuple = ()           # (digit, pitch): free fingers waiting over the figure's other keys (``figure_keys``)
 
-    def contacts(self, notes):
-        """Incoming keys are solved pressed (their longest phase); the touch is a small lift from it."""
+    def contacts(self, notes, hover=True):
+        """Incoming keys are solved pressed (their longest phase); the touch is a small lift from it. ``hover``: with
+        the free fingers over their keys of the figure (``HOVER`` above them)."""
         return [Contact(notes[i].digit, notes[i].pitch, KEY_TRAVEL) for i in self.incoming] + \
-               [Contact(notes[i].digit, notes[i].pitch, notes[i].depth(self.time)) for i in self.held]
+               [Contact(notes[i].digit, notes[i].pitch, notes[i].depth(self.time)) for i in self.held] + \
+               ([Contact(d, p, -HOVER) for d, p in self.hover] if hover else [])
 
 
 def note_motions(rows, score):
@@ -123,7 +130,38 @@ def build_anchors(notes, wrist_x):
             t = min(n.touch for n in incoming)
             held = tuple(n.id for n in mine if n.group != group and n.held_at(t))
             anchors.append(Anchor(hand, group, t, wrist_x[(group, hand)], tuple(n.id for n in incoming), held))
+    for a in anchors:
+        a.hover = figure_keys(a, anchors, notes)
     return anchors
+
+
+def figure_keys(anchor, anchors, notes):
+    """(digit, pitch) for the free fingers of ``anchor``: each the nearest key in time (``HOVER_SECONDS``) its finger
+    plays from the same hand position (the planner's wrist unchanged from the anchor to it), kept only in the
+    fingers' order across the keys (nearest first)."""
+    pressed = [notes[i] for i in anchor.incoming + anchor.held]
+    busy, keys = {n.digit for n in pressed}, {n.pitch for n in pressed}
+    same = [b for b in anchors if b.hand == anchor.hand and abs(b.time - anchor.time) <= HOVER_SECONDS]
+    moved = [b.time for b in same if abs(b.x_hint - anchor.x_hint) > 1e-4]
+    lo = max((t for t in moved if t < anchor.time), default=-np.inf)
+    hi = min((t for t in moved if t > anchor.time), default=np.inf)
+    best = {}
+    for b in same:
+        if not lo < b.time < hi:
+            continue
+        for i in b.incoming:
+            n = notes[i]
+            if n.digit in busy or n.pitch in keys:
+                continue
+            gap = abs(n.touch - anchor.time)
+            if n.digit not in best or gap < best[n.digit][0]:
+                best[n.digit] = (gap, n.pitch)
+    sign = 1 if anchor.hand == 'R' else -1
+    out = [(n.digit, n.pitch) for n in pressed]
+    for d, (_, p) in sorted(best.items(), key=lambda e: e[1][0]):
+        if p not in {q for _, q in out} and all(sign * (p - q) * (d - e) > 0 for e, q in out):
+            out.append((d, p))
+    return tuple(sorted(e for e in out if e[0] not in busy))
 
 
 # ---------- parallel solve ----------
@@ -172,6 +210,20 @@ def solve_anchors(anchors, notes, rig_path, workers, max_rounds=6, cache=None):
             jobs = [(anchors[i].hand, anchors[i].contacts(notes), anchors[i].x_hint) for i in pending]
             for i, pose in zip(pending, progress_map(pool, _solve, jobs, 'anchor poses', 4, cache, _job_key)):
                 anchors[i].pose = pose
+            # a figure shape the hand cannot hold is waited in with fewer fingers: the free finger farthest from the
+            # keys down gives up its key first, until the shape holds (or only the keys down are left)
+            while True:
+                loose = [i for i in pending if anchors[i].hover and anchors[i].pose.contact_error > REACH_TOLERANCE / 2]
+                if not loose:
+                    break
+                for i in loose:
+                    down = [notes[k].pitch for k in anchors[i].incoming + anchors[i].held]
+                    far = max(anchors[i].hover, key=lambda e: min(abs(e[1] - p) for p in down))
+                    anchors[i].hover = tuple(e for e in anchors[i].hover if e != far)
+                jobs = [(anchors[i].hand, anchors[i].contacts(notes), anchors[i].x_hint) for i in loose]
+                for i, pose in zip(loose, progress_map(pool, _solve, jobs, 'anchor poses (fewer free fingers)', 4, cache,
+                                                       _job_key)):
+                    anchors[i].pose = pose
             failed = [i for i in pending if anchors[i].held and anchors[i].pose.contact_error > REACH_TOLERANCE]
             strained = [i for i in pending if anchors[i].held and i not in failed and strain(anchors[i].pose) > STRAIN_SWING]
             if not failed and not strained:
