@@ -86,6 +86,20 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
     def residuals(v):
         palm = unpack(v)
         out = []
+        if surface is not None:
+            # every skin the key surface is asked about this evaluation, looked up together (KeySurface.many)
+            skins, owns = {}, {}
+            for c in contacts:
+                skins[c.digit] = (palm @ solver.local_clearance(c.digit, vals))[:3].T
+                owns[c.digit] = c.pitch
+            for d in free_digits:
+                skins[('lifted', d)] = (palm @ solver.local_clearance(d, {**vals, d: FREE_LIFTED[d != 1]}))[:3].T
+                owns[('lifted', d)] = None
+                if curved[0]:
+                    skins[('curved', d)] = (palm @ solver.local_clearance(d, {**vals, d: curved_free[d]}))[:3].T
+                    owns[('curved', d)] = None
+            keys = list(skins)
+            hits = dict(zip(keys, surface.many([(skins[k], owns[k]) for k in keys], depths)))
         for c in contacts:
             point = solver.contact_point(solver.pad_world(c.digit, vals, palm))
             out.append(solver.regions.residual(c.pitch, c.depth, point) / CONTACT_TOLERANCE)
@@ -105,17 +119,17 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
                 # lying across, its joint rides over the next key and sinks into it as the key goes down
                 out.append([thumb_tip_angle(solver, vals, palm) / THUMB_TIP_SCALE])
             if surface is not None:
-                skin = (palm @ solver.local_clearance(c.digit, vals))[:3].T
-                out.append(surface.clearance(skin, depths, c.pitch, brush=stretch) / FLOOR_SCALE)
+                skin = skins[c.digit]
+                out.append(surface.clearance_of(hits[c.digit], skin, c.pitch, brush=stretch) / FLOOR_SCALE)
         if surface is not None:
             # Room for the fingers not on a key: lifted (as far as a free finger lifts) they clear the keys,
             # so a hand rolled or lowered onto its little-finger side comes back up.
             for d in free_digits:
-                skin = (palm @ solver.local_clearance(d, {**vals, d: FREE_LIFTED[d != 1]}))[:3].T
-                out.append(np.maximum(0., surface(skin, depths, None) - skin[:, 2]) / FREE_CLEAR_SCALE)
+                skin = skins[('lifted', d)]
+                out.append(np.maximum(0., hits[('lifted', d)][0] - skin[:, 2]) / FREE_CLEAR_SCALE)
                 if curved[0]:
-                    skin = (palm @ solver.local_clearance(d, {**vals, d: curved_free[d]}))[:3].T
-                    out.append(np.maximum(0., surface(skin, depths, None) - skin[:, 2]) / FREE_CURVED_SCALE)
+                    skin = skins[('curved', d)]
+                    out.append(np.maximum(0., hits[('curved', d)][0] - skin[:, 2]) / FREE_CURVED_SCALE)
         out.append(_order(solver, contacts, vals))
         out.append(np.array([vals[c.digit][0] / (THUMB_LATERAL_SCALE if c.digit == 1 else LATERAL_SCALE) for c in contacts], dtype=FLOAT))
         out.append(lateral_hinge(digits, vals))

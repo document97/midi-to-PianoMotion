@@ -430,6 +430,7 @@ def solve_path(anchors, notes, strokes, t0, t1):
     lb = np.full((n, 5), -np.inf); ub = np.full((n, 5), np.inf)
     target = np.full((n, 5), np.nan)
     holding = np.full(n, -1)                     # the anchor whose keys are down at a sample
+    on_way = np.zeros(n, bool)                   # samples moving on toward the next chord while holding keys
     starts = np.array([r[2] for r in rows])
     for k, t in enumerate(times):
         i = int(np.searchsorted(starts, t + 1e-9, side='right')) - 1
@@ -455,6 +456,12 @@ def solve_path(anchors, notes, strokes, t0, t1):
                                      if notes[q].touch <= t + 1e-9 and t <= notes[q].release + 1e-9):
             b, vb = rows[i + 1][0], rows[i + 1][1]
             places = np.concatenate([places, vb[None] if b.family is None else b.family[0]])
+            # the box over both families has corners that are no place (one place's side, another's depth): pulled
+            # along the way between the two chosen places, which both hold the keys
+            end = max(a.time, start + SETTLE_SECONDS)
+            share = float(np.clip((t - end) / max(rows[i + 1][2] - end, PATH_STEP), 0., 1.))
+            target[k] = v + share * (vb - v)
+            on_way[k] = True
         else:
             target[k] = v                # held where it is: pulled to its place; on the way on: free between the two
         lb[k], ub[k] = places.min(axis=0), places.max(axis=0)
@@ -498,7 +505,10 @@ def solve_path(anchors, notes, strokes, t0, t1):
     d1 = sparse.diags([-1., 1.], [0, 1], shape=(n - 1, n)) / PATH_STEP
     for d in range(5):
         has = ~np.isnan(target[:, d])
-        pull = sparse.diags(has.astype(float) / PULL_SCALE[d], 0, shape=(n, n)).tocsr()[has]
+        # on the way between two places the depth is held to the way as firmly as the side: a depth from one place
+        # with the side and turn of another holds no key
+        scale = np.where(on_way, min(PULL_SCALE[d], PULL_SCALE[0]) if d == 1 else PULL_SCALE[d], PULL_SCALE[d])
+        pull = sparse.diags(has.astype(float) / scale, 0, shape=(n, n)).tocsr()[has]
         rows_l = [(k, sc[d]) for k, sc in land]
         if rows_l:
             r = np.arange(len(rows_l)); ks = np.array([k for k, _ in rows_l]); sc = np.array([c for _, c in rows_l])
@@ -507,7 +517,7 @@ def solve_path(anchors, notes, strokes, t0, t1):
         else:
             vel = sparse.csr_matrix((0, n))
         A = sparse.vstack([d3 / JERK_SCALE[d], d2 / ACC_SCALE[d], d1 / VEL_SCALE[d], pull, vel]).tocsr()
-        b = np.r_[np.zeros(n - 3), np.zeros(n - 2), np.zeros(n - 1), (target[has, d] / PULL_SCALE[d]), np.zeros(vel.shape[0])]
+        b = np.r_[np.zeros(n - 3), np.zeros(n - 2), np.zeros(n - 1), (target[has, d] / scale[has]), np.zeros(vel.shape[0])]
         lo, hi = lb[:, d].copy(), ub[:, d].copy()
         lo[0] = hi[0] = first[d]; lo[-1] = hi[-1] = last[d]
         hi = np.maximum(hi, lo + 1e-9)
@@ -518,10 +528,67 @@ def solve_path(anchors, notes, strokes, t0, t1):
 CHUNK_SECONDS, CHUNK_KEEP = 6., 4.    # solved exactly in overlapping windows, each fixed to the last at its start
 
 
-def chunked(A, b, lo, hi):
-    """Bounded least squares, exactly (bvls) over overlapping windows of samples; the first three samples of a
-    window are fixed to the previous window's solution (position, speed, acceleration carry over)."""
+def bounded_lsq(A, b, lo, hi, iterations=None):
+    """min |A x - b|^2 with lo <= x <= hi, exactly: a primal active set (one bound freed or met at a time, like bvls)
+    over the normal equations, which are banded (the path's difference rows span a few samples) and solved banded,
+    O(n) per step where bvls refactors the dense A. The optimum is unique (the jerk/acceleration/speed rows), so this
+    is bvls's solution to rounding."""
+    from scipy.linalg import cho_solve_banded, cholesky_banded
+    A = np.asarray(A, float)
+    n = A.shape[1]
+    H, c = A.T @ A, A.T @ b
+    nz = np.nonzero(np.abs(H) > 0)
+    u = int(np.max(np.abs(nz[0] - nz[1]))) if len(nz[0]) else 0
+    fixed = hi - lo <= 1e-12
+    x = np.where(fixed, lo, np.clip(np.zeros(n), lo, hi))
+    state = np.where(fixed, 3, np.where(x <= lo, 1, np.where(x >= hi, 2, 0)))      # 0 free, 1 at lo, 2 at hi, 3 fixed
+    scale = max(1., float(np.abs(c).max()), float(np.abs(H).max()))
+    tol = 1e-12 * scale
+
+    def solve_free(free):
+        idx = np.nonzero(free)[0]
+        Hf = H[np.ix_(idx, idx)]
+        rhs = c[idx] - H[np.ix_(idx, ~free)] @ x[~free]
+        k = min(u, len(idx) - 1)
+        ab = np.zeros((k + 1, len(idx)))
+        for j in range(k + 1):
+            ab[k - j, j:] = np.diagonal(Hf, j)
+        return idx, cho_solve_banded((cholesky_banded(ab), False), rhs)
+
+    for _ in range(iterations or 20 * n + 50):
+        free = state == 0
+        if free.any():
+            idx, z = solve_free(free)
+            low, high = z < lo[idx], z > hi[idx]
+            if low.any() or high.any():
+                # walk from x toward z until the first bound
+                step = z - x[idx]
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    t = np.where(low, (lo[idx] - x[idx]) / step, np.where(high, (hi[idx] - x[idx]) / step, np.inf))
+                a = float(np.clip(t.min(), 0., 1.))
+                x[idx] += a * step
+                hit = (t <= a + 1e-15) & (low | high)
+                x[idx[hit & low]] = lo[idx[hit & low]]
+                x[idx[hit & high]] = hi[idx[hit & high]]
+                state[idx[hit & low]] = 1
+                state[idx[hit & high]] = 2
+                continue
+            x[idx] = z
+        g = H @ x - c
+        # a bound held with the gradient pulling inward is let go: the worst one
+        wrong = np.where(state == 1, -g, np.where(state == 2, g, -np.inf))
+        j = int(np.argmax(wrong))
+        if wrong[j] <= tol:
+            return x
+        state[j] = 0
     from scipy.optimize import lsq_linear
+    return lsq_linear(A, b, bounds=(lo, np.maximum(hi, lo + 1e-12)), method='bvls').x
+
+
+def chunked(A, b, lo, hi):
+    """Bounded least squares, exactly (bounded_lsq; bvls stopped on its cost tolerance far from the optimum in some
+    windows) over overlapping windows of samples; the first three samples of a window are fixed to the previous
+    window's solution (position, speed, acceleration carry over)."""
     A = A.tocsr()
     n = A.shape[1]
     first = np.array([A.indices[A.indptr[r]:A.indptr[r + 1]].min() if A.indptr[r + 1] > A.indptr[r] else 0 for r in range(A.shape[0])])
@@ -535,9 +602,9 @@ def chunked(A, b, lo, hi):
         lo_w, hi_w = lo[i0:i1].copy(), hi[i0:i1].copy()
         if i0 > 0:
             lo_w[:3] = hi_w[:3] = x[i0:i0 + 3]
-        res = lsq_linear(A[rows][:, i0:i1].toarray(), b[rows], bounds=(lo_w, np.maximum(hi_w, lo_w + 1e-12)), method='bvls')
+        sol = bounded_lsq(A[rows][:, i0:i1].toarray(), b[rows], lo_w, np.maximum(hi_w, lo_w + 1e-12))
         stop = i1 >= n
-        x[i0:i1 if stop else i0 + keep] = res.x[:(i1 - i0) if stop else keep]
+        x[i0:i1 if stop else i0 + keep] = sol[:(i1 - i0) if stop else keep]
         if stop:
             return x
         i0 += keep - 3 if keep > 3 else keep
@@ -833,7 +900,44 @@ class KeySurface:
                 a.setflags(write=False)
         return hit
 
+    def many(self, queries, depths):
+        """``_surface`` for several (points, own_pitch) at once under one ``depths``: the memo answers what it knows,
+        the rest is computed in one pass (each point as alone: the same numbers)."""
+        dkey = tuple(sorted(depths.items()))
+        out, todo = [None] * len(queries), []
+        for i, (points, own) in enumerate(queries):
+            points = np.asarray(points)
+            key = (points.dtype.str, points.shape, points.tobytes(), dkey, own)
+            hit = self._memo.get(key)
+            if hit is None:
+                todo.append((i, key, points, own))
+            else:
+                out[i] = hit
+        if todo:
+            pts = np.concatenate([t[2] for t in todo])
+            owns = np.concatenate([np.full(len(t[2]), -2 if t[3] is None else t[3], dtype=np.int16) for t in todo])
+            z, soft = self._compute(pts, depths, owns)
+            if len(self._memo) > 4096:
+                self._memo.clear()
+            at = 0
+            for i, key, points, _ in todo:
+                hit = (z[at:at + len(points)], soft[at:at + len(points)])
+                at += len(points)
+                for a in hit:
+                    a.setflags(write=False)
+                self._memo[key] = out[i] = hit
+        return out
+
+    def clearance_of(self, hit, points, own_pitch, brush=False):
+        """``clearance`` from a ``_surface`` result."""
+        z, soft = hit
+        pen = np.maximum(0., z - points[:, 2])
+        if not brush or own_pitch is None:
+            return pen
+        return soft * brushed(pen, True) + (1 - soft) * pen
+
     def _compute(self, points, depths, own_pitch):
+        """``own_pitch``: one pitch, None, or one per point (-2: none)."""
         f = self.field
         u = (points[:, :2] - f.origin) / CELL
         i = np.clip(np.floor(u).astype(int), 0, np.array(self.top.shape) - 2)

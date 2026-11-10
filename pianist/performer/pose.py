@@ -158,6 +158,7 @@ class PoseSolver:
         self.identity = np.eye(4, dtype=FLOAT)
         self.neutral = rig.neutral_wrist[hand]
         self._pad_cache = {}
+        self._static = {}
         owner = rig.bone_owner[hand]
         self.pad_digits = {d: sorted({owner[b] for b in rig.fingers[hand][d].pad.bones if b in owner}) for d in DIGITS}
         self.clearance_skin = {}
@@ -196,7 +197,7 @@ class PoseSolver:
             return hit
         finger = self.rig.fingers[self.hand][digit]
         skin = finger.pad if kind == 'pad' else self.clearance_skin[digit]
-        mats = self.rig.bone_matrices(self.hand, self.identity, values, skin.bones)
+        mats = self._skin_matrices(skin, values)
         acc = np.zeros((skin.weights.shape[0], 4), dtype=FLOAT)
         for k, name in enumerate(skin.bones):
             acc += skin.weights[:, k:k + 1] * (skin.local[k] @ mats[name].T)
@@ -205,6 +206,24 @@ class PoseSolver:
             self._pad_cache.clear()
         self._pad_cache[key] = local
         return local
+
+    def _skin_matrices(self, skin, values):
+        """rig.bone_matrices at the identity wrist (the wrist frame): the bones that move with the wrist are fixed,
+        kept once per skin; the fingers' own come from their (memoised) chains."""
+        static = self._static.get(id(skin))
+        if static is None:
+            rig, hand = self.rig, self.hand
+            owner = rig.bone_owner[hand]
+            static = self._static[id(skin)] = (
+                {n: (self.identity if n == rig.wrist_bone[hand] else rig.neutral_wrist_inverse[hand] @ rig.neutral_bones[n])
+                 for n in skin.bones if owner.get(n) is None},
+                sorted({owner[n] for n in skin.bones if owner.get(n) is not None}))
+        fixed, digits = static
+        mats = dict(fixed)
+        for d in digits:
+            finger = self.rig.fingers[self.hand][d]
+            mats.update(zip(finger.names, finger.local_matrices(values[d])))
+        return mats
 
     def clearance_residual(self, digit, values, palm, depths, own_pitch, brush=False):
         """Penetration of the finger's skin into keys other than its own (scaled), fixed length."""
