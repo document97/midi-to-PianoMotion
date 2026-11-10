@@ -120,10 +120,11 @@ def trunk_shape(arm, skin, coords):
     root = arm.data.bones[TRUNK_BONE]
     cut = {b.name for b in root.children_recursive if b.name.endswith(('肩P', '肩', '首'))}
     away = {c.name for b in root.children_recursive if b.name in cut for c in [b] + list(b.children_recursive)}
-    # physics-driven pieces (an MMD rigid body that is not kinematic names its bone after the index: 055_SZY親) swing
-    # aside: not the trunk
-    swinging = {o.name.split('_', 1)[1] for o in bpy.data.objects
-                if o.rigid_body is not None and not o.rigid_body.kinematic and '_' in o.name}
+    # physics-driven pieces swing aside: not the trunk. A bone follows a simulated (non-kinematic) rigid body through
+    # a constraint targeting it or its child; rigid body names need not match the bone's.
+    dynamic = {o for o in bpy.data.objects if o.rigid_body is not None and not o.rigid_body.kinematic}
+    swinging = {pb.name for pb in arm.pose.bones for c in pb.constraints
+                if getattr(c, 'target', None) is not None and (c.target in dynamic or c.target.parent in dynamic)}
     away |= {c.name for b in root.children_recursive if b.name in swinging for c in [b] + list(b.children_recursive)}
     trunk = ({root.name} | {b.name for b in root.children_recursive}) - away
     deform = set(arm.data.bones.keys())
