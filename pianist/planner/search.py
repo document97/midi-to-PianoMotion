@@ -138,11 +138,12 @@ def initial_state(rest_x=None):
 
 class Planner:
     def __init__(self, score, instrument, weights=Weights(), beam_width=48, finger_options=4, model=None,
-                 outer_voice_bonus=1., pair_table=None, pair_strain=None, shape_penalty=None, rest_x=None):
+                 outer_voice_bonus=1., pair_table=None, pair_strain=None, shape_penalty=None, rest_x=None, reach_x=None):
         """``pair_table``: two-finger feasibility of the animated rig (performer.reach_table); without it
         the fixed-palm screens are used. ``shape_penalty``: {(hand, frozenset of (note, finger) on the keys)}: cost
         of the animated hand's awkwardness in that shape (performer.pipeline.awkward_shapes); the search weighs it
-        against other fingers, an omitted note or a held key let go early."""
+        against other fingers, an omitted note or a held key let go early. ``reach_x``: {hand: (lowest, highest) key
+        centre x} the hand reaches (performer.torso.reach_window); a key beyond both hands' reach is omitted."""
         self.score, self.w = score, weights
         outer = score.outer_voice_notes()
         self.voice_scale = [outer_voice_bonus if i in outer else 1. for i in range(len(score.notes))]
@@ -152,6 +153,7 @@ class Planner:
         self.split = hand_split_pitches(score)
         self.shape_penalty = shape_penalty or {}
         self.rest_x = rest_x
+        self.reach_x = reach_x or {}
         self.last_reason = None
 
     def initial_state(self):
@@ -374,7 +376,8 @@ class Planner:
         playable, lifts = self._restrike(hands, group)
         if forced is None:
             # a hand-split score (a pianist's own division) is kept: each hand is offered only its own notes
-            candidates = {h: self.hand_candidates(h, hands[h], group, [n for n in playable if self.score.notes[n].hand in (None, h)])
+            candidates = {h: self.hand_candidates(h, hands[h], group, [n for n in playable if self.score.notes[n].hand in (None, h)
+                                                                       and self._reachable(h, self.score.notes[n].pitch)])
                           for h in HANDS}
         else:
             candidates = self._forced_candidates(hands, group, playable, forced)
@@ -406,6 +409,12 @@ class Planner:
                         successors.append(State(state.cost + lo.cost + ro.cost + omission + apart,
                                                 {'L': lo.state, 'R': ro.state}, (decision, state.trail)))
         return successors
+
+    def _reachable(self, hand, pitch):
+        if hand not in self.reach_x:
+            return True
+        lo, hi = self.reach_x[hand]
+        return lo <= self.model.key_center(pitch) <= hi
 
     def _hands_overlap(self, left, right, touch):
         """Metres the left hand's finger range reaches past the right hand's (0 when apart)."""

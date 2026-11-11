@@ -1,14 +1,13 @@
-"""Below the hands (run inside Blender): the bench under the character, a pedal extender under the feet, the right
-foot on the damper pedal.
+"""Below the hands (run inside Blender): the bench under the character, the feet on the floor and the right foot on
+the piano's damper pedal.
 
-A short character's shins do not reach the floor when seated at the keyboard (the development model's knees are
-level with the bench), so, like a short player, it uses a pedal extender: a box over the piano's pedals with its
-own pedals on top, linked to the piano's. Everything is fitted to the posed skin, not to fixed numbers:
+Everything is fitted to the posed skin, not to fixed numbers:
+- the feet are put down by their leg IK targets: the left boot flat on the floor, the right boot's heel on the floor
+  and its ball on the damper pedal, a little behind the pedal's tip;
 - the bench top is lowered to the lowest point of the seated body (hips, thighs; clothes without cloth
   simulation may still dip into the seat);
-- the box top carries the heels, each extender pedal lies under the ball of a foot;
-- pressing turns the right boot about its heel tip, the extender pedal about its hinge and the piano's damper
-  pedal about its back end, all by the same depth at the contact.
+- pressing turns the right boot about its heel tip and the piano's damper pedal about its back end, by the same
+  depth at the contact.
 """
 import bpy
 import numpy as np
@@ -17,35 +16,22 @@ from mathutils import Matrix, Vector
 from thumb_driver import mesh_world
 
 PEDAL_DEPTH = .008             # m the damper pedal goes down where the foot presses
-PIANO_DAMPER = 'piano_part_034'   # the grand's right pedal (under the box)
-BOX = 'pedal_extender'         # the extender body (apply_seating's footrest, refitted here)
-LEVERS = {'L': 'extender_pedal_L', 'R': 'extender_pedal_R'}
+PIANO_DAMPER = 'piano_part_034'   # the grand's right pedal
+FLOOR = 'floor'                # the floor object (its top is the floor height; 0 without one)
 FOOT_TARGET = '右足ＩＫ'        # the right leg's IK target; the toe target is its child
-BOX_MARGIN = (.03, .04, .03)   # m around the boots: sides, behind the heels, in front of the toes
-LEVER_WIDTH, LEVER_BACK, LEVER_FRONT, LEVER_THICK = .06, .08, .03, .005
+FOOT_TARGETS = {'L': '左足ＩＫ', 'R': FOOT_TARGET}
+ANKLES = {'L': '左足首', 'R': '右足首'}
+BALL_ON_PEDAL = .04            # m from the damper pedal's tip back to under the ball of the foot
+OLD_STAGING = ('pedal_extender', 'extender_pedal_L', 'extender_pedal_R')   # earlier versions' footrest objects
 SIDE = {'L': -1., 'R': 1.}
 SEATED_BONES = ('下半身', '左足D', '右足D', '左足', '右足')   # pelvis and thighs: what rests on the bench
-
-
-def _box_mesh(name, lo, hi):
-    """An axis-aligned box mesh from lo to hi (object space)."""
-    mesh = bpy.data.meshes.new(name)
-    x0, y0, z0 = lo
-    x1, y1, z1 = hi
-    verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0), (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
-    faces = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
-    mesh.from_pydata(verts, [], faces)
-    return mesh
-
-
-def _material(name, colour):
-    material = bpy.data.materials.get(name) or bpy.data.materials.new(name)
-    material.diffuse_color = colour
-    return material
+HIP_JOINTS = ('左足', '右足')
 
 
 def fit_bench(skin):
-    """Lower the bench top to the lowest seated-body point over it; the legs get shorter. Returns the drop (m)."""
+    """Lower the bench top to the lowest seated-body point over it behind the hip joints (the buttocks carry the
+    weight; the thighs in front slope down to the knees and press into the front edge); the legs get shorter.
+    Returns the drop (m)."""
     seat = bpy.data.objects['bench_seat']
     coords, _ = mesh_world(skin)
     seated = {g.index for g in skin.vertex_groups if g.name in SEATED_BONES}
@@ -55,7 +41,9 @@ def fit_bench(skin):
                      for v in skin.data.vertices])
     corners = np.array([list(seat.matrix_world @ Vector(c)) for c in seat.bound_box])
     lo, hi = corners.min(0), corners.max(0)
-    over = body & (coords[:, 0] > lo[0]) & (coords[:, 0] < hi[0]) & (coords[:, 1] > lo[1]) & (coords[:, 1] < hi[1]) & (coords[:, 2] > lo[2])
+    arm = skin.find_armature()
+    hips = max((arm.matrix_world @ arm.pose.bones[n].head).y for n in HIP_JOINTS)
+    over = body & (coords[:, 1] < hips) & (coords[:, 0] > lo[0]) & (coords[:, 0] < hi[0]) & (coords[:, 1] > lo[1]) & (coords[:, 1] < hi[1]) & (coords[:, 2] > lo[2])
     drop = max(0., hi[2] - coords[over, 2].min()) if over.any() else 0.
     if drop:
         world = seat.matrix_world.copy()
@@ -72,13 +60,14 @@ def fit_bench(skin):
     return drop
 
 
-def boot_contacts(skin):
+def boot_contacts(arm, skin):
     """Per boot: heel tip (lowest point of its back 40 %) and ball (lowest point of its front half), world xyz."""
     coords, _ = mesh_world(skin)
-    feet = bpy.data.objects[BOX].matrix_world.translation
     out = {}
     for h, sx in SIDE.items():
-        boot = coords[(coords[:, 0] * sx > .02) & (coords[:, 2] < feet.z + .25) & (np.abs(coords[:, 1] - feet.y) < .3)]
+        ankle = arm.matrix_world @ arm.pose.bones[ANKLES[h]].head
+        boot = coords[(coords[:, 0] * sx > .02) & (np.abs(coords[:, 0] - ankle.x) < .12) & (coords[:, 2] < ankle.z + .05)
+                      & (np.abs(coords[:, 1] - ankle.y) < .3)]
         back, front = boot[:, 1].min(), boot[:, 1].max()
         rear = boot[boot[:, 1] < back + .4 * (front - back)]
         fore = boot[boot[:, 1] > back + .5 * (front - back)]
@@ -86,44 +75,54 @@ def boot_contacts(skin):
     return out
 
 
-def pedal_extender(skin):
-    """Refit the box under the heels and put an extender pedal under each ball. Returns the contact geometry."""
-    contacts = boot_contacts(skin)
-    lo = np.min([c['lo'] for c in contacts.values()], axis=0)
-    hi = np.max([c['hi'] for c in contacts.values()], axis=0)
-    top = min(c['heel'][2] for c in contacts.values())
-    floor = 0.
-    box = bpy.data.objects[BOX]
-    old = box.data
-    box.data = _box_mesh(BOX, (lo[0] - BOX_MARGIN[0], lo[1] - BOX_MARGIN[1], floor), (hi[0] + BOX_MARGIN[0], hi[1] + BOX_MARGIN[2], top))
-    box.matrix_world = Matrix.Identity(4)
-    for material in old.materials:
-        box.data.materials.append(material)
-    brass = _material('extender_pedal_brass', (.55, .42, .18, 1.))
-    for h, c in contacts.items():
-        ball = c['ball']
-        hinge = Vector((ball[0], ball[1] - LEVER_BACK, ball[2]))
-        lever = bpy.data.objects.get(LEVERS[h])
-        if lever is None:
-            lever = bpy.data.objects.new(LEVERS[h], None)
-            bpy.context.scene.collection.objects.link(lever)
-        mesh = _box_mesh(LEVERS[h], (-LEVER_WIDTH / 2, 0., -LEVER_THICK), (LEVER_WIDTH / 2, LEVER_BACK + LEVER_FRONT, 0.))
-        block = _box_mesh('hinge', (-LEVER_WIDTH / 2, 0., top - ball[2]), (LEVER_WIDTH / 2, .015, -LEVER_THICK))
-        verts = [v.co.copy() for v in mesh.vertices] + [v.co.copy() for v in block.vertices]
-        faces = [tuple(p.vertices) for p in mesh.polygons] + [tuple(i + 8 for i in p.vertices) for p in block.polygons]
-        mesh.clear_geometry()
-        mesh.from_pydata(verts, [], faces)
-        bpy.data.meshes.remove(block)
-        if lever.type != 'MESH':
-            bpy.data.objects.remove(lever)
-            lever = bpy.data.objects.new(LEVERS[h], mesh)
-            bpy.context.scene.collection.objects.link(lever)
-        else:
-            lever.data = mesh
-        lever.data.materials.append(brass)
-        lever.matrix_world = Matrix.Translation(hinge)
-        c['hinge'] = np.array(hinge)
-    contacts['top'] = top
+def _bounds(obj):
+    corners = np.array([list(obj.matrix_world @ Vector(c)) for c in obj.bound_box])
+    return corners.min(0), corners.max(0)
+
+
+def _place_foot(arm, skin, h, target, steps=8):
+    """Move and pitch the foot's IK target until the boot's heel and ball are at ``target(heel, ball)`` -> (heel, ball)
+    targets (world). Returns the remaining miss (m)."""
+    bone = arm.pose.bones[FOOT_TARGETS[h]]
+    bone.rotation_mode = 'QUATERNION'
+    miss = np.inf
+    for _ in range(steps):
+        c = boot_contacts(arm, skin)[h]
+        heel, ball = c['heel'], c['ball']
+        heel_to, ball_to = target(heel, ball)
+        miss = max(np.linalg.norm(heel_to - heel), np.linalg.norm(ball_to - ball))
+        if miss < 5e-4:
+            break
+        pitch = (np.arctan2(ball_to[2] - heel_to[2], ball_to[1] - heel_to[1]) - np.arctan2(ball[2] - heel[2], ball[1] - heel[1]))
+        world = Matrix.Translation(Vector(heel_to)) @ Matrix.Rotation(pitch, 4, 'X') @ Matrix.Translation(-Vector(heel))
+        bone.matrix = arm.matrix_world.inverted() @ world @ arm.matrix_world @ bone.matrix
+        bpy.context.view_layer.update()
+    return float(miss)
+
+
+def place_feet(arm, skin):
+    """Left boot flat on the floor, right boot's heel on the floor and ball on the damper pedal (by the leg IK targets).
+    Removes earlier versions' footrest. Returns the contact geometry and the misses."""
+    for name in OLD_STAGING:
+        if bpy.data.objects.get(name) is not None:
+            bpy.data.objects.remove(bpy.data.objects[name])
+    floor = _bounds(bpy.data.objects[FLOOR])[1][2] if bpy.data.objects.get(FLOOR) else 0.
+    lo, hi = _bounds(bpy.data.objects[PIANO_DAMPER])
+    on_pedal = np.array([(lo[0] + hi[0]) / 2, lo[1] + BALL_ON_PEDAL, hi[2]])
+
+    def right(heel, ball):
+        length = np.linalg.norm(ball - heel)
+        heel_to = on_pedal - [ball[0] - heel[0], np.sqrt(max(length ** 2 - (on_pedal[2] - floor) ** 2, 0.)), on_pedal[2] - floor]
+        return heel_to, on_pedal
+    misses = dict(R=_place_foot(arm, skin, 'R', right))
+    right_heel = boot_contacts(arm, skin)['R']['heel']
+
+    def left(heel, ball):
+        heel_to = np.array([heel[0], right_heel[1], floor])
+        return heel_to, heel_to + [ball[0] - heel[0], np.hypot(ball[1] - heel[1], ball[2] - heel[2]), 0.]
+    misses['L'] = _place_foot(arm, skin, 'L', left)
+    contacts = boot_contacts(arm, skin)
+    contacts['floor'], contacts['miss_mm'] = floor, {h: m * 1000 for h, m in misses.items()}
     return contacts
 
 
@@ -139,7 +138,7 @@ def damper_pose(arm, skin, contacts):
     """Rest and fully pressed (location, quaternion) of the right foot's IK target, turned about the heel tip.
 
     The leg IK does not turn the boot by exactly the target's angle, so the angle is solved on the posed skin:
-    the ball of the boot goes down PEDAL_DEPTH, onto the pressed extender pedal."""
+    the ball of the boot goes down PEDAL_DEPTH, with the pressed damper pedal."""
     heel, ball = contacts['R']['heel'], contacts['R']['ball']
     bone = arm.pose.bones[FOOT_TARGET]
     bone.rotation_mode = 'QUATERNION'
@@ -166,7 +165,7 @@ def damper_pose(arm, skin, contacts):
 
 
 def animate_damper(arm, skin, contacts, frames, depth, intervals, fps, write_curve):
-    """Foot, extender pedal and piano pedal follow ``depth``; the piano pedal also carries the exact pedal state
+    """Foot and piano pedal follow ``depth``; the piano pedal also carries the exact pedal state
     as the custom property ``damper`` (0/1, constant between source events) for a sound engine."""
     depth = np.asarray(depth, float)[:, None]
     (rest_loc, rest_q), (pressed_loc, pressed_q), angle, reached = damper_pose(arm, skin, contacts)
@@ -176,9 +175,6 @@ def animate_damper(arm, skin, contacts, frames, depth, intervals, fps, write_cur
     q1 = q1 if q0 @ q1 >= 0 else -q1
     q = q0 + depth * (q1 - q0)
     write_curve(bone, 'rotation_quaternion', frames, q / np.linalg.norm(q, axis=1, keepdims=True))
-    lever = bpy.data.objects[LEVERS['R']]
-    lever.rotation_mode = 'XYZ'
-    write_curve(lever, 'rotation_euler', frames, -depth[:, 0] * PEDAL_DEPTH / LEVER_BACK, index=0)
     piano = bpy.data.objects[PIANO_DAMPER]
     corners = np.array([list(piano.matrix_world @ Vector(c)) for c in piano.bound_box])
     lo, hi = corners.min(0), corners.max(0)

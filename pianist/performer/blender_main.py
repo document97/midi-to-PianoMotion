@@ -5,7 +5,7 @@ blender -b <scene with character and piano>.blend --python-exit-code 1 \
 
 This is the only Blender process of a run. It prepares the bake's neutral scene,
 starts the solve (performer.pipeline) as an ordinary Python process with its own
-worker pool and waits for it, fits the bench and pedal extender (performer.staging),
+worker pool and waits for it, puts the feet down and fits the bench (performer.staging),
 then writes every curve (arms, torso, fingers, right foot and pedals,
 keys) and saves ``<output>/performer.blend``. No rendering. Finally a sample
 of frames is evaluated on the real deformed mesh to confirm the written pads
@@ -33,7 +33,7 @@ from recorded_curve_io import replace_linear_curve   # noqa: E402
 from thumb_driver import animation_curves, mesh_world   # noqa: E402
 
 from performer.rig_export import neutral_scene       # noqa: E402
-from performer.staging import animate_damper, fit_bench, pedal_extender   # noqa: E402
+from performer.staging import animate_damper, fit_bench, place_feet   # noqa: E402
 
 # the solve runs in an ordinary Python (numpy, scipy), not Blender's: PIANOMOTION_PYTHON, else the first python on PATH
 PYTHON = os.environ.get('PIANOMOTION_PYTHON') or shutil.which('python') or shutil.which('python3')
@@ -82,9 +82,27 @@ def write_animation(arm, rig, motion):
                 bone.rotation_mode = 'XYZ'
                 write_curve(bone, 'rotation_euler', frames, motion[f'{h}_child_euler'][:, int(d) - 1, j])
     if rig.get('torso') and np.any(motion['torso']):
-        bone = arm.pose.bones[rig['torso']['bone']]
-        bone.rotation_mode = 'QUATERNION'
-        write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion['torso']))
+        names = [b['bone'] for b in rig['torso'].get('spine', [])] + ([rig['torso']['neck']['bone']] if 'neck' in rig['torso'] else [])
+        if 'spine' in motion and names:
+            for k, name in enumerate(names):        # the spine and the neck: lean and turn shared up the back
+                bone = arm.pose.bones[name]
+                bone.rotation_mode = 'QUATERNION'
+                write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion['spine'][:, k]))
+        else:
+            bone = arm.pose.bones[rig['torso']['bone']]
+            bone.rotation_mode = 'QUATERNION'
+            write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion['torso']))
+        slide_bone = rig['torso'].get('slide_bone')
+        if slide_bone and 'slide' in motion and np.any(motion['slide']):
+            bone = arm.pose.bones[slide_bone]       # the seat's slide (world offset) as the bone's location
+            pre = arm.matrix_world @ bone.parent.matrix @ bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
+            to_local = np.array(pre.to_3x3().inverted())
+            write_curve(bone, 'location', frames, np.array(bone.location)[None] + motion['slide'] @ to_local.T)
+        for h, s in rig['torso'].get('shoulders', {}).items():
+            if f'{h}_collar_q' in motion and np.any(motion[f'{h}_collar_q']):
+                bone = arm.pose.bones[s['bone']]
+                bone.rotation_mode = 'QUATERNION'
+                write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion[f'{h}_collar_q']))
     # Every key starts from rest with no animation: the scene may carry another performance's key curves
     # (the base file's), and a key this run never plays would replay them on its own.
     for key in [ob for ob in bpy.data.objects if ob.name.startswith('key_')]:
@@ -157,8 +175,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     cal = json.loads((ROOT / 'hand_calibration.json').read_text(encoding='utf-8'))
     arm, skin, _, _, _ = neutral_scene(cal)
+    contacts = place_feet(arm, skin)        # before the bench: the thighs follow the legs
     bench_drop = fit_bench(skin)
-    contacts = pedal_extender(skin)
     if not args.skip_solve:
         if not args.inputs:
             parser.error('--inputs is required unless --skip-solve')
@@ -172,7 +190,7 @@ def main():
     from performer.pipeline import RIG as rig_path
     rig = json.loads(rig_path.read_text(encoding='utf-8'))
     frames = write_animation(arm, rig, motion)
-    staging = dict(bench_drop_mm=bench_drop * 1000, extender_top_m=contacts['top'])
+    staging = dict(bench_drop_mm=bench_drop * 1000, feet_miss_mm=contacts['miss_mm'])
     if 'damper' in motion:
         fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
         staging.update(animate_damper(arm, skin, contacts, frames, motion['damper'], motion['damper_intervals'], fps, write_curve))
