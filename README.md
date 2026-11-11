@@ -81,7 +81,7 @@ blender -b your_scene.blend --python-exit-code 1 --python performer/blender_main
 
 第一次运行时会为这个骨架计算手指配对表（`performer/reach_table.py`），缓存在 `performer/rig_cache/`。16 进程约 20 秒。`blender_main.py` 会用 `PATH` 上找到的 Python 求解，也可以用环境变量 `PIANOMOTION_PYTHON` 指定（要指定装了 numba 的那个 Python）。
 
-预览音频（`planner/audio.py`）用的是 Windows 自带的 General MIDI 音色库（`gm.dls`）。
+试听音频（`planner/audio.py`）用 FluidSynth 和 Fazioli F308 音源渲染（见“依赖”），延音踏板沿用原 MIDI 的 CC64，只做一次统一音量调整。规划内部比较两种方案的音频差异时，用的是 Windows 自带的 General MIDI 音色（`gm.dls`）的简单采样器，不影响输出的音频。
 
 ## 许可证
 

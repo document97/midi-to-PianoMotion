@@ -81,7 +81,7 @@ By default the solve runs on the CPU's big cores only, with every one of their t
 
 The first run computes the finger pair table for the skeleton (`performer/reach_table.py`) and caches it in `performer/rig_cache/`: about 20 seconds on 16 processes. `blender_main.py` runs the solve with the Python found on `PATH`; the environment variable `PIANOMOTION_PYTHON` can name another one (the Python that has numba).
 
-The preview audio (`planner/audio.py`) uses the General MIDI sound bank that comes with Windows (`gm.dls`).
+The listening audio (`planner/audio.py`) is rendered with FluidSynth and the Fazioli F308 SF2 (see Requirements), with the source MIDI's sustain pedal (CC64) and one uniform gain. The planner's internal comparison of two plans' sound uses a plain sampler on the General MIDI samples that come with Windows (`gm.dls`); it does not affect the output audio.
 
 ## License
 
