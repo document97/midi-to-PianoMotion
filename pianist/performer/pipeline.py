@@ -28,7 +28,7 @@ from planner.problem import PIECE_FILES, build, load_raw, plan_notes, register_r
 from planner.search import Weights
 from planner.validate import validate
 
-from .anchors import KEY_TRAVEL, REACH_TOLERANCE, Anchor, build_anchors, note_motions, solve_anchors, summary
+from .anchors import KEY_RETURN_SECONDS, KEY_TRAVEL, REACH_TOLERANCE, REPAIR_FAR_CUT_SECONDS, Anchor, build_anchors, note_motions, solve_anchors, summary
 from .checks import BRUSH_DEPTH, Heightfield, stretched
 from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, least_sunk, neighbour_targets,
                         settle, sunk, vector_of, wide_settle)
@@ -37,7 +37,8 @@ from .torso import Torso, reach_window
 from .contacts import HandCapsules, finger_pairs, hands_gap, pointing, raised_between
 from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contact_error, contact_waypoints, finger_track, frame_hand,
                      placed, refine_points, refine_score, strokes, waypoint, wrist_path, SIDEWAYS_FREE, YieldingPath,
-                     yield_offsets)
+                     yield_offsets, _split)
+from .kinematics import FLOAT
 from .pedal import PEDAL_LEAD, damper_depth, damper_intervals, pedal_union
 from .pose import RELAXED, hand_solvers
 from .progress import progress_map
@@ -177,6 +178,38 @@ def _check(job):
     hand, times = job
     return np.array([contact_error(t, _ctx['paths'][hand], _ctx['hand_notes'][hand], _ctx['waypoints'],
                                    _ctx['solvers'][hand], _ctx['ik'][hand]) for t in times])
+
+
+def _held_errors(job):
+    """Pad error (m) of each key the hand holds at ``t`` on its wrist path: {note id: error}."""
+    hand, t = job
+    path, solver, ik = _ctx['paths'][hand], _ctx['solvers'][hand], _ctx['ik'][hand]
+    palm = solver.palm(*_split(path(t)))
+    out = {}
+    for n in _ctx['hand_notes'][hand].values():
+        if n.touch <= t <= n.release and n.id in _ctx['waypoints']:
+            top, seed = waypoint(_ctx['waypoints'][n.id], t, path)
+            out[n.id] = float(ik.solve(n.digit, palm, top - np.array([0., 0., n.depth(t)], dtype=FLOAT), seed)[1])
+    return out
+
+
+def leave_lifts(drops, errors, samples, notes):
+    """Held keys to let go early where the hand cannot hold them on its way (an intermediate pose there would snap
+    the wrist off its path, ``gentle``): ``drops`` [(note id, time)], ``errors`` the hand's pad errors on ``samples``.
+    Each key is lifted so it is up where its error run (pad error above REACH_TOLERANCE) begins, if that is legal and
+    loses at most REPAIR_FAR_CUT_SECONDS of sound against the planned release (as an anchor repair may). -> {note id: lift time}."""
+    lifts = {}
+    bad = errors > REACH_TOLERANCE
+    for k, t in drops:
+        n = notes[k]
+        i = int(np.argmin(np.abs(samples - t)))
+        while i > 0 and bad[i - 1] and samples[i - 1] >= n.touch:
+            i -= 1
+        lift = max(n.earliest_release, float(samples[i]) - KEY_RETURN_SECONDS)
+        if lift >= n.release - 1e-6 or max(0., min(n.pedal_release, n.release) - lift) > REPAIR_FAR_CUT_SECONDS:
+            continue
+        lifts[k] = min(lift, lifts.get(k, lift))
+    return lifts
 
 
 NEAR_PATH = np.array([.01, .01, .01, 3., 3.])     # intermediate poses stay this close to the wrist path
@@ -863,7 +896,7 @@ def run(args):
     paths = paths_for(anchors)
     waypoints = contact_waypoints(placed(anchors, paths, posture_solvers, notes), notes)
     samples = np.arange(0., duration, REFINE_STEP)
-    intermediate = dropped_snaps = 0
+    intermediate = dropped_snaps = left_early = 0
     for refine_round in range(REFINE_ROUNDS):
         print(f'[wrist paths] refine round {refine_round + 1}/{REFINE_ROUNDS}', flush=True)
         with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(base, paths=paths, waypoints=waypoints),)) as pool:
@@ -898,8 +931,24 @@ def run(args):
                                                       if len(c)], 'depth families')
                 for a, sl in zip(kept, [sl for part in parts for sl in part]):
                     a.family = sl
+            # where no gentle pose holds the keys, the keys the hand cannot hold on its way are let go early
+            missed = [a for a, p in zip(new, poses) if a.held and not any(k is a for k in kept)]
+            lifted = {}
+            if missed:
+                held = progress_map(pool, _held_errors, [(a.hand, a.time) for a in missed], 'held keys off', 4)
+                for h in 'LR':
+                    drops = [(k, a.time) for a, e in zip(missed, held) if a.hand == h for k, v in e.items() if v > REACH_TOLERANCE]
+                    lifted.update(leave_lifts(drops, np.concatenate(errors[h])[:, 0], samples, notes))
+            for k, lift in lifted.items():
+                notes[k].release = lift
+            if lifted:
+                for a in anchors + kept:
+                    a.held = tuple(k for k in a.held if notes[k].held_at(a.time))
+                stroke_of = strokes(notes)
+                base['strokes'] = stroke_of
+                left_early += len(lifted)
         dropped_snaps += sum(p is not None for p in poses) - len(kept)
-        if not kept:
+        if not kept and not lifted:
             break
         anchors = anchors + kept
         intermediate += len(kept)
@@ -994,7 +1043,7 @@ def run(args):
                        audibly_shortened_notes=len(shortened), band_deficit_db=fidelity,
                        plan_validation_problems=len(problems), score_hands=score_hands(source, final_rows)),
         motion=dict(frames=len(times), rate=FRAME_RATE, anchors=summary([a for a in anchors if a.incoming]),
-                    awkward_shapes=shape_report(chosen), intermediate_poses=intermediate, intermediate_dropped_snaps=dropped_snaps, idle_hand_yield_mm=yielded, early_releases_for_wrist=freed, bridged_frames=bridged,
+                    awkward_shapes=shape_report(chosen), intermediate_poses=intermediate, intermediate_dropped_snaps=dropped_snaps, held_keys_left_early=left_early, idle_hand_yield_mm=yielded, early_releases_for_wrist=freed, bridged_frames=bridged,
                     brushed_keys=brushed,
                     smoothness=smoothness(frames, FRAME_RATE),
                     finger_sideways_at_press=sideways(frames, notes, FRAME_RATE),
