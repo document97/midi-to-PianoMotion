@@ -23,9 +23,10 @@ from .pose import (hand_shape, CLEARANCE_SCALE, CONTACT_TOLERANCE, WEB_SCALE, NA
                    wrist_steps)
 
 # GPU memory a solve may use: this share of what is free when it starts (an iGPU shares it with the CPU),
-# or PIANOMOTION_GPU_MEMORY_GB. Passes are split into chunks of rows that fit, measured on the first pass
-# of each kind, so a larger card runs larger chunks.
+# at most MEMORY_GB (PIANOMOTION_GPU_MEMORY_GB, default a 6 GB laptop card). Passes are split into chunks of
+# rows that fit, measured on the first pass of each kind, so a larger card runs larger chunks.
 MEMORY_SHARE = float(os.environ.get('PIANOMOTION_GPU_MEMORY_SHARE', .4))
+MEMORY_GB = float(os.environ.get('PIANOMOTION_GPU_MEMORY_GB', 6))
 PROBE_ROWS = 128            # rows of the pass that measures a chunk's memory per row
 BATCH_ROWS = 1 << 18        # problem-seed rows of one solve (their state is small; passes are chunked)
 FINGER_BONES = 3            # per finger: root, MCP, IP
@@ -115,12 +116,9 @@ class _Hand:
         import torch
         self.torch, self.dev, self.solver = torch, dev, solver
         t = lambda a, dtype=FLOAT: torch.as_tensor(np.asarray(a, dtype), device=dev)
-        if 'PIANOMOTION_GPU_MEMORY_GB' in os.environ:
-            self.budget = float(os.environ['PIANOMOTION_GPU_MEMORY_GB']) * 2 ** 30
-        elif dev.type == 'cuda':
-            self.budget = torch.cuda.mem_get_info(dev)[0] * MEMORY_SHARE
-        else:
-            self.budget = 2 ** 30
+        self.budget = MEMORY_GB * 2 ** 30
+        if dev.type == 'cuda':
+            self.budget = min(self.budget, torch.cuda.mem_get_info(dev)[0] * MEMORY_SHARE)
         self.row_bytes = {}
         # constants of the passes (a GPU graph cannot copy from the host while it records)
         self.bottom_row, self.z_axis = t([[0., 0., 0., 1.]]), t([0., 0., 1.])
