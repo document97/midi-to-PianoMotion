@@ -16,6 +16,7 @@ import math
 import numpy as np
 
 from .checks import stretched
+from . import fast_settle
 from .anchors import KEY_TRAVEL
 from .kinematics import DIGITS, FLOAT
 from .posture import natural_orientation
@@ -151,11 +152,27 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
 
     steps = wrist_steps(len(digits))
     start = x.copy()
-    x, used = PoseSolver._levenberg_marquardt(residuals, start, lower, upper, steps, iterations)
-    if free_digits and surface is not None and contact_error(x) > CONTACT_TOLERANCE * 2.5:
-        curved[0] = False      # the curved free fingers held the hand off its keys (an octave's middle fingers)
-        x, more = PoseSolver._levenberg_marquardt(residuals, start, lower, upper, steps, iterations)
-        used += more
+    if surface is not None and fast_settle.available():
+        # the same solve compiled (fast_settle), retry without the curved free fingers included
+        ordered = sorted(contacts, key=lambda c: c.digit)
+        edges, blacks = [], []
+        for c in ordered:
+            black = solver.regions.is_black(c.pitch)
+            blacks.append(black)
+            edges.append(solver.regions.keys[c.pitch]['bounds_min'][1] + BLACK_FRONT_IN if black
+                         else solver.regions.black_front - WHITE_FRONT_CLEAR if front is None
+                         else solver.regions.keys[c.pitch]['bounds_min'][1] + front)
+        prob = fast_settle.problem(ordered, digits, start, lower, upper, values, depths, edges, blacks,
+                                   [solver.regions.centre(c.pitch)[0] for c in ordered], target, pull, natural, shape,
+                                   curved_free, np.array(FREE_LIFTED), stretch, steps, iterations, True)
+        x, used = fast_settle.solve(fast_settle.pack(solver), prob)
+        x = np.asarray(x, FLOAT)
+    else:
+        x, used = PoseSolver._levenberg_marquardt(residuals, start, lower, upper, steps, iterations)
+        if free_digits and surface is not None and contact_error(x) > CONTACT_TOLERANCE * 2.5:
+            curved[0] = False      # the curved free fingers held the hand off its keys (an octave's middle fingers)
+            x, more = PoseSolver._levenberg_marquardt(residuals, start, lower, upper, steps, iterations)
+            used += more
     palm = unpack(x)
     error, targets, clearance = 0., {}, 0.
     for c in contacts:

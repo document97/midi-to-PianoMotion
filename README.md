@@ -38,6 +38,7 @@
 ## 依赖
 
 - Python（需要 `numpy`、`scipy`、`mido`）和 Blender。
+- 推荐：`numba`。手腕路径阶段最耗时的局部求解会编译成机器码，这一步快十倍左右；第一次运行要先编译约 15 秒，结果缓存在磁盘上，改代码后才重新编译。没有装时用 numpy 计算，质量相同（浮点舍入不同，细节会略有差异），只是慢。
 - 试听音频（输出目录里的 `preview.wav`）：[FluidSynth](https://github.com/FluidSynth/fluidsynth/releases)（Windows 版解压到 `tools/fluidsynth/`）和 Dore Mark 的 Fazioli F308 SF2 音源（法齐奥里三角钢琴，soundfonts4u 制作；原站已关闭，可从 [Hugging Face 镜像](https://huggingface.co/datasets/projectlosangeles/soundfonts4u) 下载 `Dore Mark's Fazioli F308-v2.6.sf2`，放到 `tools/fazioli/`）。也可以用环境变量 `PIANOMOTION_FLUIDSYNTH`、`PIANOMOTION_SOUNDFONT` 指定位置。输出是 WAV，只做一次统一音量调整。
 - 可选：支持 GPU 的 PyTorch（NVIDIA 用 CUDA 版，AMD 用 ROCm 版），用来加速手指配对表。没有装、或检测不到 GPU 时，自动用 CPU 多进程计算，结果的用法不变。
 - 开发环境是 Windows 11、Python 3.12、Blender 5.2，其他环境没有测试过。
