@@ -1,8 +1,8 @@
 """coherence.settle's solve compiled (numba): the same residuals, bounds, start and bounded Levenberg-Marquardt, the
 whole solve of one problem in machine code instead of some hundred small numpy calls per residual evaluation.
 
-``available()`` is False without numba (or with PIANOMOTION_FAST_SETTLE=0): coherence.settle then runs its numpy
-solve. The rig's tables are packed once per solver (``pack``); a problem is a tuple of small arrays (``problem``).
+numba is required: without it the import stops with how to install it. PIANOMOTION_FAST_SETTLE=0 runs coherence.settle's
+numpy solve instead (about ten times slower; for checking the compiled solve against it). The rig's tables are packed once per solver (``pack``); a problem is a tuple of small arrays (``problem``).
 The compiled code is kept on disk (numba cache) and only rebuilt when this file changes.
 """
 import math
@@ -15,12 +15,14 @@ from .kinematics import DIGITS, child_euler
 from .motion import FLOOR_SCALE, PAD_PITCH_MAX, PAD_PITCH_SCALE, KeyFloor, KeySurface, Spacing
 from .pose import CONTACT_TOLERANCE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, STEP_TOLERANCE, VALUE_SCALE, WEB_SCALE
 
-try:
-    if os.environ.get('PIANOMOTION_FAST_SETTLE', '1') == '0':
-        raise ImportError
-    from numba import njit
-except ImportError:
+if os.environ.get('PIANOMOTION_FAST_SETTLE', '1') == '0':
     njit = None
+else:
+    try:
+        from numba import njit
+    except ImportError:
+        raise ImportError('numba is required (pip install numba): the wrist path solve runs compiled. '
+                          'PIANOMOTION_FAST_SETTLE=0 runs it in numpy instead, about ten times slower.') from None
 _jit = njit(cache=True, fastmath=False, nogil=True) if njit is not None else (lambda f: f)
 
 F = np.float64

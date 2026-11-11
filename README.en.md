@@ -37,8 +37,8 @@ Only the algorithm. The character, piano and scene models used during developmen
 
 ## Requirements
 
-- Python (with `numpy`, `scipy`, `mido`) and Blender.
-- Recommended: `numba`. The wrist path stage's most expensive local solve is compiled to machine code, about ten times faster; the first run compiles for about 15 s and keeps the result on disk until the code changes. Without it the same solve runs in numpy: the same quality (rounding differs, so details vary slightly), only slower.
+- Python (with `numpy`, `scipy`, `mido`, `numba`) and Blender.
+- Required: `numba` (`pip install numba`). The wrist path stage's most expensive local solve runs compiled, about ten times faster than numpy; without numba the program stops and says to install it. The first run compiles for about 15 s and keeps the result on disk until the code changes.
 - For the listening audio (`preview.wav` in the output folder): [FluidSynth](https://github.com/FluidSynth/fluidsynth/releases) (the Windows build unpacked into `tools/fluidsynth/`) and Dore Mark's Fazioli F308 SF2 (a Fazioli grand, converted by soundfonts4u; that site is gone, the [Hugging Face mirror](https://huggingface.co/datasets/projectlosangeles/soundfonts4u) has `Dore Mark's Fazioli F308-v2.6.sf2`, into `tools/fazioli/`), or set `PIANOMOTION_FLUIDSYNTH` and `PIANOMOTION_SOUNDFONT`. The output is WAV with one uniform gain and nothing else.
 - Optional: PyTorch with GPU support (the CUDA build for NVIDIA, ROCm for AMD) to speed up the finger pair table. Without it, or without a GPU, the table is computed on CPU processes as before.
 - Developed on Windows 11, Python 3.12 and Blender 5.2; other setups have not been tested.
