@@ -897,8 +897,8 @@ def run(args):
     waypoints = contact_waypoints(placed(anchors, paths, posture_solvers, notes), notes)
     samples = np.arange(0., duration, REFINE_STEP)
     intermediate = dropped_snaps = left_early = 0
-    for refine_round in range(REFINE_ROUNDS):
-        print(f'[wrist paths] refine round {refine_round + 1}/{REFINE_ROUNDS}', flush=True)
+    for refine_round in range(args.refine_rounds):
+        print(f'[wrist paths] refine round {refine_round + 1}/{args.refine_rounds}', flush=True)
         with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(base, paths=paths, waypoints=waypoints),)) as pool:
             jobs = [(h, c) for h in 'LR' for c in chunks(samples, workers * 2)]
             errors = {h: [] for h in 'LR'}
@@ -1043,7 +1043,7 @@ def run(args):
                        audibly_shortened_notes=len(shortened), band_deficit_db=fidelity,
                        plan_validation_problems=len(problems), score_hands=score_hands(source, final_rows)),
         motion=dict(frames=len(times), rate=FRAME_RATE, anchors=summary([a for a in anchors if a.incoming]),
-                    awkward_shapes=shape_report(chosen), intermediate_poses=intermediate, intermediate_dropped_snaps=dropped_snaps, held_keys_left_early=left_early, idle_hand_yield_mm=yielded, early_releases_for_wrist=freed, bridged_frames=bridged,
+                    awkward_shapes=shape_report(chosen), intermediate_poses=intermediate, intermediate_dropped_snaps=dropped_snaps, refine_rounds=args.refine_rounds, held_keys_left_early=left_early, idle_hand_yield_mm=yielded, early_releases_for_wrist=freed, bridged_frames=bridged,
                     brushed_keys=brushed,
                     smoothness=smoothness(frames, FRAME_RATE),
                     finger_sideways_at_press=sideways(frames, notes, FRAME_RATE),
@@ -1080,6 +1080,8 @@ def main():
                         help="the planner's relaxed spacing per finger (m); default: an adult hand's. The rig's own "
                              "(rig_finger_spacing, ~.0154) avoids stretches by cutting held notes: -0.6 dB in the first 30 s")
     parser.add_argument('--lift-speed', type=float, help='wrist speed (m/s) the planner times releases for')
+    parser.add_argument('--refine-rounds', type=int, default=REFINE_ROUNDS,
+                        help=f'wrist path refine rounds: check, intermediate poses, early lifts (default {REFINE_ROUNDS})')
     parser.add_argument('--motion-cut', type=float, default=MOTION_CUT_SECONDS,
                         help='longest audible early lift that lets the wrist travel at a natural pace (s); 0: none')
     parser.add_argument('--dump', help='pickle the frame context (debugging)')
