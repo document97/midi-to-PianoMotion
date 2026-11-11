@@ -64,7 +64,7 @@ INTRO_SECONDS = 2.                # the hands rest at least this long before the
                                   # a piece starting sooner is preceded by silence (motion and audio start that much later)
 WARM_FRAMES = 12                 # frames solved before a chunk (discarded) so the warm start carries over
 CHUNKS_PER_WORKER = 4
-REFINE_ROUNDS = 1                 # wrist path -> contact check -> intermediate poses (AMA 0-50 s: the 1st round 497->379 points, L max 39.8->4.0 mm; the 2nd only 379->356 for ~2 min)
+REFINE_ROUNDS = 2                 # wrist path -> contact check -> intermediate poses (Daylight: after 1 round L 18 checks >8 mm, after 2 10; the 2nd round ~30 s)
 SPIKE_ERROR = .005                # pad error above which a short run of frames is replaced by its neighbours
 SPIKE_FRAMES = 4
 
