@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 # Every array of the solve is float32 (Blender stores poses and keys as float32 too). Steps, tolerances
-# and the Jacobians are chosen for it (pose.PoseSolver._levenberg_marquardt, batch_pose).
+# and the Jacobians are chosen for it (pose.PoseSolver._levenberg_marquardt, fast_settle).
 FLOAT = np.float32
 CALIBRATION = Path(__file__).resolve().parents[1] / 'hand_calibration.json'
 DIGITS = (1, 2, 3, 4, 5)

@@ -9,7 +9,7 @@ Give it a MIDI file and a 3D character plays it on a piano in Blender:
 1. **Planning**: decides which hand and which finger plays each note, when each finger lets go of its key, and which notes have to be left out because the hand cannot reach them. The planner splits the notes between the hands itself; the score does not need to be separated into hands.
 2. **Motion**: animates the arms, wrists, fingers, the lean of the upper body, the right foot on the sustain pedal and every key, and writes it all into a `.blend` with preview audio.
 
-No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything is computed in 32-bit floats (fp32). Planning and motion run on the CPU in parallel processes (8 or 16); the finger pair table computed on the first run is solved in batches on the GPU when there is one. For a 160-second piece (Daylight), planning takes about a minute and the whole solve about 28 minutes on 16 processes.
+No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything is computed in 32-bit floats (fp32). Everything runs on the CPU in parallel processes (8 or 16), the most expensive local solves compiled to machine code with numba. For a 160-second piece (Daylight), the whole solve takes about 8 minutes on 16 processes.
 
 > **Demo video:** https://www.bilibili.com/video/BV1QEnc6rECK/
 
@@ -40,7 +40,6 @@ Only the algorithm. The character, piano and scene models used during developmen
 - Python (with `numpy`, `scipy`, `mido`, `numba`) and Blender.
 - Required: `numba` (`pip install numba`). The wrist path stage's most expensive local solve runs compiled, about ten times faster than numpy; without numba the program stops and says to install it. The first run compiles for about 15 s and keeps the result on disk until the code changes.
 - For the listening audio (`preview.wav` in the output folder): [FluidSynth](https://github.com/FluidSynth/fluidsynth/releases) (the Windows build unpacked into `tools/fluidsynth/`) and Dore Mark's Fazioli F308 SF2 (a Fazioli grand, converted by soundfonts4u; that site is gone, the [Hugging Face mirror](https://huggingface.co/datasets/projectlosangeles/soundfonts4u) has `Dore Mark's Fazioli F308-v2.6.sf2`, into `tools/fazioli/`), or set `PIANOMOTION_FLUIDSYNTH` and `PIANOMOTION_SOUNDFONT`. The output is WAV with one uniform gain and nothing else.
-- Optional: PyTorch with GPU support (the CUDA build for NVIDIA, ROCm for AMD) to speed up the finger pair table. Without it, or without a GPU, the table is computed on CPU processes as before.
 - Developed on Windows 11, Python 3.12 and Blender 5.2; other setups have not been tested.
 
 ## The development character
@@ -80,18 +79,7 @@ blender -b your_scene.blend --python-exit-code 1 --python performer/blender_main
 
 By default the solve runs on the CPU's big cores only, with every one of their threads busy: on Intel hybrid (P-cores / E-cores) and Arm big.LITTLE only the performance cores, on a CPU with one kind of core every thread. The process is pinned to those cores (Windows and Linux read the core types from the system; macOS only takes the number of performance cores, without pinning). `--workers N` sets another process count.
 
-The first run computes the finger pair table for the skeleton (`performer/reach_table.py`) and caches it in `performer/rig_cache/`: about 10 minutes on 16 CPU processes, or, with a GPU, about 2.5 minutes on a Radeon 780M iGPU, where `performer/batch_pose.py` solves all 7680 cases as one batch and keeps the GPU close to fully busy. `blender_main.py` runs the solve with the Python found on `PATH`; the environment variable `PIANOMOTION_PYTHON` can name another one (for the GPU, the Python that has PyTorch).
-
-GPU environment variables:
-
-| Variable | Effect |
-|---|---|
-| `PIANOMOTION_DEVICE=cpu` | no GPU: the pair table on CPU processes too |
-| `PIANOMOTION_GPU_MEMORY_SHARE` | largest share of the GPU memory free at the start to use, default `0.4` (an iGPU shares it with the CPU) |
-| `PIANOMOTION_GPU_MEMORY_GB` | cap on the GPU memory to use, in GB, default `6`; the smaller of this and the share is used |
-| `PIANOMOTION_GPU_GRAPHS=0` | no CUDA/HIP graph replay (on by default; replay gives the same results, and is switched off by itself if a graph cannot be recorded) |
-
-The GPU solver has been measured on a Radeon 780M only (Windows, ROCm); on discrete NVIDIA and AMD cards its batches grow with the memory, untested.
+The first run computes the finger pair table for the skeleton (`performer/reach_table.py`) and caches it in `performer/rig_cache/`: about 20 seconds on 16 processes. `blender_main.py` runs the solve with the Python found on `PATH`; the environment variable `PIANOMOTION_PYTHON` can name another one (the Python that has numba).
 
 The preview audio (`planner/audio.py`) uses the General MIDI sound bank that comes with Windows (`gm.dls`).
 
