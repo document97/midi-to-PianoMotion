@@ -201,9 +201,9 @@ class Torso:
         chain = spine_transforms(shift, turn, heads, self.neck['head'], self.height, offset)
         spine_q, below = {}, np.eye(4)
         below[:3, 3] = offset
-        for b, t in zip(self.spine, chain):
-            spine_q[b['bone']] = mat3_q((b['pre_inverse'] @ np.linalg.inv(below) @ t @ b['world']).astype(FLOAT))
-            below = t
+        for b, moved in zip(self.spine, chain):
+            spine_q[b['bone']] = mat3_q((b['pre_inverse'] @ np.linalg.inv(below) @ moved @ b['world']).astype(FLOAT))
+            below = moved
         transform = chain[-1]
         # the neck takes back part of the side lean and turn (not the forward lean): the head steadier than the chest
         lean_only = spine_transforms(shift, turn, heads, self.neck['head'], self.height)[-1][:3, :3] \
