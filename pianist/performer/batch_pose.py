@@ -19,7 +19,7 @@ import numpy as np
 from .checks import BRUSH_COST, BRUSH_DEPTH, CELL, OWN_KEY_TOLERANCE, stretched
 from .kinematics import DIGITS, FLOAT, child_euler
 from .pose import (hand_shape, CLEARANCE_SCALE, CONTACT_TOLERANCE, WEB_SCALE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, RELAXED, ROLL_BOUNDS,
-                   SEED_ITERATIONS, SEEDS, STEP_TOLERANCE, VALUE_SCALE, WRIST_SCALE, WRIST_TRAVEL, YAW_BOUNDS, HandPose,
+                   SEED_ITERATIONS, SEEDS, SOLVE_ITERATIONS, STEP_TOLERANCE, VALUE_SCALE, WRIST_SCALE, WRIST_TRAVEL, YAW_BOUNDS, HandPose,
                    wrist_steps)
 
 # GPU memory a solve may use: this share of what is free when it starts (an iGPU shares it with the CPU),
@@ -90,7 +90,7 @@ class BatchPoseSolver:
         self.solvers = solvers
         self.hands = {h: _Hand(s, self.dev) for h, s in solvers.items()}
 
-    def solve(self, problems, seeds=SEEDS, clearance=True, iterations=40):
+    def solve(self, problems, seeds=SEEDS, clearance=True, iterations=SOLVE_ITERATIONS):
         """``problems``: (hand, contacts, wrist or None, x_hint or None) each; returns HandPoses in order."""
         out = [None] * len(problems)
         groups = {}
@@ -361,6 +361,11 @@ class _Hand:
         """One damped step of every row still looking for one; rows that took a step keep it (pure: new state)."""
         torch = self.torch
         pending = live & ~improved
+        # pose.bound_step: variables held at a bound their gradient pushes past are taken out of the step
+        held = ((x <= lower) & (g > 0)) | ((x >= upper) & (g < 0))
+        free = (~held).to(h.dtype)
+        h = h * free[:, :, None] * free[:, None, :] + torch.diag_embed(held.to(h.dtype))
+        g = g * free
         a = h + lam[:, None, None] * torch.diag_embed(torch.diagonal(h, dim1=1, dim2=2) + 1e-9)
         chol, info = torch.linalg.cholesky_ex(a)        # J^T J + damping is symmetric positive definite
         delta = torch.cholesky_solve(-g[..., None], chol)[..., 0]

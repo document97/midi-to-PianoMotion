@@ -61,6 +61,7 @@ FOLLOW_VALUE_SCALE = 40.   # metres the wrist may leave its hint / neutral y, z
 YAW_BOUNDS = (-25., 25.)   # wrist side bend; real hands ~-25 (thumb side) .. +35. +-15 stopped black-key octaves
 SEEDS = ((0., 0., 0.), (0., 0., -.03), (-12., -.02, 0.), (12., .02, 0.))   # (yaw deg, wrist dx, dy m) starts
 SEED_ITERATIONS = 12
+SOLVE_ITERATIONS = 300     # cap of the finishing passes; a converged solve stops long before (bound_step)
 WIDE_SEEDS = tuple((y, dx, dy) for y in (-12., 0., 12.) for dx in (-.03, 0., .03) for dy in (0., -.03))   # offline tables
 ROLL_BOUNDS = (-20., 20.)
 # Forward-difference steps: float32 resolves ~6e-8 m at the wrist's ~0.8 m, so a 10 um step (enough in float64)
@@ -245,13 +246,14 @@ class PoseSolver:
         return (palm @ self.local_pad(digit, values))[:3].T
 
     # ----- solve -----
-    def solve(self, contacts, values=None, wrist=None, yaw=0., roll=0., x_hint=None, iterations=40, seeds=SEEDS,
+    def solve(self, contacts, values=None, wrist=None, yaw=0., roll=0., x_hint=None, iterations=None, seeds=SEEDS,
               clearance=True):
         """Pose with every contact on its key; ``values`` seeds / fixes free fingers.
 
         Feasibility (``ok``) is the contacts alone. Key clearance of the contact fingers is minimised
         (``clearance=True``) and reported, not a gate: the key tops are piecewise flat and as a hard
         screen they make the search call reachable chords impossible."""
+        iterations = SOLVE_ITERATIONS if iterations is None else iterations
         values = {d: np.array(v, FLOAT) for d, v in (values or {d: RELAXED[d] for d in DIGITS}).items()}
         for d in DIGITS:
             values.setdefault(d, RELAXED[d].copy())
@@ -406,9 +408,12 @@ class PoseSolver:
                 trial[j] += steps[j]
                 jac[:, j] = (residuals(trial) - r) / steps[j]
             g, h = jac.T @ r, jac.T @ jac
+            # a variable at a bound the gradient pushes past stays there this step (bound_step): a full step clipped
+            # back at the joint limits wasted the iteration and left the solve crawling, wherever it had stopped
+            a, g = bound_step(h, g, x, lower, upper)
             improved = False
             for _ in range(10):
-                delta = np.linalg.solve(h + lam * np.diag(np.diag(h) + 1e-9), -g)
+                delta = np.linalg.solve(a + lam * np.diag(np.diag(a) + 1e-9), -g)
                 trial = np.clip(x + delta, lower, upper)
                 tr = np.asarray(residuals(trial), FLOAT)
                 if tr @ tr < cost:
@@ -427,6 +432,16 @@ class PoseSolver:
             point = self.contact_point(self.pad_world(digit, {d: RELAXED[d] for d in DIGITS}, palm))
             self._pad_cache[key] = point[0] - self.neutral[0]
         return self._pad_cache[key]
+
+
+def bound_step(h, g, x, lower, upper):
+    """Normal equations (J^T J, J^T r) with every variable held at a bound its gradient pushes past taken out
+    (its row and column replaced by the identity, its gradient by zero): the step moves only the others."""
+    held = ((x <= lower) & (g > 0)) | ((x >= upper) & (g < 0))
+    if not held.any():
+        return h, g
+    free = ~held
+    return h * np.outer(free, free) + np.diag(held.astype(h.dtype)), np.where(free, g, 0.).astype(g.dtype)
 
 
 def hand_solvers(rig):
