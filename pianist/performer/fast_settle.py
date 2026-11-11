@@ -1,7 +1,8 @@
 """coherence.settle's solve compiled (numba): the same residuals, bounds, start and bounded Levenberg-Marquardt, the
 whole solve of one problem in machine code instead of some hundred small numpy calls per residual evaluation.
 
-numba is required: without it the import stops with how to install it. PIANOMOTION_FAST_SETTLE=0 runs coherence.settle's
+numba is required: without it the first settle stops with how to install it (``require``; importing this module
+works anywhere, Blender's Python included). PIANOMOTION_FAST_SETTLE=0 runs coherence.settle's
 numpy solve instead (about ten times slower; for checking the compiled solve against it). The rig's tables are packed once per solver (``pack``); a problem is a tuple of small arrays (``problem``).
 The compiled code is kept on disk (numba cache) and only rebuilt when this file changes.
 """
@@ -15,14 +16,13 @@ from .kinematics import DIGITS, child_euler
 from .motion import FLOOR_SCALE, PAD_PITCH_MAX, PAD_PITCH_SCALE, KeyFloor, KeySurface, Spacing
 from .pose import CONTACT_TOLERANCE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, STEP_TOLERANCE, VALUE_SCALE, WEB_SCALE
 
-if os.environ.get('PIANOMOTION_FAST_SETTLE', '1') == '0':
-    njit = None
-else:
+OPTED_OUT = os.environ.get('PIANOMOTION_FAST_SETTLE', '1') == '0'
+njit = None
+if not OPTED_OUT:
     try:
         from numba import njit
     except ImportError:
-        raise ImportError('numba is required (pip install numba): the wrist path solve runs compiled. '
-                          'PIANOMOTION_FAST_SETTLE=0 runs it in numpy instead, about ten times slower.') from None
+        pass
 _jit = njit(cache=True, fastmath=False, nogil=True) if njit is not None else (lambda f: f)
 
 F = np.float64
@@ -32,6 +32,16 @@ FINGER_BONES = 3
 
 def available():
     return njit is not None
+
+
+def require():
+    """True for the compiled solve; False only when opted out (PIANOMOTION_FAST_SETTLE=0); without numba: stops."""
+    if njit is not None:
+        return True
+    if OPTED_OUT:
+        return False
+    raise ImportError('numba is required (pip install numba): the wrist path solve runs compiled. '
+                      'PIANOMOTION_FAST_SETTLE=0 runs it in numpy instead, about ten times slower.')
 
 
 # ---------------------------------------------------------------- packing (python, once per solver / problem)

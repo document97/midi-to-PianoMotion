@@ -152,7 +152,7 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
 
     steps = wrist_steps(len(digits))
     start = x.copy()
-    if surface is not None and fast_settle.available():
+    if surface is not None and fast_settle.require():
         # the same solve compiled (fast_settle), retry without the curved free fingers included
         ordered = sorted(contacts, key=lambda c: c.digit)
         edges, blacks = [], []
