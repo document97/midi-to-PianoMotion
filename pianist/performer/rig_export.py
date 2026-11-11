@@ -106,6 +106,46 @@ def scaled_hands(arm):
     root['performer_hand_scale'] = HAND_SCALE
 
 
+def spine_chain(arm, torso='上半身', neck='首'):
+    """The pose bones from the torso bone up to the neck's parent (lowest first), or [] if the neck is not above it."""
+    bones = arm.pose.bones
+    if torso not in bones or neck not in bones:
+        return []
+    chain, b = [], bones[neck].parent
+    while b is not None and b.name != torso:
+        chain.append(b)
+        b = b.parent
+    return [] if b is None else [b] + chain[::-1]
+
+
+def _bone_frames(arm, bone):
+    pre = arm.matrix_world @ bone.parent.matrix @ bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
+    return dict(bone=bone.name, head=vec(arm.matrix_world @ bone.head), pre=mat(pre), world=mat(arm.matrix_world @ bone.matrix))
+
+
+def spine_data(arm, torso, neck='首'):
+    """The spine (torso bone up to the neck's parent) and the neck: names, heads, parent frames and posed matrices."""
+    chain = spine_chain(arm, torso.name, neck)
+    if not chain:
+        return {}
+    return dict(spine=[_bone_frames(arm, b) for b in chain], neck=_bone_frames(arm, arm.pose.bones[neck]))
+
+
+def slide_bone(arm, torso, foot_target='右足ＩＫ'):
+    """The bone that slides the seated body along the bench: the highest ancestor of the torso bone that is not an
+    ancestor of the foot IK target (so the feet stay planted), e.g. MMD センター."""
+    keep = set()
+    b = arm.pose.bones.get(foot_target)
+    while b is not None:
+        keep.add(b.name)
+        b = b.parent
+    chain, b = [], torso.parent
+    while b is not None and b.name not in keep:
+        chain.append(b.name)
+        b = b.parent
+    return chain[-1] if chain else None
+
+
 def collarbones(arm, drivers, cal):
     """Per hand the collarbone: the first unconstrained bone above the upper arm (MMD cancel bones such as 肩C carry
     constraints), with its parent frame, posed world matrix and head (world), and the level direction from the
@@ -340,8 +380,9 @@ def lap(arm, skin):
     for h, side in SIDE.items():
         bone = arm.pose.bones[side + '足']
         hip, knee = world @ bone.head, world @ bone.tail
+        other = world @ arm.pose.bones[SIDE['L' if h == 'R' else 'R'] + '足'].head
         point = hip + (knee - hip) * LAP_ALONG
-        point.x += LAP_OUT * (1 if point.x > 0 else -1)
+        point.x += LAP_OUT * (1 if hip.x > other.x else -1)      # outward: away from the other hip, wherever the seat is
         origin, down = inverse @ Vector((point.x, point.y, point.z + 1.)), inverse @ Vector((point.x, point.y, point.z))
         direction = (down - origin).normalized()
         while True:
@@ -370,7 +411,10 @@ def main():
     torso = None
     if body.bone is not None:
         torso = dict(bone=body.bone.name, pivot=vec(body.pivot), pre=mat(body.pre), world=mat(body.world),
-                     reference={h: mat(m) for h, m in body.reference.items()}, shoulders=collarbones(arm, drivers, cal))
+                     reference={h: mat(m) for h, m in body.reference.items()}, shoulders=collarbones(arm, drivers, cal),
+                     hips=[vec(arm.matrix_world @ arm.pose.bones[s + '足'].head) for s in ('左', '右')],
+                     **spine_data(arm, body.bone),
+                     slide_bone=slide_bone(arm, body.bone))
     neutral_bones = {b.name: mat(b.matrix) for b in arm.pose.bones}
     rig = dict(schema='performer-rig', neutral_bones=neutral_bones, scene=bpy.data.filepath,
                scene_sha256=hashlib.sha256(Path(bpy.data.filepath).read_bytes()).hexdigest(),

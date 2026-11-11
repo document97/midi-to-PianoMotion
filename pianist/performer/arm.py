@@ -61,6 +61,19 @@ def closest_elbow(shoulder, wrist, l1, l2, side, reference=None):
     return cost(angle)[1]
 
 
+# The standard seat's shoulder relative to a hand's neutral wrist over the keys, in arm lengths (upper arm + forearm):
+# x toward the hand's own side, y toward the player, z up (a seated pianist's, measured on the development scene).
+# Whatever depends on the forearm's direction in the hand's plan takes it from here, not from the scene's seat.
+STANDARD_SHOULDER = np.array([-.006, -.766, .427])
+
+
+def standard_shoulder(arm, neutral_wrist):
+    """World position of the standard seat's shoulder for the hand whose neutral wrist is ``neutral_wrist``."""
+    offset = STANDARD_SHOULDER * (arm.l1 + arm.l2)
+    offset[0] *= arm.side                  # toward the hand's own side: left hand -x, right hand +x
+    return (np.asarray(neutral_wrist, FLOAT) + offset).astype(FLOAT)
+
+
 class Arm:
     def __init__(self, data, arm_world):
         self.data = data
@@ -108,4 +121,4 @@ class Arm:
                  self.names['elbow']: mat3_q(np.linalg.inv(upper @ self.upper_elbow_link) @ forearm),
                  self.names['wrist']: mat3_q(np.linalg.inv(wrist_pre) @ palm),
                  self.names['twist']: twist_q}
-        return dict(world=palm, armature=self.arm_inverse @ palm, local=local, elbow=elbow, shoulder=shoulder)
+        return dict(world=palm, armature=self.arm_inverse @ palm, local=local, elbow=elbow, shoulder=shoulder, forearm=forearm)

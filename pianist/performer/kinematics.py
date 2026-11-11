@@ -228,6 +228,47 @@ class Finger:
 
 
 class Rig:
+    def _standard_forearms(self):
+        """The forearm twist bone's neutral pose as the standard seat's arm would hold it (arm.standard_shoulder): the
+        thumb's base skin follows that bone, so the hand's shape at a given wrist does not change with the seat. The
+        exported forearm (elbow to wrist, its hinge across the arm's plane) is turned about the wrist onto the
+        standard arm's."""
+        from .arm import closest_elbow, standard_shoulder
+
+        def frame(shoulder, elbow, wrist, like):
+            forearm = (wrist - elbow) / np.linalg.norm(wrist - elbow)
+            hinge = np.cross(elbow - shoulder, wrist - elbow)
+            hinge /= np.linalg.norm(hinge)
+            if hinge @ like < 0:          # the plane's normal on the side of the elbow bone's own hinge axis (a nearly
+                hinge = -hinge            # straight-down upper arm leaves its sign to chance)
+            return np.stack([forearm, hinge, np.cross(forearm, hinge)], axis=1)
+
+        for h, arm in self.arms.items():
+            twist, elbow_bone = arm.names['twist'], arm.names['elbow']
+            if twist not in self.neutral_bones or elbow_bone not in self.neutral_bones:
+                continue
+            wrist = self.neutral_wrist[h].astype(np.float64)
+            shoulder = arm.pre_upper_world[:3, 3].astype(np.float64)
+            elbow = (self.arm_world @ self.neutral_bones[elbow_bone])[:3, 3].astype(np.float64)
+            standard = standard_shoulder(arm, wrist).astype(np.float64)
+            turn = np.eye(4)
+            bone = (self.arm_world @ self.neutral_bones[elbow_bone])[:3, :3].astype(np.float64)
+            bone /= np.linalg.norm(bone, axis=0)
+            normal = np.cross(elbow - shoulder, wrist - elbow)
+            axis = bone[:, np.argmax(np.abs(bone.T @ normal))]       # the bone axis along the arm plane's normal
+            exported = frame(shoulder, elbow, wrist, axis)
+            turn[:3, :3] = frame(standard, closest_elbow(standard, wrist, arm.l1, arm.l2, arm.side), wrist, axis) @ exported.T
+            turn[:3, 3] = wrist - turn[:3, :3] @ wrist
+            moved = np.linalg.inv(self.arm_world) @ turn @ self.arm_world @ self.neutral_bones[twist]
+            # The exporting arm driver may hold the forearm rolled half a turn about its length (its elbow solution's
+            # sign, decided by the seat): the twist bone is taken in the roll closer to the wrist bone's.
+            flipped = moved @ np.diag([-1., 1., -1., 1.])
+            wrist_rot = self.neutral_bones[self.wrist_bone[h]][:3, :3]
+            def angle(m):
+                r = (m[:3, :3] / np.linalg.norm(m[:3, :3], axis=0)).T @ (wrist_rot / np.linalg.norm(wrist_rot, axis=0))
+                return np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1))
+            self.neutral_bones[twist] = (moved if angle(moved) <= angle(flipped) else flipped).astype(FLOAT)
+
     def __init__(self, path):
         data = json.loads(Path(path).read_text(encoding='utf-8'))
         self.data = data
@@ -244,6 +285,7 @@ class Rig:
         self.wrist_bone = {h: data['hands'][h]['bones']['wrist'] for h in 'LR'}
         self.neutral_wrist_inverse = {h: np.linalg.inv(np.array(data['hands'][h]['neutral_wrist_matrix'], dtype=FLOAT)) for h in 'LR'}
         self.bone_owner = {h: {name: d for d, f in self.fingers[h].items() for name in f.names} for h in 'LR'}
+        self._standard_forearms()
         self._web = {}
         for h in 'LR':
             for d, swing in SWING_LATERAL.items():

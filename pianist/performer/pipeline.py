@@ -425,7 +425,9 @@ def _frames(times):
     pitches = sorted(by_pitch)
     n = len(times)
     out = dict(times=np.asarray(times), torso=np.zeros((n, 4)), key_depth=np.zeros((n, len(pitches))))
-    out.update({f'{h}_collar_q': np.zeros((n, 4)) for h in 'LR'})
+    out.update({f'{h}_collar_q': np.zeros((n, 4)) for h in 'LR'}, slide=np.zeros((n, 3)))
+    spine_names = [] if _ctx['torso'] is None else [b['bone'] for b in _ctx['torso'].spine] + [_ctx['torso'].neck['bone']]
+    out['spine'] = np.zeros((n, len(spine_names), 4))
     for h in 'LR':
         out[f'{h}_wrist'] = np.zeros((n, 5))
         out[f'{h}_values'] = np.zeros((n, 5, 4))
@@ -458,10 +460,12 @@ def _frames(times):
             out['key_depth'][i, j] = d
             if d > 0:
                 depths[p] = d
-        torso_q, pre, collar = (None, None, {}) if _ctx['torso'] is None else _ctx['torso'].pose(t)
+        spine_q, pre, collar, slide = (None, None, {}, None) if _ctx['torso'] is None else _ctx['torso'].pose(t)
         segments = {}
-        if torso_q is not None:
-            out['torso'][i] = torso_q
+        if spine_q is not None:
+            out['spine'][i] = [spine_q[name] for name in spine_names]
+            out['torso'][i] = out['spine'][i, 0]
+            out['slide'][i] = slide
         for h, q in collar.items():
             out[f'{h}_collar_q'][i] = q
         for h in 'LR':

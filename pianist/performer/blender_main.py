@@ -82,9 +82,22 @@ def write_animation(arm, rig, motion):
                 bone.rotation_mode = 'XYZ'
                 write_curve(bone, 'rotation_euler', frames, motion[f'{h}_child_euler'][:, int(d) - 1, j])
     if rig.get('torso') and np.any(motion['torso']):
-        bone = arm.pose.bones[rig['torso']['bone']]
-        bone.rotation_mode = 'QUATERNION'
-        write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion['torso']))
+        names = [b['bone'] for b in rig['torso'].get('spine', [])] + ([rig['torso']['neck']['bone']] if 'neck' in rig['torso'] else [])
+        if 'spine' in motion and names:
+            for k, name in enumerate(names):        # the spine and the neck: lean and turn shared up the back
+                bone = arm.pose.bones[name]
+                bone.rotation_mode = 'QUATERNION'
+                write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion['spine'][:, k]))
+        else:
+            bone = arm.pose.bones[rig['torso']['bone']]
+            bone.rotation_mode = 'QUATERNION'
+            write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion['torso']))
+        slide_bone = rig['torso'].get('slide_bone')
+        if slide_bone and 'slide' in motion and np.any(motion['slide']):
+            bone = arm.pose.bones[slide_bone]       # the seat's slide (world offset) as the bone's location
+            pre = arm.matrix_world @ bone.parent.matrix @ bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
+            to_local = np.array(pre.to_3x3().inverted())
+            write_curve(bone, 'location', frames, np.array(bone.location)[None] + motion['slide'] @ to_local.T)
         for h, s in rig['torso'].get('shoulders', {}).items():
             if f'{h}_collar_q' in motion and np.any(motion[f'{h}_collar_q']):
                 bone = arm.pose.bones[s['bone']]
