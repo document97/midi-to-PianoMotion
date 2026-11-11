@@ -28,8 +28,9 @@ from planner.search import Weights
 from planner.validate import validate
 
 from .anchors import KEY_TRAVEL, REACH_TOLERANCE, Anchor, build_anchors, note_motions, solve_anchors, summary
+from .batch_pose import device
 from .checks import BRUSH_DEPTH, Heightfield, stretched
-from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, least_sunk, neighbour_targets,
+from .coherence import (SETTLE_ITERATIONS, COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, least_sunk, neighbour_targets,
                         settle, sunk, vector_of, wide_settle)
 from .kinematics import DIGITS, SWING_LATERAL, Rig
 from .torso import Torso
@@ -327,8 +328,13 @@ def pair_awkwardness(table, workers):
     from .codekey import code_key
     classes = [v for m in (kinematics, arm, pose, checks, regions) for v in vars(m).values()
                if inspect.isclass(v) and v.__module__ == m.__name__]       # the solvers, rig and keys it runs on
-    code = code_key(_pair_awkward, awkwardness, performer_solvers, *classes,
-                    extra=hashlib.sha256(np.ascontiguousarray(table).tobytes()).digest())
+    from . import batch_pose, batch_settle
+    gpu = device() is not None
+    if gpu:
+        classes += [v for m in (batch_pose, batch_settle) for v in vars(m).values()
+                    if inspect.isclass(v) and v.__module__ == m.__name__]
+    code = code_key(_pair_awkward, awkwardness, performer_solvers, *classes, *([_pair_awkward_gpu] if gpu else []),
+                    extra=hashlib.sha256(np.ascontiguousarray(table).tobytes()).digest() + (b'gpu' if gpu else b''))
     path = cache_path(RIG).with_name(f'pair_awkward_{cache_path(RIG).stem[6:]}_{code[:8]}.npz')
     if path.exists():
         return np.load(path)['units']
@@ -342,13 +348,43 @@ def pair_awkwardness(table, workers):
                         if f1 != f2 and table[h, f1 - 1, f2 - 1, pc, interval + MAX_INTERVAL]:
                             p1 = REFERENCE_OCTAVE[hand] + pc
                             jobs.append((hand, f1, p1, f2, p1 + interval))
+    def store(case, u):
+        hand, f1, p1, f2, p2 = case
+        h = 'LR'.index(hand)
+        units[h, f1 - 1, f2 - 1, p1 % 12, p2 - p1 + MAX_INTERVAL] = u
+        units[h, f2 - 1, f1 - 1, p2 % 12, p1 - p2 + MAX_INTERVAL] = u
+    rest = jobs
+    if device() is not None:
+        rest = _pair_awkward_gpu(jobs, store)          # the pairs its seeds miss go to the workers as before
     with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(rig_path=str(RIG), notes={}, checks=True),)) as pool:
-        for (hand, f1, p1, f2, p2), u in progress_map(pool, _pair_awkward, jobs, 'pair awkwardness', 8):
-            h = 'LR'.index(hand)
-            units[h, f1 - 1, f2 - 1, p1 % 12, p2 - p1 + MAX_INTERVAL] = u
-            units[h, f2 - 1, f1 - 1, p2 % 12, p1 - p2 + MAX_INTERVAL] = u
+        for case, u in progress_map(pool, _pair_awkward, rest, 'pair awkwardness', 8):
+            store(case, u)
     np.savez_compressed(path, units=units)
     return units
+
+
+def _pair_awkward_gpu(jobs, store):
+    """``_pair_awkward`` of every pair at once on the GPU (batch_pose, batch_settle): the pose from the hand's wide
+    seeds, settled; returns the pairs whose seeds all fell short (``_pair_awkward`` starts those from the table's pose)."""
+    from .batch_pose import BatchPoseSolver
+    from .batch_settle import BatchSettler
+    from .pose import WIDE_SEEDS, Contact
+    t0 = time.perf_counter()
+    solvers = performer_solvers(Rig(RIG))
+    settler = BatchSettler(solvers)
+    contacts = [[Contact(f1, p1, KEY_TRAVEL), Contact(f2, p2, KEY_TRAVEL)] for _, f1, p1, f2, p2 in jobs]
+    poses = BatchPoseSolver.solve(settler, [(job[0], c, None, None) for job, c in zip(jobs, contacts)],
+                                  seeds=WIDE_SEEDS, clearance=False)
+    print(f'pair awkwardness: {len(jobs)} poses (gpu) {time.perf_counter() - t0:.0f}s', flush=True)
+    ok = [i for i, p in enumerate(poses) if p.ok]
+    settled = settler.settle([(jobs[i][0], contacts[i], vector_of(poses[i]),
+                               {d: poses[i].values.get(d, RELAXED[d]) for d in DIGITS}, vector_of(poses[i]),
+                               ORIENTATION_PULLS[0], SETTLE_ITERATIONS, None) for i in ok])
+    for i, pose in zip(ok, settled):
+        store(jobs[i], awkwardness(solvers[jobs[i][0]], contacts[i], pose))
+    print(f'pair awkwardness: {len(ok)} settled (gpu) {time.perf_counter() - t0:.0f}s', flush=True)
+    done = set(ok)
+    return [job for i, job in enumerate(jobs) if i not in done]
 
 
 def shape_key(anchor, notes):

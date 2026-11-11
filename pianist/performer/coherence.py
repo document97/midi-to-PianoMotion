@@ -40,7 +40,10 @@ PALM_SCALE = .004               # stays off the keys and the fingers reach down 
 CENTRE_SCALE = .001             # pad pulled toward its key's centre line (m per unit): the finger's sides stay off the neighbours
 
 
-def settle(solver, contacts, vector, values, target, pull, iterations=25, front=None):
+SETTLE_ITERATIONS = 25
+
+
+def settle(solver, contacts, vector, values, target, pull, iterations=SETTLE_ITERATIONS, front=None):
     """Pose keeping ``contacts`` with the wrist pulled toward ``target`` (x, y, z, yaw, roll); ``front``: white-key
     pads preferably within this of their key's front edge (m) instead of ``WHITE_FRONT_CLEAR`` before the black keys.
 
