@@ -410,14 +410,16 @@ def hand_bones(arm, drivers):
 
 def seat_free_hands(cal):
     """The hands' geometry exported at DEFAULT_SEATING (fingers, neutral wrist, the bones they read): the scene's own
-    seat changes only the arms and body. In float32 the same hand exported at another seat differs by ~0.1 um, and
+    seat changes only the arms and body. The armature's world matrix comes along: the solves pass the wrist through
+    the armature frame and back, and that round trip too must not depend on the seat. In float32 the same hand exported at another seat differs by ~0.1 um, and
     that is enough to send a pose solve down another valley: the hand's plan would change with the seat."""
     arm, skin, drivers, _, _ = neutral_scene(cal, DEFAULT_SEATING)
     coords, normals = mesh_world(skin)
     hands = {h: export_hand(arm, skin, drivers[h], cal['hands'][h], coords, normals) for h in 'LR'}
     bones = {b.name: mat(b.matrix) for b in arm.pose.bones if b.name in hand_bones(arm, drivers)}
+    world = mat(arm.matrix_world)
     bpy.ops.wm.open_mainfile(filepath=bpy.data.filepath)        # back to the scene as saved, for the actual seat
-    return hands, bones
+    return hands, bones, world
 
 
 def main():
@@ -442,16 +444,18 @@ def main():
                      slide_bone=slide_bone(arm, body.bone))
     neutral_bones = {b.name: mat(b.matrix) for b in arm.pose.bones}
     if seat_free is not None:
-        free_hands, free_bones = seat_free
+        free_hands, free_bones, free_world = seat_free
         neutral_bones.update(free_bones)
         for h in 'LR':
-            for key in ('fingers', 'neutral_wrist', 'neutral_wrist_matrix'):
+            # the arm's lengths too: the plan's natural orientation (posture) reads them, and float32 noise of 1e-8 m
+            # from another seat is enough to change its solves
+            for key in ('fingers', 'neutral_wrist', 'neutral_wrist_matrix', 'l1', 'l2'):
                 hands[h][key] = free_hands[h][key]
     rig = dict(schema='performer-rig', neutral_bones=neutral_bones, scene=bpy.data.filepath,
                scene_sha256=hashlib.sha256(Path(bpy.data.filepath).read_bytes()).hexdigest(),
                calibration_sha256=hashlib.sha256(cal_path.read_bytes()).hexdigest(),
                fps=bpy.context.scene.render.fps / bpy.context.scene.render.fps_base,
-               arm_world=mat(arm.matrix_world), hands=hands, torso=torso, keyboard=keyboard,
+               arm_world=mat(arm.matrix_world) if seat_free is None else free_world, hands=hands, torso=torso, keyboard=keyboard,
                key_meshes=key_meshes(),
                key_depth_gain={p: k['local_z_world_gain'] for p, k in keyboard.items()})
     rig['validation'] = validation_poses(arm, skin, drivers, cal, hands, args.samples, 7)
