@@ -367,7 +367,26 @@ def region(table, sc, pitch, depth, pt, out):
     out[2] = pt[2] - (top - depth)
 
 @_jit
-def pose_mats(H, Q, x, vals, mats, work):
+def new_cache():
+    """Kept finger matrices of one solve: (the values mats holds per finger (nan: none), the free fingers' lifted and
+    curved matrices, which of those are made)."""
+    return np.full((5, 4), np.nan), np.empty((5, 2, 3, 4, 4)), np.zeros((5, 2), np.bool_)
+
+
+@_jit
+def finger_kept(fp, d, v, mats, work, C):
+    """finger() into mats unless mats already holds digit d at these values (a difference step moves one variable)."""
+    held = C[0]
+    for j in range(4):
+        if held[d, j] != v[j]:
+            finger(fp, d, v, mats[3 * d:3 * d + 3], work)
+            for i in range(4):
+                held[d, i] = v[i]
+            return
+
+
+@_jit
+def pose_mats(H, Q, x, vals, mats, work, C):
     fp, const = H[0], H[3]
     digits = Q[0]
     vals[:, :] = Q[6]
@@ -375,19 +394,20 @@ def pose_mats(H, Q, x, vals, mats, work):
         for j in range(4):
             vals[digits[i] - 1, j] = x[5 + 4 * i + j]
     for d in range(5):
-        finger(fp, d, vals[d], mats[3 * d:3 * d + 3], work)
+        finger_kept(fp, d, vals[d], mats, work, C)
     nb = 3 * 5
     for c in range(const.shape[0]):
         mats[nb + c] = const[c]
 
 @_jit
-def residuals(H, Q, x, curved, vals, mats, alt, work, loc, world, out):
+def residuals(H, Q, x, curved, vals, mats, alt, work, loc, world, out, C):
     """coherence.settle's residuals at x into out; returns their count."""
-    fp, pad, clear, const, pm, table, ks, spacing, web, sc, per_digit, neutral_or, value_scale = H
+    fp, pad, clear, const, pm, table, ks, spacing, web, sc, per_digit, neutral_or, value_scale = (
+        H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8], H[9], H[10], H[11], H[12])
     (digits, pitches, depths, _x, _lo, _up, _values, dtable, edges, blacks, centres, target, pull, natural, shape,
      curved_free, lifted, stretch, _steps, _it, _curved) = Q
     k = len(digits)
-    pose_mats(H, Q, x, vals, mats, work)
+    pose_mats(H, Q, x, vals, mats, work, C)
     palm = np.empty((3, 4))
     palm_matrix(pm, x, palm)
     pt = np.empty(3)
@@ -443,13 +463,12 @@ def residuals(H, Q, x, curved, vals, mats, alt, work, loc, world, out):
                 free = False
         if not free:
             continue
+        own = mats[3 * d:3 * d + 3].copy()
         for variant in range(2 if curved else 1):
-            alt[:, :] = vals
-            if variant == 0:
-                alt[d] = lifted[0 if d == 0 else 1]
-            else:
-                alt[d] = curved_free[d]
-            finger(fp, d, alt[d], mats[3 * d:3 * d + 3], work)
+            if not C[2][d, variant]:
+                finger(fp, d, lifted[0 if d == 0 else 1] if variant == 0 else curved_free[d], C[1][d, variant], work)
+                C[2][d, variant] = True
+            mats[3 * d:3 * d + 3] = C[1][d, variant]
             n = skin_local(clear, d, mats, loc)
             to_world(palm, loc, n, world)
             scale = sc[8] if variant == 0 else sc[9]
@@ -457,7 +476,7 @@ def residuals(H, Q, x, curved, vals, mats, alt, work, loc, world, out):
                 z, soft = surface(ks, sc, dtable, world[p], -2)
                 out[m] = max(0., z - world[p, 2]) / scale
                 m += 1
-        finger(fp, d, vals[d], mats[3 * d:3 * d + 3], work)
+        mats[3 * d:3 * d + 3] = own
     # chord fingers 2..5 keep their order (wrist-frame lateral positions of their halves)
     lateral, proximal, gaps = spacing
     prev = -1
@@ -518,10 +537,10 @@ def residuals(H, Q, x, curved, vals, mats, alt, work, loc, world, out):
     return m
 
 @_jit
-def contact_error(H, Q, x, vals, mats, work, loc, world):
+def contact_error(H, Q, x, vals, mats, work, loc, world, C):
     pad, table, sc = H[1], H[5], H[9]
     digits, pitches, depths = Q[0], Q[1], Q[2]
-    pose_mats(H, Q, x, vals, mats, work)
+    pose_mats(H, Q, x, vals, mats, work, C)
     palm = np.empty((3, 4))
     palm_matrix(H[4], x, palm)
     pt, rr = np.empty(3), np.empty(3)
@@ -610,9 +629,10 @@ def lm(H, Q, curved, cap):
     loc = np.empty((cap, 4))
     world = np.empty((cap, 3))
     buf = np.empty(16384)
+    C = new_cache()
     x = x0.astype(np.float32)
     lo, up, st = lower.astype(np.float32), upper.astype(np.float32), steps.astype(np.float32)
-    m = residuals(H, Q, x.astype(np.float64), curved, vals, mats, alt, work, loc, world, buf)
+    m = residuals(H, Q, x.astype(np.float64), curved, vals, mats, alt, work, loc, world, buf, C)
     r = buf[:m].astype(np.float32)
     cost = np.float32(np.dot(r, r))
     lam = 1e-2
@@ -621,7 +641,7 @@ def lm(H, Q, curved, cap):
         for j in range(n):
             trial = x.copy()
             trial[j] += st[j]
-            residuals(H, Q, trial.astype(np.float64), curved, vals, mats, alt, work, loc, world, buf)
+            residuals(H, Q, trial.astype(np.float64), curved, vals, mats, alt, work, loc, world, buf, C)
             for i in range(m):
                 jac[i, j] = (np.float32(buf[i]) - r[i]) / st[j]
         g, h = normal_bound(jac, r, x, lo, up)
@@ -630,7 +650,7 @@ def lm(H, Q, curved, cap):
         for _ in range(10):
             delta = damped(h, g, lam)
             trial = np.minimum(np.maximum(x + delta, lo), up)
-            residuals(H, Q, trial.astype(np.float64), curved, vals, mats, alt, work, loc, world, buf)
+            residuals(H, Q, trial.astype(np.float64), curved, vals, mats, alt, work, loc, world, buf, C)
             tr = buf[:m].astype(np.float32)
             tc = np.float32(np.dot(tr, tr))
             if tc < cost:
@@ -652,7 +672,7 @@ def solve_one(H, Q):
         work = np.empty((5, 4, 4))
         loc = np.empty((cap, 4))
         world = np.empty((cap, 3))
-        if contact_error(H, Q, x.astype(np.float64), vals, mats, work, loc, world) > H[9][0] * 2.5:
+        if contact_error(H, Q, x.astype(np.float64), vals, mats, work, loc, world, new_cache()) > H[9][0] * 2.5:
             x, more = lm(H, Q, False, cap)
             used += more
     return x, used
@@ -686,7 +706,7 @@ def penetration(H, dtable, pt, own, brush):
 
 
 @_jit
-def pose_residuals(H, Q, x, prior, clear, vals, mats, work, loc, world, out):
+def pose_residuals(H, Q, x, prior, clear, vals, mats, work, loc, world, out, C):
     """PoseSolver.solve's residuals at x into out; returns their count."""
     pad, clearskin, pm, table, web, sc, value_scale = H[1], H[2], H[4], H[5], H[8], H[9], H[12]
     wrist_scale, clear_scale = H[13][2], H[13][3][0]
@@ -697,7 +717,7 @@ def pose_residuals(H, Q, x, prior, clear, vals, mats, work, loc, world, out):
         for j in range(4):
             vals[digits[i] - 1, j] = x[5 + 4 * i + j]
     for d in range(5):
-        finger(H[0], d, vals[d], mats[3 * d:3 * d + 3], work)
+        finger_kept(H[0], d, vals[d], mats, work, C)
     const = H[3]
     for c in range(const.shape[0]):
         mats[15 + c] = const[c]
@@ -748,9 +768,10 @@ def lm_pose(H, Q, x0, prior, clear, iterations, cap):
     loc = np.empty((cap, 4))
     world = np.empty((cap, 3))
     buf = np.empty(16384)
+    C = new_cache()
     x = x0.astype(np.float32)
     lo, up, st = lower.astype(np.float32), upper.astype(np.float32), steps.astype(np.float32)
-    m = pose_residuals(H, Q, x.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf)
+    m = pose_residuals(H, Q, x.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf, C)
     r = buf[:m].astype(np.float32)
     cost = np.float32(np.dot(r, r))
     lam = 1e-2
@@ -759,7 +780,7 @@ def lm_pose(H, Q, x0, prior, clear, iterations, cap):
         for j in range(n):
             trial = x.copy()
             trial[j] += st[j]
-            pose_residuals(H, Q, trial.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf)
+            pose_residuals(H, Q, trial.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf, C)
             for i in range(m):
                 jac[i, j] = (np.float32(buf[i]) - r[i]) / st[j]
         g, h = normal_bound(jac, r, x, lo, up)
@@ -768,7 +789,7 @@ def lm_pose(H, Q, x0, prior, clear, iterations, cap):
         for _ in range(10):
             delta = damped(h, g, lam)
             trial = np.minimum(np.maximum(x + delta, lo), up)
-            pose_residuals(H, Q, trial.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf)
+            pose_residuals(H, Q, trial.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf, C)
             tr = buf[:m].astype(np.float32)
             tc = np.float32(np.dot(tr, tr))
             if tc < cost:
@@ -786,7 +807,7 @@ def pose_cost(H, Q, x, prior, clear, cap):
     mats = np.empty((15 + H[3].shape[0], 4, 4))
     buf = np.empty(16384)
     m = pose_residuals(H, Q, x.astype(np.float64), prior, clear, vals, mats, np.empty((5, 4, 4)), np.empty((cap, 4)),
-                       np.empty((cap, 3)), buf)
+                       np.empty((cap, 3)), buf, new_cache())
     r = buf[:m].astype(np.float32)
     return np.float32(np.dot(r, r))
 
