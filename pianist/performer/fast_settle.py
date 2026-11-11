@@ -159,6 +159,22 @@ def solve_pose(hand_pack, prob):
     return pose_one(hand_pack, prob)
 
 
+def ride(hand_pack, digit, palm, target, seed, depths, own_pitch, x0, start, brush, front, lower, upper, iterations,
+         scales):
+    """motion.FingerIK.ride's solve (x, iterations): the other fingers relaxed (``RELAXED``), ``scales``:
+    (IK_VALUE_SCALE, RIDE_SLIP, RIDE_STEADY)."""
+    from .pose import RELAXED
+    table = np.zeros(128, F)
+    for p, d in depths.items():
+        table[p] = d
+    has_start = start is not None
+    R = (int(digit) - 1, np.asarray(palm, F)[:3].copy(), np.asarray(target, F), np.asarray(seed, F), table, int(own_pitch),
+         np.asarray(start if has_start else seed, F), has_start, bool(brush), float(front), np.asarray(lower, F),
+         np.asarray(upper, F), int(iterations), np.asarray(scales, F), np.array([RELAXED[d] for d in DIGITS], F),
+         np.asarray(x0, F))
+    return ride_lm(hand_pack, R)
+
+
 def solve(hand_pack, prob):
     """(x, iterations used) of coherence.settle's solve, with its retry without the curved free fingers."""
     return solve_one(hand_pack, prob)
@@ -842,3 +858,105 @@ def pose_one(H, Q):
     it += used
     x, used = lm_pose(H, Q, x, 1., clearance, iterations // 2, cap)
     return x, it + used
+
+
+# ---------------------------------------------------------------- FingerIK.ride
+@_jit
+def ride_residuals(H, R, v, vals, mats, work, loc, world, out, C):
+    pad, clearskin, sc = H[1], H[2], H[9]
+    d, palm, target, seed, dtable, own, start, has_start, brush, front, scales = (
+        R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7], R[8], R[9], R[13])
+    vals[:, :] = R[14]
+    for j in range(4):
+        vals[d, j] = v[j]
+    for f in range(5):
+        finger_kept(H[0], f, vals[f], mats, work, C)
+    const = H[3]
+    for c in range(const.shape[0]):
+        mats[15 + c] = const[c]
+    pt = np.empty(3)
+    n = skin_local(pad, d, mats, loc)
+    to_world(palm, loc, n, world)
+    contact_point(world, n, sc, pt)
+    off0, off1, off2 = pt[0] - target[0], pt[1] - target[1], pt[2] - target[2]
+    m = 0
+    out[0] = off0 / .0002
+    out[1] = off1 / (scales[1] if off1 < 0. else .0002)
+    out[2] = off2 / .0002
+    out[3] = max(0., front - pt[1]) / .0002
+    m = 4
+    for j in range(4):
+        out[m] = (v[j] - seed[j]) / scales[0]
+        m += 1
+    n = skin_local(clearskin, d, mats, loc)
+    to_world(palm, loc, n, world)
+    for p in range(n):
+        z, soft = surface(H[6], sc, dtable, world[p], own)
+        pen = max(0., z - world[p, 2])
+        if brush:
+            brushed = max(pen - sc[20], 0.) + sc[21] * min(max(pen, 0.), sc[20])
+            pen = soft * brushed + (1 - soft) * pen
+        out[m] = pen / sc[7]
+        m += 1
+    if d == 0:
+        out[m] = 0.
+    else:
+        last = mats[3 * d + 2]
+        ax0 = palm[0, 0] * last[0, 1] + palm[0, 1] * last[1, 1] + palm[0, 2] * last[2, 1]
+        ax1 = palm[1, 0] * last[0, 1] + palm[1, 1] * last[1, 1] + palm[1, 2] * last[2, 1]
+        ax2 = palm[2, 0] * last[0, 1] + palm[2, 1] * last[1, 1] + palm[2, 2] * last[2, 1]
+        f0, f1 = palm[0, 1], palm[1, 1]
+        fn = math.sqrt(f0 * f0 + f1 * f1)
+        pitch = math.degrees(math.atan2(-ax2, (ax0 * f0 + ax1 * f1) / fn))
+        out[m] = max(0., pitch - sc[4]) / sc[5]
+    m += 1
+    if has_start:
+        for j in range(4):
+            out[m] = (v[j] - start[j]) / scales[2]
+            m += 1
+    return m
+
+
+@_jit
+def ride_lm(H, R):
+    """PoseSolver._levenberg_marquardt on FingerIK.ride's residuals from ``start`` (or the seed)."""
+    x0, lower, upper, iterations, sc = R[15], R[10], R[11], R[12], H[9]
+    cap = max(H[1][3][:, 0].max(), H[2][3][:, 0].max())
+    vals = np.empty((5, 4))
+    mats = np.empty((15 + H[3].shape[0], 4, 4))
+    work = np.empty((5, 4, 4))
+    loc = np.empty((cap, 4))
+    world = np.empty((cap, 3))
+    buf = np.empty(4096)
+    C = new_cache()
+    lo, up = lower.astype(np.float32), upper.astype(np.float32)
+    x = np.minimum(np.maximum(x0.astype(np.float32), lo), up)
+    st = np.full(4, 1e-2, np.float32)
+    m = ride_residuals(H, R, x.astype(np.float64), vals, mats, work, loc, world, buf, C)
+    r = buf[:m].astype(np.float32)
+    cost = np.float32(np.dot(r, r))
+    lam = 1e-2
+    jac = np.empty((m, 4), np.float32)
+    for it in range(1, iterations + 1):
+        for j in range(4):
+            trial = x.copy()
+            trial[j] += st[j]
+            ride_residuals(H, R, trial.astype(np.float64), vals, mats, work, loc, world, buf, C)
+            for i in range(m):
+                jac[i, j] = (np.float32(buf[i]) - r[i]) / st[j]
+        g, h = normal_bound(jac, r, x, lo, up)
+        improved = False
+        delta = np.zeros(4, np.float32)
+        for _ in range(10):
+            delta = damped(h, g, lam)
+            trial = np.minimum(np.maximum(x + delta, lo), up)
+            ride_residuals(H, R, trial.astype(np.float64), vals, mats, work, loc, world, buf, C)
+            tr = buf[:m].astype(np.float32)
+            tc = np.float32(np.dot(tr, tr))
+            if tc < cost:
+                x, r, cost, lam, improved = trial, tr, tc, max(lam / 3, 1e-7), True
+                break
+            lam *= 4
+        if not improved or np.max(np.abs(delta)) < sc[23] or cost < 1e-6:
+            return x, it
+    return x, iterations

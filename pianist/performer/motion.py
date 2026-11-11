@@ -1171,9 +1171,18 @@ class FingerIK:
             return np.r_[off[0] / .0002, along, off[2] / .0002, max(0., front - point[1]) / .0002,
                          (v - seed) / IK_VALUE_SCALE, below, pad_residual(self.solver, digit, v, palm), steady]
 
+        from . import fast_settle       # (late: it reads this module's tables)
+        fast = fast_settle.require()
+
         def run(x0):
-            x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, finger.lower, finger.upper),
-                                                   finger.lower, finger.upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
+            if fast:
+                x, _ = fast_settle.ride(fast_settle.pack(self.solver), digit, palm, target, seed, depths, own_pitch,
+                                        x0, start, brush, front, finger.lower, finger.upper,
+                                        IK_ITERATIONS, (IK_VALUE_SCALE, RIDE_SLIP, RIDE_STEADY))
+                x = np.asarray(x, FLOAT)
+            else:
+                x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, finger.lower, finger.upper),
+                                                       finger.lower, finger.upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
             values[digit] = x
             point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
             off = point - target
