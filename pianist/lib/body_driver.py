@@ -25,12 +25,6 @@ def apply_seating(arm, cal):
         for vertex,point in zip(leg.data.vertices,points):
             point.x+=offset.x;point.y+=offset.y
             point.z=low+(point.z-low)*(1+offset.z/(high-low));vertex.co=inverse@point
-    support=cal.get('ergonomics',{}).get('footrest')
-    if support and bpy.data.objects.get('pedal_extender') is None:
-        x0,y0,x1,y1=support['bounds_xy'];floor=support['floor_z'];top=support['top_z']
-        bpy.ops.mesh.primitive_cube_add(size=1,location=((x0+x1)/2,(y0+y1)/2,(floor+top)/2))
-        obj=bpy.context.object;obj.name='pedal_extender';obj.dimensions=(x1-x0,y1-y0,top-floor)
-        material=bpy.data.materials.new('pedal_extender_dark');material.diffuse_color=(.035,.028,.023,1);obj.data.materials.append(material)
     root['performer_seating_offset']=list(offset);bpy.context.view_layer.update()
 
 

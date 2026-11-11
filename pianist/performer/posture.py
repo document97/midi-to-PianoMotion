@@ -14,6 +14,11 @@ from .arm import closest_elbow
 from .kinematics import FLOAT
 
 HAND_FOLLOW = .3                # share of the forearm's inward angle the palm follows
+# The forearm the hand's orientation follows is taken from a standard seat, not the scene's: the hand's plan (fingering,
+# poses, wrist path) is the same wherever the performer sits within reach, the arm reaching to it from the actual seat.
+# The standard shoulder relative to the hand's neutral wrist over the keys, in arm lengths (upper + forearm): x toward
+# the hand's own side, y toward the player, z up (a seated pianist's, measured on the development scene).
+STANDARD_SHOULDER = np.array([-.006, -.766, .427])
 LITTLE_SIDE_DOWN = 6.           # deg: the little-finger side of the palm lower than the thumb side
 
 
@@ -38,11 +43,20 @@ def _calibration(solver):
     return solver._orientation_map
 
 
-def natural_orientation(solver, wrist):
-    """(yaw, roll) parameters of the relaxed hand with the wrist at ``wrist`` (world)."""
+def standard_shoulder(solver):
+    """The shoulder of the standard seat (``STANDARD_SHOULDER``) for this hand."""
+    arm = solver.arm
+    offset = STANDARD_SHOULDER * (arm.l1 + arm.l2)
+    offset[0] *= arm.side                  # toward the hand's own side: left hand -x, right hand +x
+    return (np.asarray(solver.rig.neutral_wrist[solver.hand], FLOAT) + offset).astype(FLOAT)
+
+
+def natural_orientation(solver, wrist, shoulder=None):
+    """(yaw, roll) parameters of the relaxed hand with the wrist at ``wrist`` (world), its forearm from ``shoulder``:
+    the standard seat's (``standard_shoulder``) unless given (the hand on the lap: the actual body's)."""
     y0, dy, t0, dt = _calibration(solver)
     arm = solver.arm
-    shoulder = arm.pre_upper_world[:3, 3]
+    shoulder = standard_shoulder(solver) if shoulder is None else np.asarray(shoulder, FLOAT)
     try:
         elbow = closest_elbow(shoulder, np.asarray(wrist, FLOAT), arm.l1, arm.l2, arm.side)
         forearm = np.asarray(wrist, FLOAT) - elbow

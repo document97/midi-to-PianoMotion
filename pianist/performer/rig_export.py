@@ -11,6 +11,7 @@ against the real deformed mesh.
 import argparse
 import hashlib
 import json
+import os
 import math
 from pathlib import Path
 import random
@@ -48,10 +49,12 @@ def vec(v):
 # development character: (0, .06, .17) put the thighs 13.5 mm into the keybed with the elbows bent tight; 9 cm
 # further back and 2.5 cm lower leaves 16 mm under the keybed, a more open elbow and a flatter forearm.
 PERFORMER_SEATING = (0., -.05, .145)     # fixed: performer and bench 2 cm further back than the original -.03
+if os.environ.get('PIANOMOTION_SEAT'):  # another seat (x, y, z m) for a scene of its own
+    PERFORMER_SEATING = tuple(float(v) for v in os.environ['PIANOMOTION_SEAT'].split(','))
 # Uniform scale of the character. Set it for your model: the hand's size decides what it can reach. The development
 # model (barefoot 1.52 m) missed black-key octaves (thumb to little finger) by 3.4 mm; at 1.05 (about 1.60 m) its
 # hand holds them. The character is scaled about the middle of the bench top so it stays seated; the feet move with
-# the scale, and so does the footrest (blender_main then refits bench and footrest: performer.staging).
+# the scale (blender_main then refits the bench and puts the feet on the floor and the pedal: performer.staging).
 CHARACTER_SCALE = 1.05
 # Uniform scale of both hands about the wrist joints, on top of CHARACTER_SCALE: the model's hands are small for its
 # height (wrist to middle fingertip 15.0 cm at 1.60 m, a real hand about 17 cm) and its white-key octaves landed on the
@@ -61,8 +64,10 @@ HAND_SCALE = 1.12
 
 
 def scaled_seat(arm, cal, offset):
-    """Scale the armature about the seated bench top; returns the calibration with the footrest moved to match."""
+    """Scale the armature about the seated bench top; returns the calibration without a footrest (the feet stand on
+    the floor and the piano's own pedal: performer.staging)."""
     root = arm.parent or arm
+    cal = dict(cal, ergonomics={k: v for k, v in cal.get('ergonomics', {}).items() if k != 'footrest'})
     if 'performer_character_scale' in root:
         if abs(root['performer_character_scale'] - CHARACTER_SCALE) > 1e-9:
             raise ValueError('Scene already has a different character scale')
@@ -74,14 +79,6 @@ def scaled_seat(arm, cal, offset):
     world = arm.matrix_world.copy()        # before seating: apply_seating then moves the character and the bench together
     arm.matrix_world = Matrix.Translation(pivot) @ Matrix.Scale(s, 4) @ Matrix.Translation(-pivot) @ world
     root['performer_character_scale'] = s
-    pivot += Vector(offset)                # the footrest is placed in the seated world
-    support = cal.get('ergonomics', {}).get('footrest')
-    if support:
-        x0, y0, x1, y1 = support['bounds_xy']
-        support = dict(support, bounds_xy=[pivot.x + (x0 - pivot.x) * s, pivot.y + (y0 - pivot.y) * s,
-                                           pivot.x + (x1 - pivot.x) * s, pivot.y + (y1 - pivot.y) * s],
-                       top_z=pivot.z - (pivot.z - support['top_z']) * s)
-        cal = dict(cal, ergonomics=dict(cal['ergonomics'], footrest=support))
     return cal
 
 
@@ -109,6 +106,55 @@ def scaled_hands(arm):
     root['performer_hand_scale'] = HAND_SCALE
 
 
+def collarbones(arm, drivers, cal):
+    """Per hand the collarbone: the first unconstrained bone above the upper arm (MMD cancel bones such as 肩C carry
+    constraints), with its parent frame, posed world matrix and head (world), and the level direction from the
+    shoulder joint to the hand's neutral wrist (where the shoulder goes when it reaches)."""
+    out = {}
+    for h, driver in drivers.items():
+        bone = arm.pose.bones[driver.upper.name].parent
+        while bone is not None and bone.constraints:
+            bone = bone.parent
+        if bone is None or bone.parent is None:
+            continue
+        pre = arm.matrix_world @ bone.parent.matrix @ bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
+        ahead = Vector(cal['hands'][h]['neutral_wrist']) - driver.pre_upper_world.translation
+        ahead.z = 0.
+        out[h] = dict(bone=bone.name, pre=mat(pre), world=mat(arm.matrix_world @ bone.matrix),
+                      head=vec(arm.matrix_world @ bone.head), ahead=vec(ahead.normalized()))
+    return out
+
+
+def straight_back(arm, torso='上半身', neck='首'):
+    """The torso bone and the spine bones above it up to the neck turned onto one upright line (a seated pianist's
+    back is straight, not arched: the model's rest curve and any pose left in the scene are taken out); the neck
+    keeps its direction in the armature. The torso's small forward lean (torso.py) turns it all."""
+    bones = arm.pose.bones
+    if torso not in bones or neck not in bones:
+        return
+    chain, b = [], bones[neck].parent
+    while b is not None and b.name != torso:
+        chain.append(b)
+        b = b.parent
+    if b is None or not chain:
+        return
+    chain = [b] + chain[::-1]
+    remove_curves(arm, lambda c: any('"' + n.name + '"' in c.data_path for n in chain[1:] + [bones[neck]]))
+    bpy.context.view_layer.update()
+    neck_before = bones[neck].matrix.to_3x3()
+    direction = arm.matrix_world.inverted().to_3x3() @ Vector((0., 0., 1.))
+    for bone in chain:
+        bone.rotation_mode = 'QUATERNION'
+        bone.rotation_quaternion = (1., 0., 0., 0.)
+        bpy.context.view_layer.update()
+        turn = (bone.tail - bone.head).rotation_difference(direction).to_matrix().to_4x4()
+        bone.matrix = Matrix.Translation(bone.head) @ turn @ Matrix.Translation(-bone.head) @ bone.matrix
+        bpy.context.view_layer.update()
+    head = bones[neck].head.copy()
+    bones[neck].matrix = Matrix.Translation(head) @ neck_before.to_4x4()
+    bpy.context.view_layer.update()
+
+
 def neutral_scene(cal):
     """The bake's neutral state (setup()), without HandModel / mesh clearance objects, on the performer's seat."""
     (arm, skin), scene = character(), bpy.context.scene
@@ -118,6 +164,7 @@ def neutral_scene(cal):
     cal = scaled_seat(arm, cal, PERFORMER_SEATING)
     scaled_hands(arm)
     apply_seating(arm, cal)
+    straight_back(arm)
     remove_curves(arm, lambda c: any('"' + s in c.data_path for s in ARM_CHANNELS))
     for h, s in SIDE.items():
         for c in arm.pose.bones[s + '手首'].constraints:
@@ -323,7 +370,7 @@ def main():
     torso = None
     if body.bone is not None:
         torso = dict(bone=body.bone.name, pivot=vec(body.pivot), pre=mat(body.pre), world=mat(body.world),
-                     reference={h: mat(m) for h, m in body.reference.items()})
+                     reference={h: mat(m) for h, m in body.reference.items()}, shoulders=collarbones(arm, drivers, cal))
     neutral_bones = {b.name: mat(b.matrix) for b in arm.pose.bones}
     rig = dict(schema='performer-rig', neutral_bones=neutral_bones, scene=bpy.data.filepath,
                scene_sha256=hashlib.sha256(Path(bpy.data.filepath).read_bytes()).hexdigest(),

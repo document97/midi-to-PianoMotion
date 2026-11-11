@@ -15,6 +15,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 import json
 import math
+import os
 from pathlib import Path
 import time
 
@@ -32,7 +33,7 @@ from .checks import BRUSH_DEPTH, Heightfield, stretched
 from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, least_sunk, neighbour_targets,
                         settle, sunk, vector_of, wide_settle)
 from .kinematics import DIGITS, SWING_LATERAL, Rig
-from .torso import Torso
+from .torso import Torso, reach_window
 from .contacts import HandCapsules, finger_pairs, hands_gap, pointing, raised_between
 from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contact_error, contact_waypoints, finger_track, frame_hand,
                      placed, refine_points, refine_score, strokes, waypoint, wrist_path, SIDEWAYS_FREE, YieldingPath,
@@ -45,7 +46,7 @@ from .regions import performer_solvers
 from .posture import natural_orientation
 
 HERE = Path(__file__).resolve().parent
-RIG = HERE / 'rig_cache' / 'rig.json'     # performer seat and size (rig_export.PERFORMER_SEATING, CHARACTER_SCALE)
+RIG = Path(os.environ['PIANOMOTION_RIG']) if os.environ.get('PIANOMOTION_RIG') else HERE / 'rig_cache' / 'rig.json'     # performer seat and size (rig_export.PERFORMER_SEATING, CHARACTER_SCALE)
 LEGACY_RIG = 'rig_unscaled.json'   # runs whose report does not name its rig were solved with this one
 
 
@@ -424,6 +425,7 @@ def _frames(times):
     pitches = sorted(by_pitch)
     n = len(times)
     out = dict(times=np.asarray(times), torso=np.zeros((n, 4)), key_depth=np.zeros((n, len(pitches))))
+    out.update({f'{h}_collar_q': np.zeros((n, 4)) for h in 'LR'})
     for h in 'LR':
         out[f'{h}_wrist'] = np.zeros((n, 5))
         out[f'{h}_values'] = np.zeros((n, 5, 4))
@@ -456,10 +458,12 @@ def _frames(times):
             out['key_depth'][i, j] = d
             if d > 0:
                 depths[p] = d
-        torso_q, pre = (None, None) if _ctx['torso'] is None else _ctx['torso'].pose(t)
+        torso_q, pre, collar = (None, None, {}) if _ctx['torso'] is None else _ctx['torso'].pose(t)
         segments = {}
         if torso_q is not None:
             out['torso'][i] = torso_q
+        for h, q in collar.items():
+            out[f'{h}_collar_q'][i] = q
         for h in 'LR':
             vector, values, error = frame_hand(t, _ctx['paths'][h], tracks[h], notes, _ctx['waypoints'],
                                                _ctx['solvers'][h], _ctx['ik'][h], depths, previous[h])
@@ -749,8 +753,10 @@ def run(args):
         from . import motion
         motion.LIFT_SCALE = float(json.loads(settings.read_text(encoding='utf-8')).get('lift', 1.))
         print(f'[motion] {settings.name}: lift x{motion.LIFT_SCALE}', flush=True)
+    reach_x = {h: reach_window(s, Rig(RIG).data.get('torso'), RELAXED) for h, s in hand_solvers(Rig(RIG)).items()}
+    print('[planning] reach (key x, m): ' + ', '.join(f'{h} {lo:.3f}..{hi:.3f}' for h, (lo, hi) in reach_x.items()), flush=True)
     planner_kwargs = dict(beam_width=args.beam, outer_voice_bonus=1.5, pair_table=table, pair_strain=pair_awkwardness(table, workers),
-                          rest_x={h: float(Rig(RIG).neutral_wrist[h][0]) for h in 'LR'},
+                          rest_x={h: float(Rig(RIG).neutral_wrist[h][0]) for h in 'LR'}, reach_x=reach_x,
                           weights=Weights(**({} if args.finger_spacing is None else dict(finger_spacing=args.finger_spacing)),
                                           **({} if args.lift_speed is None else dict(lift_speed=args.lift_speed))))
     stages['planning'] = stages['anchor_poses'] = stages['chord_shapes'] = 0.
@@ -835,7 +841,7 @@ def run(args):
     rest = {}
     for h in 'LR':      # on the lap: the palm on the thigh (rig_export.lap), the hand turned in a little
         wrist = np.array(rig.data['hands'][h]['lap'], dtype=float) + REST_OFFSET
-        orientation = np.array(natural_orientation(rest_solvers[h], wrist), dtype=float)
+        orientation = np.array(natural_orientation(rest_solvers[h], wrist, rest_solvers[h].arm.pre_upper_world[:3, 3]), dtype=float)
         orientation[0] += REST_YAW * (1. if h == 'R' else -1.)
         rest[h] = np.r_[wrist, orientation]
     hand_notes = {h: {k: n for k, n in notes.items() if n.hand == h} for h in 'LR'}
@@ -904,18 +910,22 @@ def run(args):
 
     # 4. torso, finger keyposes
     t0 = time.perf_counter()
-    torso_rows = []
+    torso_rows, reach_rows = [], {'L': [], 'R': []}
     if rig.data.get('torso'):
         reference = {h: np.array(m) for h, m in rig.data['torso']['reference'].items()}
         for n in notes.values():
-            delta = paths[n.hand](n.onset)[0] - reference[n.hand][0, 3]
-            torso_rows.append((n.onset, math.copysign(max(0., abs(delta) - .15), delta), (n.velocity / 127) ** .6))
+            wrist = np.asarray(paths[n.hand](n.onset)[:3], float)
+            delta = wrist[0] - reference[n.hand][0, 3]
+            weight = (n.velocity / 127) ** .6
+            torso_rows.append((n.onset, math.copysign(max(0., abs(delta) - .15), delta), weight))
+            arm = rig.arms[n.hand]
+            reach_rows[n.hand].append((n.onset, np.linalg.norm(wrist - reference[n.hand][:3, 3]) / (arm.l1 + arm.l2), weight))
     first = min(n.onset for n in notes.values())
     last = max(n.release for n in notes.values())
     by_pitch = {}
     for n in notes.values():
         by_pitch.setdefault(n.pitch, []).append(n)
-    context = dict(base, paths=paths, waypoints=waypoints, torso_rows=(torso_rows, first, last), by_pitch=by_pitch)
+    context = dict(base, paths=paths, waypoints=waypoints, torso_rows=(torso_rows, first, last, reach_rows), by_pitch=by_pitch)
     with ProcessPoolExecutor(min(workers, 10), initializer=_init, initargs=(context,)) as pool:
         tracks = {'L': {}, 'R': {}}
         for (h, d), track in progress_map(pool, _track, [(h, d) for h in 'LR' for d in DIGITS], 'finger tracks'):
