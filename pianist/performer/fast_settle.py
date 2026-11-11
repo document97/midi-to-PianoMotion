@@ -14,7 +14,8 @@ import numpy as np
 from .checks import BRUSH_COST, BRUSH_DEPTH, CELL, OWN_KEY_TOLERANCE
 from .kinematics import DIGITS, child_euler
 from .motion import FLOOR_SCALE, PAD_PITCH_MAX, PAD_PITCH_SCALE, KeyFloor, KeySurface, Spacing
-from .pose import CONTACT_TOLERANCE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, STEP_TOLERANCE, VALUE_SCALE, WEB_SCALE
+from .pose import (CLEARANCE_SCALE, CONTACT_TOLERANCE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, STEP_TOLERANCE, VALUE_SCALE,
+                   WEB_SCALE, WRIST_SCALE)
 
 OPTED_OUT = os.environ.get('PIANOMOTION_FAST_SETTLE', '1') == '0'
 njit = None
@@ -118,7 +119,9 @@ def pack(solver):
     per_digit = np.array([[THUMB_LATERAL_SCALE if d == 1 else LATERAL_SCALE, LATERAL_FREE[d]] for d in DIGITS], F)
     out = solver._fast_pack = (fp, pad, clear, const, palm, table, ks, (np.asarray(spacing.lateral, F), proximal, gaps),
                                (rest, slope, free, hard), scales, per_digit, np.asarray(NEUTRAL_ORIENTATION, F),
-                               np.asarray(VALUE_SCALE, F))
+                               np.asarray(VALUE_SCALE, F),
+                               (np.where(np.isfinite(hf.top), hf.top, 0.).astype(F), np.isfinite(hf.top),
+                                np.asarray(WRIST_SCALE, F), np.array([CLEARANCE_SCALE], F)))
     return out
 
 
@@ -136,6 +139,24 @@ def problem(contacts, digits, x, lower, upper, values, depths, edges, blacks, ce
             np.array([shape[d] for d in digits], F).reshape(k, 4),
             np.array([curved_free.get(d, np.zeros(4)) for d in DIGITS], F), np.asarray(lifted, F),
             bool(stretch), np.asarray(steps, F), int(iterations), bool(curved))
+
+
+def pose_problem(contacts, digits, x, lower, upper, values, depths, prior_wrist, shape, stretch, steps, seeds,
+                 seed_iterations, iterations, clearance):
+    """One PoseSolver.solve problem as arrays (contacts sorted by digit)."""
+    table = np.zeros(128, F)
+    for p, d in depths.items():
+        table[p] = d
+    k = len(digits)
+    return (np.array(digits, I), np.array([c.pitch for c in contacts], I), np.array([c.depth for c in contacts], F),
+            np.asarray(x, F), np.asarray(lower, F), np.asarray(upper, F), np.array([values[d] for d in DIGITS], F), table,
+            np.asarray(prior_wrist, F), np.array([shape[d] for d in digits], F).reshape(k, 4), bool(stretch),
+            np.asarray(steps, F), np.array(seeds, F).reshape(-1, 3), int(seed_iterations), int(iterations), bool(clearance))
+
+
+def solve_pose(hand_pack, prob):
+    """(x, iterations used) of PoseSolver.solve's seeded solve."""
+    return pose_one(hand_pack, prob)
 
 
 def solve(hand_pack, prob):
@@ -545,6 +566,38 @@ def linsolve(a, b):
     return x
 
 @_jit
+def normal_bound(jac, r, x, lo, up):
+    """J^T r, J^T J with every variable held at a bound its gradient pushes past taken out (pose.bound_step)."""
+    m, n = jac.shape
+    g = np.zeros(n, np.float32)
+    h = np.zeros((n, n), np.float32)
+    for i in range(m):
+        ri = r[i]
+        for a in range(n):
+            ja = jac[i, a]
+            g[a] += ja * ri
+            for b in range(n):
+                h[a, b] += ja * jac[i, b]
+    for a in range(n):
+        if (x[a] <= lo[a] and g[a] > 0) or (x[a] >= up[a] and g[a] < 0):
+            for b in range(n):
+                h[a, b] = 0.
+                h[b, a] = 0.
+            h[a, a] = 1.
+            g[a] = 0.
+    return g, h
+
+
+@_jit
+def damped(h, g, lam):
+    n = len(g)
+    a = h.copy()
+    for j in range(n):
+        a[j, j] += np.float32(lam) * (h[j, j] + np.float32(1e-9))
+    return linsolve(a, -g)
+
+
+@_jit
 def lm(H, Q, curved, cap):
     """PoseSolver._levenberg_marquardt on coherence.settle's residuals (float32 state, as the numpy solve)."""
     x0, lower, upper, steps, iterations = Q[3], Q[4], Q[5], Q[18], Q[19]
@@ -571,29 +624,11 @@ def lm(H, Q, curved, cap):
             residuals(H, Q, trial.astype(np.float64), curved, vals, mats, alt, work, loc, world, buf)
             for i in range(m):
                 jac[i, j] = (np.float32(buf[i]) - r[i]) / st[j]
-        g = np.zeros(n, np.float32)
-        h = np.zeros((n, n), np.float32)
-        for i in range(m):
-            ri = r[i]
-            for a in range(n):
-                ja = jac[i, a]
-                g[a] += ja * ri
-                for b in range(n):
-                    h[a, b] += ja * jac[i, b]
-        for a in range(n):          # pose.bound_step
-            if (x[a] <= lo[a] and g[a] > 0) or (x[a] >= up[a] and g[a] < 0):
-                for b in range(n):
-                    h[a, b] = 0.
-                    h[b, a] = 0.
-                h[a, a] = 1.
-                g[a] = 0.
+        g, h = normal_bound(jac, r, x, lo, up)
         improved = False
         delta = np.zeros(n, np.float32)
         for _ in range(10):
-            a = h.copy()
-            for j in range(n):
-                a[j, j] += np.float32(lam) * (h[j, j] + np.float32(1e-9))
-            delta = linsolve(a, -g)
+            delta = damped(h, g, lam)
             trial = np.minimum(np.maximum(x + delta, lo), up)
             residuals(H, Q, trial.astype(np.float64), curved, vals, mats, alt, work, loc, world, buf)
             tr = buf[:m].astype(np.float32)
@@ -624,3 +659,165 @@ def solve_one(H, Q):
 
 
 
+
+
+# ---------------------------------------------------------------- PoseSolver.solve
+@_jit
+def penetration(H, dtable, pt, own, brush):
+    """checks.Heightfield.penetration of one point (own: the finger's pitch, all points allowed)."""
+    top, finite = H[13][0], H[13][1]
+    origin, pitch_grid, sc = H[6][3], H[6][2], H[9]
+    ix = int(math.floor((pt[0] - origin[0]) / sc[18]))
+    iy = int(math.floor((pt[1] - origin[1]) / sc[18]))
+    if ix < 0 or iy < 0 or ix >= top.shape[0] or iy >= top.shape[1]:
+        return 0.
+    if not finite[ix, iy]:
+        return 0.
+    p = pitch_grid[ix, iy]
+    pressed = dtable[p] if p >= 0 else dtable[dtable.shape[0] + p]
+    pen = top[ix, iy] - pressed - pt[2]
+    if p == own:
+        pen -= sc[19]
+    if brush:
+        pen = max(pen, 0.)
+        if p != own and pressed <= 0.:
+            pen = max(pen - sc[20], 0.) + sc[21] * min(max(pen, 0.), sc[20])
+    return max(pen, 0.)
+
+
+@_jit
+def pose_residuals(H, Q, x, prior, clear, vals, mats, work, loc, world, out):
+    """PoseSolver.solve's residuals at x into out; returns their count."""
+    pad, clearskin, pm, table, web, sc, value_scale = H[1], H[2], H[4], H[5], H[8], H[9], H[12]
+    wrist_scale, clear_scale = H[13][2], H[13][3][0]
+    digits, pitches, depths, dtable, prior_wrist, shape, stretch = Q[0], Q[1], Q[2], Q[7], Q[8], Q[9], Q[10]
+    k = len(digits)
+    vals[:, :] = Q[6]
+    for i in range(k):
+        for j in range(4):
+            vals[digits[i] - 1, j] = x[5 + 4 * i + j]
+    for d in range(5):
+        finger(H[0], d, vals[d], mats[3 * d:3 * d + 3], work)
+    const = H[3]
+    for c in range(const.shape[0]):
+        mats[15 + c] = const[c]
+    palm = np.empty((3, 4))
+    palm_matrix(pm, x, palm)
+    rest, slope, hard = web[0], web[1], web[3]
+    m = 0
+    for i in range(k):
+        for j in range(i + 1, k):
+            a, b = digits[i], digits[j]
+            opening = rest[a, b] + slope[a, b] * (vals[b - 1, 0] - vals[a - 1, 0])
+            out[m] = max(0., opening - hard[a, b]) / sc[12]
+            m += 1
+    pt, rr = np.empty(3), np.empty(3)
+    for i in range(k):
+        d = digits[i] - 1
+        n = skin_local(pad, d, mats, loc)
+        to_world(palm, loc, n, world)
+        contact_point(world, n, sc, pt)
+        region(table, sc, pitches[i], depths[i], pt, rr)
+        for j in range(3):
+            out[m] = rr[j] / sc[0]
+            m += 1
+        if clear:
+            n = skin_local(clearskin, d, mats, loc)
+            to_world(palm, loc, n, world)
+            for p in range(n):
+                out[m] = penetration(H, dtable, world[p], pitches[i], stretch) / clear_scale
+                m += 1
+    for j in range(5):
+        out[m] = prior * (x[j] - prior_wrist[j]) / wrist_scale[j]
+        m += 1
+    for i in range(k):
+        for j in range(4):
+            out[m] = prior * (vals[digits[i] - 1, j] - shape[i, j]) / value_scale[j]
+            m += 1
+    return m
+
+
+@_jit
+def lm_pose(H, Q, x0, prior, clear, iterations, cap):
+    """PoseSolver._levenberg_marquardt on PoseSolver.solve's residuals."""
+    lower, upper, steps, sc = Q[4], Q[5], Q[11], H[9]
+    n = len(x0)
+    vals = np.empty((5, 4))
+    mats = np.empty((15 + H[3].shape[0], 4, 4))
+    work = np.empty((5, 4, 4))
+    loc = np.empty((cap, 4))
+    world = np.empty((cap, 3))
+    buf = np.empty(16384)
+    x = x0.astype(np.float32)
+    lo, up, st = lower.astype(np.float32), upper.astype(np.float32), steps.astype(np.float32)
+    m = pose_residuals(H, Q, x.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf)
+    r = buf[:m].astype(np.float32)
+    cost = np.float32(np.dot(r, r))
+    lam = 1e-2
+    jac = np.empty((m, n), np.float32)
+    for it in range(1, iterations + 1):
+        for j in range(n):
+            trial = x.copy()
+            trial[j] += st[j]
+            pose_residuals(H, Q, trial.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf)
+            for i in range(m):
+                jac[i, j] = (np.float32(buf[i]) - r[i]) / st[j]
+        g, h = normal_bound(jac, r, x, lo, up)
+        improved = False
+        delta = np.zeros(n, np.float32)
+        for _ in range(10):
+            delta = damped(h, g, lam)
+            trial = np.minimum(np.maximum(x + delta, lo), up)
+            pose_residuals(H, Q, trial.astype(np.float64), prior, clear, vals, mats, work, loc, world, buf)
+            tr = buf[:m].astype(np.float32)
+            tc = np.float32(np.dot(tr, tr))
+            if tc < cost:
+                x, r, cost, lam, improved = trial, tr, tc, max(lam / 3, 1e-7), True
+                break
+            lam *= 4
+        if not improved or np.max(np.abs(delta)) < sc[23] or cost < 1e-6:
+            return x, it
+    return x, iterations
+
+
+@_jit
+def pose_cost(H, Q, x, prior, clear, cap):
+    vals = np.empty((5, 4))
+    mats = np.empty((15 + H[3].shape[0], 4, 4))
+    buf = np.empty(16384)
+    m = pose_residuals(H, Q, x.astype(np.float64), prior, clear, vals, mats, np.empty((5, 4, 4)), np.empty((cap, 4)),
+                       np.empty((cap, 3)), buf)
+    r = buf[:m].astype(np.float32)
+    return np.float32(np.dot(r, r))
+
+
+@_jit
+def pose_one(H, Q):
+    """PoseSolver.solve's seeds and phases: each seed reaches the keys, then adds clearance; the best is finished,
+    then relaxed toward the prior."""
+    x0, lower, upper, seeds, seed_it, iterations, clearance = Q[3], Q[4], Q[5], Q[12], Q[13], Q[14], Q[15]
+    cap = max(H[1][3][:, 0].max(), H[2][3][:, 0].max())
+    lo, up = lower.astype(np.float32), upper.astype(np.float32)
+    it = 0
+    best_cost = np.float32(np.inf)
+    best = x0.astype(np.float32)
+    for s in range(seeds.shape[0]):
+        start = x0.astype(np.float32)
+        start[0] += np.float32(seeds[s, 1])
+        start[1] += np.float32(seeds[s, 2])
+        start[3] = np.float32(seeds[s, 0])
+        start = np.minimum(np.maximum(start, lo), up)
+        trial, used = lm_pose(H, Q, start, .03, False, seed_it, cap)
+        more = 0
+        if clearance:
+            trial, more = lm_pose(H, Q, trial, .03, clearance, seed_it, cap)
+        it += used + more
+        c = pose_cost(H, Q, trial, .03, clearance, cap)
+        if s == 0 or c < best_cost:
+            best_cost, best = c, trial
+        if c < 1e-4:
+            break
+    x, used = lm_pose(H, Q, best, .03, clearance, iterations, cap)
+    it += used
+    x, used = lm_pose(H, Q, x, 1., clearance, iterations // 2, cap)
+    return x, it + used

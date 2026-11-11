@@ -313,25 +313,33 @@ class PoseSolver:
         # The key surfaces are piecewise flat, so their clearance has poor gradients and stretched
         # chords have local minima: each wrist seed first reaches the keys, then adds key clearance;
         # the best seed is finished, and a last phase relaxes the hand while keeping both.
-        it, best = 0, None
-        for yaw_seed, dx, dy in seeds:
-            start = x.copy()
-            start[0] += dx
-            start[1] += dy
-            start[3] = yaw_seed
-            start = np.clip(start, lower, upper)
-            trial, used = self._levenberg_marquardt(touch, start, lower, upper, steps, SEED_ITERATIONS)
-            trial, more = self._levenberg_marquardt(reach, trial, lower, upper, steps, SEED_ITERATIONS) if clearance else (trial, 0)
-            it += used + more
-            r = reach(trial)
-            if best is None or r @ r < best[0]:
-                best = (r @ r, trial)
-            if r @ r < 1e-4:
-                break
-        x, used = self._levenberg_marquardt(reach, best[1], lower, upper, steps, iterations)
-        it += used
-        x, used = self._levenberg_marquardt(lambda v: residuals(v, 1., clearance), x, lower, upper, steps, iterations // 2)
-        it += used
+        from . import fast_settle       # (late: it reads this module's tables)
+        if digits and self.heightfield is not None and fast_settle.require():
+            # the same seeds, phases and solves compiled (fast_settle)
+            x, it = fast_settle.solve_pose(fast_settle.pack(self), fast_settle.pose_problem(
+                contacts, digits, x, lower, upper, values, depths, prior_wrist, shape, stretch, steps, seeds, SEED_ITERATIONS,
+                iterations, clearance))
+            x = np.asarray(x, FLOAT)
+        else:
+            it, best = 0, None
+            for yaw_seed, dx, dy in seeds:
+                start = x.copy()
+                start[0] += dx
+                start[1] += dy
+                start[3] = yaw_seed
+                start = np.clip(start, lower, upper)
+                trial, used = self._levenberg_marquardt(touch, start, lower, upper, steps, SEED_ITERATIONS)
+                trial, more = self._levenberg_marquardt(reach, trial, lower, upper, steps, SEED_ITERATIONS) if clearance else (trial, 0)
+                it += used + more
+                r = reach(trial)
+                if best is None or r @ r < best[0]:
+                    best = (r @ r, trial)
+                if r @ r < 1e-4:
+                    break
+            x, used = self._levenberg_marquardt(reach, best[1], lower, upper, steps, iterations)
+            it += used
+            x, used = self._levenberg_marquardt(lambda v: residuals(v, 1., clearance), x, lower, upper, steps, iterations // 2)
+            it += used
         w, ya, ro, vals = unpack(x)
         palm = self.palm(w, ya, ro)
         error, targets = 0., {}
