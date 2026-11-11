@@ -9,7 +9,7 @@ Give it a MIDI file and a 3D character plays it on a piano in Blender:
 1. **Planning**: decides which hand and which finger plays each note, when each finger lets go of its key, and which notes have to be left out because the hand cannot reach them. The planner splits the notes between the hands itself; the score does not need to be separated into hands.
 2. **Motion**: animates the arms, wrists, fingers, the lean of the upper body, the right foot on the sustain pedal and every key, and writes it all into a `.blend` with preview audio.
 
-No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything is computed in 32-bit floats (fp32). Planning and motion run on the CPU in parallel processes (8 or 16); the finger pair table computed on the first run is solved in batches on the GPU when there is one. For a 160-second piece, planning takes a dozen seconds or so, and the motion about 13 minutes on 16 cores.
+No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything is computed in 32-bit floats (fp32). Planning and motion run on the CPU in parallel processes (8 or 16); the finger pair table computed on the first run is solved in batches on the GPU when there is one. For a 160-second piece (Daylight), planning takes about a minute and the whole solve about 28 minutes on 16 processes.
 
 > **Demo video:** https://www.bilibili.com/video/BV1QEnc6rECK/
 
@@ -87,7 +87,7 @@ GPU environment variables:
 |---|---|
 | `PIANOMOTION_DEVICE=cpu` | no GPU: the pair table on CPU processes too |
 | `PIANOMOTION_GPU_MEMORY_SHARE` | largest share of the GPU memory free at the start to use, default `0.4` (an iGPU shares it with the CPU) |
-| `PIANOMOTION_GPU_MEMORY_GB` | GPU memory to use, in GB; overrides the share |
+| `PIANOMOTION_GPU_MEMORY_GB` | cap on the GPU memory to use, in GB, default `6`; the smaller of this and the share is used |
 | `PIANOMOTION_GPU_GRAPHS=0` | no CUDA/HIP graph replay (on by default; replay gives the same results, and is switched off by itself if a graph cannot be recorded) |
 
 The GPU solver has been measured on a Radeon 780M only (Windows, ROCm); on discrete NVIDIA and AMD cards its batches grow with the memory, untested.
