@@ -48,7 +48,8 @@ def vec(v):
 # The performer's seat: world offset of the character and bench from where the scene has them. Tuned for the
 # development character: (0, .06, .17) put the thighs 13.5 mm into the keybed with the elbows bent tight; 9 cm
 # further back and 2.5 cm lower leaves 16 mm under the keybed, a more open elbow and a flatter forearm.
-PERFORMER_SEATING = (0., -.05, .145)     # fixed: performer and bench 2 cm further back than the original -.03
+DEFAULT_SEATING = (0., -.05, .145)       # fixed: performer and bench 2 cm further back than the original -.03
+PERFORMER_SEATING = DEFAULT_SEATING
 if os.environ.get('PIANOMOTION_SEAT'):  # another seat (x, y, z m) for a scene of its own
     PERFORMER_SEATING = tuple(float(v) for v in os.environ['PIANOMOTION_SEAT'].split(','))
 # Uniform scale of the character. Set it for your model: the hand's size decides what it can reach. The development
@@ -195,13 +196,14 @@ def straight_back(arm, torso='上半身', neck='首'):
     bpy.context.view_layer.update()
 
 
-def neutral_scene(cal):
+def neutral_scene(cal, seating=None):
     """The bake's neutral state (setup()), without HandModel / mesh clearance objects, on the performer's seat."""
     (arm, skin), scene = character(), bpy.context.scene
     set_time(scene, 0)
     keyboard = measured_keyboard()
-    cal = dict(cal, ergonomics=dict(cal.get('ergonomics', {}), world_root_offset=list(PERFORMER_SEATING)))
-    cal = scaled_seat(arm, cal, PERFORMER_SEATING)
+    seating = PERFORMER_SEATING if seating is None else seating
+    cal = dict(cal, ergonomics=dict(cal.get('ergonomics', {}), world_root_offset=list(seating)))
+    cal = scaled_seat(arm, cal, seating)
     scaled_hands(arm)
     apply_seating(arm, cal)
     straight_back(arm)
@@ -396,6 +398,28 @@ def lap(arm, skin):
     return out
 
 
+def hand_bones(arm, drivers):
+    """Names of the bones the hands' kinematics read (rig.neutral_bones relative to the wrist): each wrist, what it
+    carries, and the forearm bones whose skin the hand shares."""
+    names = set()
+    for driver in drivers.values():
+        names |= {driver.wrist.name, driver.elbow.name} | {b.name for b in driver.wrist.children_recursive}
+        names |= {b.name for b in driver.twists}
+    return names
+
+
+def seat_free_hands(cal):
+    """The hands' geometry exported at DEFAULT_SEATING (fingers, neutral wrist, the bones they read): the scene's own
+    seat changes only the arms and body. In float32 the same hand exported at another seat differs by ~0.1 um, and
+    that is enough to send a pose solve down another valley: the hand's plan would change with the seat."""
+    arm, skin, drivers, _, _ = neutral_scene(cal, DEFAULT_SEATING)
+    coords, normals = mesh_world(skin)
+    hands = {h: export_hand(arm, skin, drivers[h], cal['hands'][h], coords, normals) for h in 'LR'}
+    bones = {b.name: mat(b.matrix) for b in arm.pose.bones if b.name in hand_bones(arm, drivers)}
+    bpy.ops.wm.open_mainfile(filepath=bpy.data.filepath)        # back to the scene as saved, for the actual seat
+    return hands, bones
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True)
@@ -403,6 +427,7 @@ def main():
     args = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
     cal_path = ROOT / 'hand_calibration.json'
     cal = json.loads(cal_path.read_text(encoding='utf-8'))
+    seat_free = seat_free_hands(cal) if tuple(PERFORMER_SEATING) != tuple(DEFAULT_SEATING) else None
     arm, skin, drivers, body, keyboard = neutral_scene(cal)
     coords, normals = mesh_world(skin)
     hands = {h: export_hand(arm, skin, drivers[h], cal['hands'][h], coords, normals) for h in 'LR'}
@@ -416,6 +441,12 @@ def main():
                      **spine_data(arm, body.bone),
                      slide_bone=slide_bone(arm, body.bone))
     neutral_bones = {b.name: mat(b.matrix) for b in arm.pose.bones}
+    if seat_free is not None:
+        free_hands, free_bones = seat_free
+        neutral_bones.update(free_bones)
+        for h in 'LR':
+            for key in ('fingers', 'neutral_wrist', 'neutral_wrist_matrix'):
+                hands[h][key] = free_hands[h][key]
     rig = dict(schema='performer-rig', neutral_bones=neutral_bones, scene=bpy.data.filepath,
                scene_sha256=hashlib.sha256(Path(bpy.data.filepath).read_bytes()).hexdigest(),
                calibration_sha256=hashlib.sha256(cal_path.read_bytes()).hexdigest(),
