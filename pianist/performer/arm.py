@@ -17,8 +17,10 @@ ELBOW_OUT = .035                # elbow rest: this far outside the shoulder (elb
 ELBOW_FOLLOW = .4               # share of the hand's sideways position the elbow follows
 
 
-def closest_elbow(shoulder, wrist, l1, l2, side, reference=None):
-    """arm_driver.closest_elbow."""
+def elbow_circle(shoulder, wrist, l1, l2, side):
+    """The elbow's circle for a wrist the arm can reach: (center, radius, t, q), the elbow at angle a (rad) is
+    center + radius * (t * cos(a) + q * sin(a)); angle 0 hangs the elbow down (t is the down direction projected
+    accross the shoulder-wrist line), q = u x t. Raises ValueError when the wrist is outside the unstretched arm."""
     s, w = np.asarray(shoulder, FLOAT), np.asarray(wrist, FLOAT)
     d = w - s
     distance = float(np.linalg.norm(d))
@@ -33,7 +35,16 @@ def closest_elbow(shoulder, wrist, l1, l2, side, reference=None):
     if np.linalg.norm(t) < .01:
         t = np.array([side, 0., 0.], dtype=FLOAT) - u * side * u[0]
     t /= np.linalg.norm(t)
-    q = np.cross(u, t)
+    return center, radius, t, np.cross(u, t)
+
+
+def closest_elbow(shoulder, wrist, l1, l2, side, reference=None, angle=None):
+    """arm_driver.closest_elbow; ``angle`` (rad on elbow_circle, the swing curve's convention): the elbow placed
+    there instead of optimized to the preferred rest."""
+    center, radius, t, q = elbow_circle(shoulder, wrist, l1, l2, side)
+    s, w = np.asarray(shoulder, FLOAT), np.asarray(wrist, FLOAT)
+    if angle is not None:
+        return center + radius * (t * math.cos(angle) + q * math.sin(angle))
     # The upper arm hangs: the elbow rests a little outside the shoulder and follows the hand only partly,
     # so a hand in front of the body is reached with the forearm angled in (not straight ahead).
     rest_x = s[0] + side * ELBOW_OUT
@@ -59,6 +70,15 @@ def closest_elbow(shoulder, wrist, l1, l2, side, reference=None):
         angle = min([angle - step, angle, angle + step], key=lambda theta: cost(theta)[0])
         step *= .5
     return cost(angle)[1]
+
+
+def closest_elbow_angle(shoulder, wrist, l1, l2, side):
+    """The angle on the elbow's circle of the preferred rest placement (elbows.py pulls the swing curve toward
+    it): the arm's natural hang for this wrist."""
+    elbow = closest_elbow(shoulder, wrist, l1, l2, side)
+    center, radius, t, q = elbow_circle(shoulder, wrist, l1, l2, side)
+    e = np.asarray(elbow, FLOAT) - center
+    return math.atan2(float(e @ q), float(e @ t))
 
 
 # The standard seat's shoulder relative to a hand's neutral wrist over the keys, in arm lengths (upper arm + forearm):
@@ -98,12 +118,13 @@ class Arm:
     def palm_q(self, yaw, roll):
         return q_mul(q_axis((0, 0, 1), yaw), q_mul(q_axis(self.palm_forward, roll), self.palm))
 
-    def pose(self, wrist, yaw=0., roll=0., pre_upper_world=None):
-        """World wrist matrix, armature-space wrist matrix and the bones' local quaternions."""
+    def pose(self, wrist, yaw=0., roll=0., pre_upper_world=None, elbow_angle=None):
+        """World wrist matrix, armature-space wrist matrix and the bones' local quaternions; ``elbow_angle``
+        (rad on elbow_circle): the elbow placed there (the swing curve's angle) instead of optimized."""
         pre_upper = self.pre_upper_world if pre_upper_world is None else pre_upper_world
         shoulder = pre_upper[:3, 3]
         wrist = np.asarray(wrist, FLOAT)
-        elbow = closest_elbow(shoulder, wrist, self.l1, self.l2, self.side)
+        elbow = closest_elbow(shoulder, wrist, self.l1, self.l2, self.side, angle=elbow_angle)
         upper_dir = (elbow - shoulder) / np.linalg.norm(elbow - shoulder)
         forearm_dir = (wrist - elbow) / np.linalg.norm(wrist - elbow)
         hinge = np.cross(upper_dir, forearm_dir)

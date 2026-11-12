@@ -34,6 +34,7 @@ from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS,
                         settle, sunk, vector_of, wide_settle)
 from .kinematics import DIGITS, SWING_LATERAL, Rig
 from .torso import Torso, reach_window
+from . import elbows
 from .contacts import HandCapsules, finger_pairs, hands_gap, pointing, raised_between
 from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contact_error, contact_waypoints, finger_track, frame_hand,
                      placed, refine_points, refine_score, strokes, waypoint, wrist_path, SIDEWAYS_FREE, YieldingPath,
@@ -81,6 +82,8 @@ def _init(context):
     if context.get('torso_rows') and rig.data.get('torso'):
         torso = Torso(rig.data['torso'], rig.arms)
         torso.set_notes(*context['torso_rows'])
+        if context.get('torso_cap') is not None:        # the elbows solve's ask: the body leans less here
+            torso.set_cap(*context['torso_cap'])
     _ctx['torso'] = torso
     _ctx['capsules'] = {h: HandCapsules(rig, h, rig.arms[h].arm_inverse @ solvers[h].palm(rig.neutral_wrist[h], 0., 0.))
                         for h in 'LR'}
@@ -505,6 +508,8 @@ def _frames(times):
             vector, values, error = frame_hand(t, _ctx['paths'][h], tracks[h], notes, _ctx['waypoints'],
                                                _ctx['solvers'][h], _ctx['ik'][h], depths, previous[h])
             arm = rig.arms[h]
+            swing = _ctx.get('elbow_swing')
+            phi = np.interp(t, swing[h]['times'], swing[h]['angles']) if swing is not None and h in swing else None
             out[f'{h}_wrist'][i] = vector
             out[f'{h}_contact_error'][i] = error
             # The key goes down as far as its finger takes it: a stretched hand that cannot reach the keybed
@@ -521,7 +526,7 @@ def _frames(times):
                 j = pitches.index(p)
                 out['key_depth'][i, j] = min(out['key_depth'][i, j], max(reached, 0.))
             try:
-                pose = arm.pose(vector[:3], vector[3], vector[4], None if pre is None else pre[h])
+                pose = arm.pose(vector[:3], vector[3], vector[4], None if pre is None else pre[h], phi)
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
             except ValueError:          # wrist beyond the unstretched arm
                 # Never leave the arm's rotations at zero (Blender collapses such a bone and the arm vanishes):
@@ -1011,6 +1016,21 @@ def run(args):
             tracks[h][d].set_room(grid, np.concatenate([p[d] for p in mine]))
     stages['finger_keyposes'] = time.perf_counter() - t0
 
+    # 4.5 elbows: one smooth swing-angle curve per arm that keeps them out of the trunk's outline (elbows.solve,
+    # the trunk.json export beside the rig), the body leaning less where no swing clears; the frames stage
+    # interpolates the curve and hands the angle to arm.pose
+    t0 = time.perf_counter()
+    context['elbow_swing'], context['torso_cap'] = None, None
+    elbows_report = {}
+    if rig.data.get('torso') and context.get('torso_rows'):
+        trunk_model = elbows.load(RIG)
+        if trunk_model is not None:
+            torso = Torso(rig.data['torso'], rig.arms)
+            torso.set_notes(*context['torso_rows'])
+            context['elbow_swing'], elbows_report = elbows.solve(torso, paths, -intro, duration, rig, trunk_model)
+            context['torso_cap'] = torso.cap           # the yield the solve asked (the workers' torso reads it)
+    stages['elbows'] = time.perf_counter() - t0
+
     # 5. frames
     t0 = time.perf_counter()
     times = np.arange(-intro, duration, 1. / FRAME_RATE)
@@ -1072,7 +1092,8 @@ def run(args):
                     penetration_frames_over_1mm={h: int((frames[f'{h}_penetration'] > .001).sum()) for h in 'LR'},
                     penetration_frames_over_3mm={h: int((frames[f'{h}_penetration'] > .003).sum()) for h in 'LR'},
                     worst_penetration_mm={h: float(frames[f'{h}_penetration'].max() * 1000) for h in 'LR'},
-                    arm_out_of_reach_frames={h: int((~frames[f'{h}_arm_ok']).sum()) for h in 'LR'}),
+                    arm_out_of_reach_frames={h: int((~frames[f'{h}_arm_ok']).sum()) for h in 'LR'},
+                    elbow_swing=elbows_report),
         seconds=dict(stages, total=time.perf_counter() - started), workers=workers,
         music_seconds=duration - TAIL_SECONDS, intro_seconds=intro)
     plan = dict(schema='performer-plan', notes=final_rows, omitted_ids=sorted(n['id'] for n in source if n['id'] not in played),

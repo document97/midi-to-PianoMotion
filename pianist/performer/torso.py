@@ -118,6 +118,7 @@ class Torso:
         self.height = np.mean([m[2, 3] for m in self.reference.values()]) - self.pivot[2]
         self.rows = np.zeros((0, 3))
         self.reach = {h: np.zeros((0, 3)) for h in 'LR'}
+        self.cap = None               # (times, shares 0..1): how much of the lean the body keeps (elbows.py)
         self.slide_max = slide_max(data)
         self.first = self.last = 0.
         self.spine = [dict(bone=b['bone'], head=np.array(b['head'], float), pre_inverse=np.linalg.inv(np.array(b['pre'], float)),
@@ -139,6 +140,46 @@ class Torso:
         self.rows, self.first, self.last = np.asarray(rows, float).reshape(-1, 3), first, last
         for h, r in (reach or {}).items():
             self.reach[h] = np.asarray(r, float).reshape(-1, 3)
+
+    def set_cap(self, times, shares):
+        """How much of its lean the body keeps over time (elbows.py: the elbows out of the body, the body yields
+        before an elbow is raised): interpolated at ``pose``; None keeps the full lean."""
+        self.cap = (np.asarray(times, float), np.asarray(shares, float))
+
+    def _cap(self, t):
+        return 1. if self.cap is None else float(np.interp(t, self.cap[0], self.cap[1]))
+
+    def _lean(self, t, cap=1.):
+        """(side lean shift, turn, seat offset) at ``t``; ``cap`` (0..1) scales the lean: the body yields."""
+        rows, weights = self._window(self.rows, t)
+        shift = 0.
+        if len(rows):
+            shift = float(np.sum(rows[:, 1] * weights) / (.25 + np.sum(weights)))
+        slide = self.slide(t)
+        if shift * slide > 0:           # the slid seat takes its part of the reach; a seat still coming back adds no lean
+            shift = math.copysign(max(0., abs(shift) - abs(slide)), shift)
+        shift = float(np.clip(shift, -LEAN_SHIFT, LEAN_SHIFT) * self._smooth((t - self.first + .85) / .65)
+                      * (1 - self._smooth((t - self.last) / .7))) * cap
+        offset = np.array([slide, 0., 0.], dtype=FLOAT)
+        turn = -math.radians(TURN_DEGREES) * (slide / self.slide_max if self.slide_max else 0.)
+        return shift, turn, offset
+
+    def _shoulders(self, t, chain):
+        """({hand: shoulder pre-matrix}, {hand: collarbone local quaternion}) under the spine's ``chain``."""
+        pre, collar = {}, {}
+        for h, m in self.reference.items():
+            turn = np.eye(4, dtype=FLOAT)
+            s = self.shoulders.get(h)
+            if s is not None:       # the collarbone turns about its head so the shoulder joint moves by the offset
+                arm = m[:3, 3] - s['head']
+                moved = arm + self.protraction(h, t) * s['offset']
+                axis = np.cross(arm, moved)
+                if np.linalg.norm(axis) > 1e-12:
+                    turn[:3, :3] = axis_matrix(axis / np.linalg.norm(axis), math.atan2(np.linalg.norm(axis), arm @ moved))
+                    turn[:3, 3] = s['head'] - turn[:3, :3] @ s['head']
+                collar[h] = mat3_q(s['pre_inverse'] @ turn @ s['world'])
+            pre[h] = (chain @ turn @ m).astype(FLOAT)
+        return pre, collar
 
     def _window(self, rows, t):
         """The rows near ``t`` and their Gaussian time weights (the lean's)."""
@@ -187,16 +228,7 @@ class Torso:
     def pose(self, t):
         """({bone: local quaternion} of the spine and the neck, {hand: shoulder pre-matrix}, {hand: collarbone local
         quaternion}, the seat's slide along the bench as a world offset)."""
-        rows, weights = self._window(self.rows, t)
-        shift = 0.
-        if len(rows):
-            shift = float(np.sum(rows[:, 1] * weights) / (.25 + np.sum(weights)))
-        slide = self.slide(t)
-        if shift * slide > 0:           # the slid seat takes its part of the reach; a seat still coming back adds no lean
-            shift = math.copysign(max(0., abs(shift) - abs(slide)), shift)
-        shift = float(np.clip(shift, -LEAN_SHIFT, LEAN_SHIFT) * self._smooth((t - self.first + .85) / .65) * (1 - self._smooth((t - self.last) / .7)))
-        offset = np.array([slide, 0., 0.], dtype=FLOAT)
-        turn = -math.radians(TURN_DEGREES) * (slide / self.slide_max if self.slide_max else 0.)
+        shift, turn, offset = self._lean(t, self._cap(t))
         heads = [b['head'] for b in self.spine]
         chain = spine_transforms(shift, turn, heads, self.neck['head'], self.height, offset)
         spine_q, below = {}, np.eye(4)
@@ -212,17 +244,19 @@ class Torso:
         steady[:3, :3] = _half(lean_only, HEAD_STEADY).T
         n = self.neck
         spine_q[n['bone']] = mat3_q((n['pre_inverse'] @ np.linalg.inv(transform) @ steady @ transform @ n['world']).astype(FLOAT))
-        pre, collar = {}, {}
-        for h, m in self.reference.items():
-            turn = np.eye(4, dtype=FLOAT)
-            s = self.shoulders.get(h)
-            if s is not None:       # the collarbone turns about its head so the shoulder joint moves by the offset
-                arm = m[:3, 3] - s['head']
-                moved = arm + self.protraction(h, t) * s['offset']
-                axis = np.cross(arm, moved)
-                if np.linalg.norm(axis) > 1e-12:
-                    turn[:3, :3] = axis_matrix(axis / np.linalg.norm(axis), math.atan2(np.linalg.norm(axis), arm @ moved))
-                    turn[:3, 3] = s['head'] - turn[:3, :3] @ s['head']
-                collar[h] = mat3_q(s['pre_inverse'] @ turn @ s['world'])
-            pre[h] = (transform @ turn @ m).astype(FLOAT)
+        pre, collar = self._shoulders(t, transform)
         return spine_q, pre, collar, offset
+
+    def shoulder_world(self, h, t, cap=None):
+        """The hand's shoulder pre-matrix at ``t`` (pose's pre[h]) for a lean ``cap``: the elbow-swing search."""
+        shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
+        chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height, offset)
+        return self._shoulders(t, chain[-1])[0][h]
+
+    def trunk_world(self, t, cap=None):
+        """The trunk bone's world matrix at ``t`` for a lean ``cap``: the trunk outline hangs on it (elbows.py).
+        The lowest spine bone takes its share of the lean about the neutral pose (spine_transforms) on top of its
+        exported world matrix."""
+        shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
+        chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height, offset)
+        return (chain[0] @ self.spine[0]['world']).astype(FLOAT)

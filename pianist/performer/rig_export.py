@@ -18,6 +18,7 @@ import random
 import sys
 
 import bpy
+import numpy as np
 from mathutils import Matrix, Quaternion, Vector
 
 HERE = Path(__file__).resolve().parent
@@ -422,10 +423,56 @@ def seat_free_hands(cal):
     return hands, bones, world
 
 
+TRUNK_BONES = ('上半身', '上半身2', '上半身3')       # the skin the trunk outline (performer.elbows) covers
+ARM_BONES = {s: dict(upper=(s + '腕',) + tuple(s + '腕捩' + n for n in ('', '1', '2', '3')),
+                     fore=(s + 'ひじ',) + tuple(s + '手捩' + n for n in ('', '1', '2', '3')))
+             for s in '左右'}
+
+
+def trunk_data(arm, skin):
+    """The trunk outline the elbow-swing clearance reads (performer.elbows.Trunk): the skin whose dominant bone is
+    a trunk bone, in that bone's frame, and per arm the median skin radius about its upper arm / forearm segment,
+    at the neutral pose. None without the MMD bones the model reads."""
+    names = [g.name for g in skin.vertex_groups]
+    bones = set(arm.data.bones.keys())
+    if not all(('上半身' in bones, *(b in bones for s in '左右' for group in ARM_BONES[s].values() for b in group))):
+        return None
+    dominant = np.full(len(skin.data.vertices), '', dtype=object)
+    for v in skin.data.vertices:
+        groups = [g for g in v.groups if names[g.group] in bones and g.weight > 0]
+        if groups:
+            dominant[v.index] = names[max(groups, key=lambda g: g.weight).group]
+    evaluated = skin.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    mesh = evaluated.to_mesh()
+    co = np.empty(len(mesh.vertices) * 3)
+    mesh.vertices.foreach_get('co', co)
+    evaluated.to_mesh_clear()
+    world = np.array(skin.matrix_world)
+    co = co.reshape(-1, 3) @ world[:3, :3].T + world[:3, 3]
+    trunk_bone = arm.pose.bones['上半身']
+    trunk_m = np.array(arm.matrix_world @ trunk_bone.matrix)
+    local = (co[np.isin(dominant, TRUNK_BONES)] - trunk_m[:3, 3]) @ trunk_m[:3, :3]
+
+    def radius(a, b, mask):
+        p, d = co[mask], b - a
+        t = np.clip((p - a) @ d / (d @ d), 0, 1)
+        return float(np.median(np.linalg.norm(p - (a + t[:, None] * d), axis=1)))
+
+    heads = {s + n: np.array(arm.matrix_world @ arm.pose.bones[s + n].head) for s in '左右' for n in ('腕', 'ひじ', '手首')}
+    radii = {h: [radius(heads[s + '腕'], heads[s + 'ひじ'], np.isin(dominant, ARM_BONES[s]['upper'])),
+                 radius(heads[s + 'ひじ'], heads[s + '手首'], np.isin(dominant, ARM_BONES[s]['fore']))]
+             for s, h in (('左', 'L'), ('右', 'R'))}
+    return dict(schema='performer-trunk', bone='上半身', matrix=[list(map(float, row)) for row in trunk_m],
+                local=[[float(x) for x in p] for p in local], radius=radii)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True)
     parser.add_argument('--samples', type=int, default=12)
+    parser.add_argument('--trunk-only', action='store_true',
+                        help='write trunk.json beside --output only (an existing rig.json is not touched: the '
+                             'pair-table cache keys on it)')
     args = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
     cal_path = ROOT / 'hand_calibration.json'
     cal = json.loads(cal_path.read_text(encoding='utf-8'))
@@ -435,6 +482,14 @@ def main():
     hands = {h: export_hand(arm, skin, drivers[h], cal['hands'][h], coords, normals) for h in 'LR'}
     for h, point in lap(arm, skin).items():
         hands[h]['lap'] = point
+    out = Path(args.output)
+    trunk = trunk_data(arm, skin)
+    if trunk is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        (out.parent / 'trunk.json').write_text(json.dumps(trunk), encoding='utf-8')
+        print('TRUNK_EXPORTED', out.parent / 'trunk.json', len(trunk['local']), 'verts', flush=True)
+    if args.trunk_only:
+        return
     torso = None
     if body.bone is not None:
         torso = dict(bone=body.bone.name, pivot=vec(body.pivot), pre=mat(body.pre), world=mat(body.world),
@@ -459,7 +514,6 @@ def main():
                key_meshes=key_meshes(),
                key_depth_gain={p: k['local_z_world_gain'] for p, k in keyboard.items()})
     rig['validation'] = validation_poses(arm, skin, drivers, cal, hands, args.samples, 7)
-    out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rig), encoding='utf-8')
     print('RIG_EXPORTED', out, 'validation', len(rig['validation']), flush=True)
