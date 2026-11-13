@@ -50,9 +50,33 @@ SMOOTH_TAU = .3                  # s the constraint signals (bounds, natural han
 INTRUDE_OK = .001                # m of outline intrusion the smoothing may add at the bounds (about a noise unit)
 RISE_OK = .003                   # m of rise-cap slack the smoothing may add
                                  # (rad/s^3, rad/s^2, rad/s, rad off the natural hang)
-YIELD_STEPS = (.008, .016, .032, .064)   # m the wrist-deviation ask leans toward the hand, searched small first:
-                                 # the least lean that opens the hang (the tilt opens ~1 cm per cm of shift)
-YIELD_TAU = .12                  # s of gaussian on the ask: the lean is a body motion, it ramps at body speed
+YIELD_STEPS = (.016, .032, .064)   # m the wrist-deviation ask leans, searched small first (the least motion wins
+                                  # ties); the outline's response to the shift is a parabola whose good side
+                                  # moves along the arm, so both signs are tried
+YIELD_SLIDES = (.03, .05, .08, .11)   # m the ask slides the seat: the slide raises the palm-vs-forearm angle
+                                      # where the lean's tilt lowers it (+2 deg/cm against the lean's -1.4,
+                                      # measured), at the price of the seat's travel (both hands feel it)
+YIELD_TAU = .12                  # s of gaussian on the ask's lean: the lean is a body motion, it ramps at body speed
+YIELD_SLIDE_TAU = .4             # s of gaussian on the ask's slide: the seat ramps slower than the lean
+SWING_COST = .25                 # per deg^2 of swing growth a candidate's cost takes: the ask scores both hands, and
+                                 # a body move that heals one by shoving the other's elbow into a sweep is no heal
+                                 # (.25/deg^2 makes a 10 deg sweep growth cost as much as a 32 deg angle breach)
+SWING_ENV_DEG = 25               # deg of the necessary-swing study's envelope (p90 25 at touch level): a hand whose
+                                 # baseline swing stays inside it must stay inside it under the ask -- the body's
+                                 # yielding may not manufacture a sweep the outline never demanded
+SWING_ENV_MAX_DEG = 30           # deg the same hand's worst single sample may reach under the ask: the p90 above
+                                 # is the study's own measure, this bounds its tail (a 40 deg sweep was the wreck)
+MAX_HONEST = 12                  # (lean, slide) pairs per span tried by a real rescan: the per-sample forecast
+                                 # cannot see the arcs move under the curve, and the realized swing exceeds it
+RENDER_RATE = 60                 # Hz the honest scorer reads the rendered angles at: the frames stage
+                                 # interpolates the swing curve at the render's own rate (pipeline.FRAME_RATE),
+                                 # and the grid's .05 s samples miss the dips between them
+ASK_LOG = None                   # dev hook: a list to append the honest trials' (pair, cost, reject) rows to
+
+
+def _ask_log(**row):
+    if ASK_LOG is not None:
+        ASK_LOG.append(row)
 
 
 def hull2d(points):
@@ -375,98 +399,53 @@ def _cap_curve(required, n):
     return chunked(A, b, required, np.ones(n))
 
 
-def _ease(values, step):
-    """A gaussian over time (YIELD_TAU): the ask's lean is a body motion, it ramps at body speed."""
-    r = max(1, int(round(YIELD_TAU / step * 2.)))
+def _ease(values, step, tau=YIELD_TAU):
+    """A gaussian over time (``tau``): the ask's body motion ramps at body speed."""
+    r = max(1, int(round(tau / step * 2.)))
     x = np.arange(-r, r + 1) * step
-    w = np.exp(-.5 * (x / YIELD_TAU) ** 2)
+    w = np.exp(-.5 * (x / tau) ** 2)
     w /= w.sum()
     padded = np.concatenate([np.full(r, values[0]), values, np.full(r, values[-1])])
     return np.convolve(padded, w, mode='valid')
 
 
-def _wrist_ask(torso, data, grid, paths, rig, trunk, solvers):
-    """The wrist-deviation ask (torso.Torso.set_yield): the swing that keeps the elbow out of the outline rotates
-    the forearm away from the palm axis the plan settled (the corridor predicts with the natural hang) -- where
-    that drags the wrist's interior angle below the user's floor (posture.PALM_FLOOR_DEG), the body leans toward
-    the hand instead (the tilt opens the outline at the elbow, the reach eases with it) until the natural hang
-    itself clears. The lean is searched small first per sample (YIELD_STEPS: the least yield that opens it);
-    returns the per-sample signed shift (m, + right) combining the hands (one body tilt: the larger ask wins)."""
-    from . import posture
+def _rendered(torso, curve, times, path, h, arm, solver):
+    """The rendered palm-vs-forearm angle at ``times`` (deg): the curve's phi (hermite-interpolated, as the
+    frames stage does) swings the elbow while the path's own wrist and yaw/roll aim the palm -- motion
+    .frame_hand hands the path's 5 dims to arm.pose verbatim, so this is what the user sees. NaN where the
+    hand is beyond its arm."""
+    from .kinematics import q_mat3
     from .arm import closest_elbow
-    ask = np.zeros((2, len(grid)))
-    for i, h in enumerate('LR'):
-        d, arm, solver = data[h], rig.arms[h], solvers[h]
-        for k in range(len(grid)):
-            tgt, lo, hi = d['target'][k], d['lo'][k], d['hi'][k]
-            if not np.isfinite(tgt) or not np.isfinite(lo):
-                continue
-            realized = min(max(tgt, lo), hi)
-            if realized == tgt:     # the hang sits in the free arc: the rendered forearm is the hang's itself
-                continue
-            torso.clear_yield()     # the ask reads the body the plan settled (no yield yet)
-            t = float(grid[k])
-            try:
-                s = torso.shoulder_world(h, t)[:3, 3]
-                w = np.asarray(paths[h](t)[:3], float)
-                yaw, roll = posture.natural_orientation(solver, w, s)
-                e = closest_elbow(s, w, arm.l1, arm.l2, arm.side, angle=realized)
-                ang = posture.palm_forearm_deg(solver, w, yaw, roll, s, elbow=e)
-            except ValueError:
-                continue
-            if ang >= posture.PALM_FLOOR_DEG:
-                continue
-            sgn = 1. if w[0] >= s[0] else -1.       # toward the hand: the tilt that opens the outline there
-            got = sgn * YIELD_STEPS[-1]             # beyond the last step: the least bad there is
-            for m in YIELD_STEPS:
-                torso.set_yield(np.array([t - 1., t + 1.]), np.full(2, sgn * m))
-                try:
-                    s2 = torso.shoulder_world(h, t)[:3, 3]
-                    ang2, deep2, rise2 = trunk.swing(s2, w, arm.l1, arm.l2, arm.side, torso.trunk_world(t), i)
-                    kx = int(np.argmin(np.abs(TRUNK_ANG_DEG - _wrap_deg(tgt))))
-                    if deep2[kx] <= INTRUDE_OK:
-                        got = sgn * m
-                        break
-                except ValueError:
-                    continue
-            ask[i, k] = got
-    torso.clear_yield()
-    out = ask[0].copy()
-    take = np.abs(ask[1]) > np.abs(out)
-    out[take] = ask[1][take]
+    from .motion import pchip_slopes, hermite_eval
+    sl = pchip_slopes(curve['times'], curve['angles'][:, None])
+    out = np.full(len(times), np.nan)
+    for k, t in enumerate(times):
+        try:
+            v = np.asarray(path(float(t)), float)
+            s = torso.shoulder_world(h, float(t))[:3, 3]
+            phi = float(hermite_eval(curve['times'], curve['angles'][:, None], sl, float(t))[0])
+            e = closest_elbow(s, v[:3], arm.l1, arm.l2, arm.side, angle=phi)
+            f = v[:3] - e
+            pq = q_mat3(arm.palm_q(v[3], v[4])) @ np.array([0., 1., 0.])
+            out[k] = 180. - math.degrees(math.acos(np.clip(float(pq @ f) / np.linalg.norm(f), -1., 1.)))
+        except ValueError:
+            continue
     return out
 
 
-def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
-    """Both arms' swing curves over the piece (times t0..t1): ({hand: dict(times, angles)}, report). The torso's
-    cap is set on ``torso`` (the body yields where no swing clears), and where the forced swing would bend the
-    rendered wrist past the comfort floor the body leans toward the hand instead (the wrist-deviation ask,
-    torso.set_yield, ``solvers`` given); the scans then re-read the moved body. The frames stage interpolates
-    ``angles`` and hands them to arm.Arm.pose."""
+def _swing_of(data, curve):
+    """The realized swing per sample: the curve's phi off the natural hang (0 where the hand is beyond its arm)."""
+    tgt = np.asarray(data['target'], float)
+    phi = np.asarray(curve['angles'], float)
+    return np.where(np.isfinite(tgt), phi - tgt, 0.)
+
+
+def _build(data, paths, grid):
+    """The swing curves from one scan's bounds: the least-jerk phi inside them (solve's)."""
     from .motion import chunked
-    grid = np.arange(t0, t1 + CURVE_STEP * .5, CURVE_STEP)
     n = len(grid)
-    caps = np.ones(n)
-    data, curves, report = {}, {}, {}
-    asked = 0
-    for round_ in range(CAP_ROUNDS + 2):
-        torso.set_cap(grid, caps)       # the scans read the shared yield from the torso
-        required = np.ones(n)
-        for i, h in enumerate('LR'):
-            data[h] = _scan(torso, paths[h], grid, rig.arms[h], h, i, trunk, clearance)
-            required = np.minimum(required, data[h]['required'])
-        if solvers is not None and not asked:
-            ys = _wrist_ask(torso, data, grid, paths, rig, trunk, solvers)
-            if ys.any():
-                ys = _ease(ys, CURVE_STEP)
-                torso.set_yield(grid, ys)       # the ask rides on the cap rounds: the next scans read it
-                asked = int((ys != 0.).sum())
-                continue
-        if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
-            break
-        caps = _cap_curve(required, n)  # the yield smooths over spans; the next round re-checks both hands on it
-    ym = float(np.abs(torso.yield_rows[1]).max() * 1000.) if asked else 0.
-    for i, h in enumerate('LR'):
+    out = {}
+    for h in 'LR':
         d = data[h]
         if n >= 8:
             pts = np.array([np.asarray(paths[h](t)[:3], float) for t in grid])
@@ -476,12 +455,232 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
             phi = chunked(A, b, d['lo'], np.maximum(d['hi'], d['lo'] + 1e-12))
         else:
             phi = np.where(np.isfinite(d['target']), d['target'], 0.)
-        curves[h] = dict(times=grid, angles=phi)
-        off = np.abs(phi - d['target'])[np.isfinite(d['target'])]
+        out[h] = dict(times=grid, angles=phi)
+    return out
+
+
+def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, rescan):
+    """The wrist-deviation ask (torso.Torso.set_yield / set_slide_yield): where the swing keeping the elbow out
+    of the outline would bend the rendered wrist past the user's floor (posture.PALM_FLOOR_DEG) -- the path's
+    own yaw/roll are what the render stores (motion.frame_hand hands them to arm.pose verbatim, and across
+    holds they sag off the corridor's local optimum) -- the body leans and slides instead of the wrist bending
+    further. The search is per span, two passes: a cheap per-sample pass (greedy over a lean and a slide, both
+    signs, YIELD_STEPS / YIELD_SLIDES, forecast by the moved body's own free arc, the scan's criterion) narrows
+    the candidates; then each contiguous span takes ONE (lean, slide) pair -- one coherent body move, the arcs
+    follow at body speed -- scored by an HONEST rescan (one scan+curve round at the frozen cap, the rendered
+    angles and swings read off the rescanned curves, for the per-sample forecast cannot see the arcs move under
+    the curve). A pair is admissible only where it never takes a hand the baseline kept clear below the floor,
+    nor past the study's swing envelope (SWING_ENV_DEG) a hand whose baseline stayed inside it, and it must
+    beat doing nothing on the span's summed cost (square breach below the floor, plus SWING_COST per deg^2 of
+    swing growth). The least motion wins ties. Returns the per-sample raw (lean shift, slide offset), still
+    to be eased."""
+    from . import posture
+    from .arm import closest_elbow, closest_elbow_angle
+    n = len(grid)
+    floor = posture.PALM_FLOOR_DEG
+    ft = np.arange(float(grid[0]), float(grid[-1]) + 1. / RENDER_RATE * .5, 1. / RENDER_RATE)   # the render's axis
+    base_ang_g = {h: _rendered(torso, curves[h], grid, paths[h], h, rig.arms[h], solvers[h]) for h in 'LR'}
+    base_ang = {h: _rendered(torso, curves[h], ft, paths[h], h, rig.arms[h], solvers[h]) for h in 'LR'}
+    base_sw = {h: _swing_of(data[h], curves[h]) for h in 'LR'}
+    shield = {h: not (base_ang[h] < floor).any() for h in 'LR'}        # never breached: the ask keeps it so
+    env = {h: np.abs(base_sw[h]).max() <= math.radians(SWING_ENV_DEG) for h in 'LR'}
+    plan_slide = torso.slide
+    room = np.zeros(n)
+    for k in range(n):
+        t = float(grid[k])
+        here = float(plan_slide(t)) if callable(plan_slide) else float(plan_slide)
+        room[k] = max(0., torso.slide_max - abs(here)) if torso.slide_max else 0.
+    leans = [0.] + [sgn * m for m in YIELD_STEPS for sgn in (1., -1.)]
+    slides = [0.] + ([sgn * m for m in YIELD_SLIDES for sgn in (1., -1.)] if torso.slide_max else [])
+
+    def cheap(k, ln, sl):
+        """The per-sample forecast at one body move: (breach cost, swings) or None (not a candidate)."""
+        if abs(sl) > room[k]:
+            return None             # beyond the seat's travel from where the plan has it
+        t = float(grid[k])
+        torso.set_yield(np.array([t - 1., t + 1.]), np.full(2, ln))
+        torso.set_slide_yield(np.array([t - 1., t + 1.]), np.full(2, sl))
+        cost, swings = 0., []
+        for i, h in enumerate('LR'):
+            arm, solver = rig.arms[h], solvers[h]
+            try:
+                v = np.asarray(paths[h](t), float)
+                w = v[:3]
+                s2 = torso.shoulder_world(h, t)[:3, 3]
+                tgth = closest_elbow_angle(s2, w, arm.l1, arm.l2, arm.side)
+                angb, deep2, rise2 = trunk.swing(s2, w, arm.l1, arm.l2, arm.side, torso.trunk_world(t), i)
+                cap2 = float(rise2[int(np.argmin(np.abs(angb - tgth)))]) + RISE_LIMIT
+                free2 = (deep2 <= -clearance) & (rise2 <= cap2)
+                if not free2.any():
+                    free2 = (deep2 <= 0.) & (rise2 <= cap2)   # not running in is what there is
+                if not free2.any():
+                    return None          # this move leaves no swing at all: not a candidate
+                lo2, hi2 = _choose(_runs(free2, angb), tgth, None)
+                realized2 = min(max(tgth, lo2), hi2)
+                e2 = closest_elbow(s2, w, arm.l1, arm.l2, arm.side, angle=realized2)
+                a = posture.palm_forearm_deg(solver, w, v[3], v[4], s2, elbow=e2)
+            except ValueError:
+                return None              # a hand beyond its arm at this body: not a candidate
+            cost += max(0., floor - a) ** 2
+            swings.append(realized2 - tgth)
+        return cost, swings
+
+    def grown(g, k):
+        """The cheap forecast's full cost: the breach plus the swing growth past the baseline's."""
+        return g[0] + SWING_COST * sum(max(0., abs(sw) - abs(base_sw[h][k])) ** 2
+                                       for h, sw in zip('LR', g[1]))
+
+    picks = [None] * n
+    for k in range(n):
+        if not ((base_ang_g['L'][k] < floor) or (base_ang_g['R'][k] < floor)):
+            continue
+        base_cost = sum(max(0., floor - base_ang_g[h][k]) ** 2 for h in 'LR')
+        best = (0., 0., base_cost)
+        for ln in leans:                            # the lean alone
+            g = cheap(k, ln, 0.)
+            if g is not None and grown(g, k) < best[2] - 1e-9:
+                best = (ln, 0., grown(g, k))
+        for sl in slides:                           # the slide alone
+            g = cheap(k, 0., sl)
+            if g is not None and grown(g, k) < best[2] - 1e-9:
+                best = (0., sl, grown(g, k))
+        if best[0] and best[1]:                     # the pair the two alone found
+            g = cheap(k, best[0], best[1])
+            if g is not None and grown(g, k) < best[2] - 1e-9:
+                best = (best[0], best[1], grown(g, k))
+        if best[2] < base_cost - 1e-9 and (best[0] or best[1]):
+            picks[k] = (best[0], best[1])
+    torso.clear_yield()
+    torso.clear_slide_yield()
+
+    def honest(p, run):
+        """The pair's run-scoped cost by a real rescan, scored at the render's own frame rate (the grid's
+        .05 s samples miss the dips between them), or None where it breaks a guard."""
+        ln, sl = p
+        rows = np.zeros(n)
+        rows[run] = ln
+        srows = np.zeros(n)
+        srows[run] = sl
+        torso.set_yield(grid, _ease(rows, CURVE_STEP))
+        torso.set_slide_yield(grid, _ease(srows, CURVE_STEP, YIELD_SLIDE_TAU))
+        try:
+            cdata, ccurves, _ = rescan()
+            kf = (ft >= float(grid[run[0]]) - .5 / RENDER_RATE) & (ft <= float(grid[run[-1]]) + .5 / RENDER_RATE)
+            cost = 0.
+            ks = np.asarray(run)
+            for h in 'LR':
+                ang = _rendered(torso, ccurves[h], ft, paths[h], h, rig.arms[h], solvers[h])
+                sw = _swing_of(cdata[h], ccurves[h])
+                if shield[h] and ((ang[kf] < floor - 1e-9).any() or (ang[~kf] < floor - 1e-9).any()
+                                  or (np.isfinite(base_ang[h]) & ~np.isfinite(ang)).any()):
+                    _ask_log(pair=p, span=(run[0], run[-1]), hand=h, cost=None,
+                             why='breach', min_ang=round(float(np.nanmin(ang)), 1))
+                    return None         # a hand the baseline kept clear stays clear, tails included
+                if env[h] and (np.percentile(np.abs(sw[ks]), 90) > math.radians(SWING_ENV_DEG) + 1e-12
+                               or np.abs(sw[ks]).max() > math.radians(SWING_ENV_MAX_DEG) + 1e-12):
+                    _ask_log(pair=p, span=(run[0], run[-1]), hand=h, cost=None, why='envelope',
+                             max_swing=round(float(np.degrees(np.abs(sw[ks]).max())), 1),
+                             p90_swing=round(float(np.degrees(np.percentile(np.abs(sw[ks]), 90))), 1))
+                    return None         # a hand inside the study's envelope stays inside it
+                fin = np.isfinite(ang[kf])
+                cost += float(np.sum(np.maximum(0., floor - ang[kf][fin]) ** 2))
+                cost += SWING_COST * float(np.sum(np.maximum(0., np.abs(sw[ks]) - np.abs(base_sw[h][ks])) ** 2))
+            _ask_log(pair=p, span=(run[0], run[-1]), cost=round(cost, 1),
+                     breach_frames=int((ang[kf] < floor).sum()))
+            return cost
+        finally:
+            torso.clear_yield()
+            torso.clear_slide_yield()
+
+    ask = np.zeros(n)
+    sask = np.zeros(n)
+    trig = [k for k in range(n) if picks[k] is not None]
+    runs = []
+    for k in trig:                              # one span: a gap of a few samples is still one body move
+        if runs and k - runs[-1][-1] <= 4:
+            runs[-1].append(k)
+        else:
+            runs.append([k])
+    ladder = [(0., .05), (0., .08), (0., .11), (-.016, .05), (-.016, .08), (-.032, .05), (-.032, .08)]
+    for run in runs:
+        seen = []
+        for k in run:
+            if picks[k] not in seen:
+                seen.append(picks[k])
+        cands = seen + [p for p in ladder if p not in seen]
+        if len(cands) > MAX_HONEST:             # the cheap forecast only prunes a pathological pool
+            worst = sorted(run, key=lambda k: min(base_ang_g['L'][k], base_ang_g['R'][k]))[:3]
+            cands.sort(key=lambda p: sum(1e9 if (g := cheap(k, *p)) is None else grown(g, k) for k in worst))
+            cands = cands[:MAX_HONEST]
+        cands.sort(key=lambda p: abs(p[0]) + abs(p[1]))     # least motion first: it wins ties
+        kf = (ft >= float(grid[run[0]]) - .5 / RENDER_RATE) & (ft <= float(grid[run[-1]]) + .5 / RENDER_RATE)
+        base_span = float(sum(float(np.sum(np.maximum(0., floor - base_ang[h][kf][np.isfinite(base_ang[h][kf])]) ** 2))
+                              for h in 'LR'))
+        best_pair, best_cost = None, base_span
+        for p in cands:
+            c = honest(p, run)
+            if c is not None and c < best_cost - 1e-9:
+                best_cost, best_pair = c, p
+        if best_pair is not None:
+            _ask_log(chosen=best_pair, span=(run[0], run[-1]), base=round(base_span, 1), cost=round(best_cost, 1))
+            ask[run] = best_pair[0]
+            sask[run] = best_pair[1]
+    return ask, sask
+
+
+def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
+    """Both arms' swing curves over the piece (times t0..t1): ({hand: dict(times, angles)}, report). The torso's
+    cap is set on ``torso`` (the body yields where no swing clears), and where the forced swing would bend the
+    rendered wrist past the comfort floor the body leans and slides instead (the wrist-deviation ask,
+    torso.set_yield / set_slide_yield, ``solvers`` given); the scans then re-read the moved body. The ask is
+    searched against the settled ask-free solution (the honest baseline) and accepted only by a real rescan.
+    The frames stage interpolates ``angles`` and hands them to arm.Arm.pose."""
+    from .motion import chunked
+    grid = np.arange(t0, t1 + CURVE_STEP * .5, CURVE_STEP)
+    n = len(grid)
+    caps = np.ones(n)
+    data, curves, report = {}, {}, {}
+    asked = 0
+
+    def scan_build():
+        torso.set_cap(grid, caps)       # the scans read the shared cap from the torso
+        required = np.ones(n)
+        d = {}
+        for i, h in enumerate('LR'):
+            d[h] = _scan(torso, paths[h], grid, rig.arms[h], h, i, trunk, clearance)
+            required = np.minimum(required, d[h]['required'])
+        return d, _build(d, paths, grid), required
+
+    # 1. the ask-free solution settles the body-yield (the honest baseline the ask is searched against)
+    for round_ in range(CAP_ROUNDS + 2):
+        data, curves, required = scan_build()
+        if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
+            break
+        caps = _cap_curve(required, n)  # the cap smooths over spans; the next round re-checks both hands on it
+    if solvers is not None:
+        ys, ss = _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, scan_build)
+        if ys.any() or ss.any():
+            ys = _ease(ys, CURVE_STEP)
+            torso.set_yield(grid, ys)       # the ask rides on the re-check: the next scans read it
+            if ss.any():
+                torso.set_slide_yield(grid, _ease(ss, CURVE_STEP, YIELD_SLIDE_TAU))
+            asked = int(((ys != 0.) | (ss != 0.)).sum())
+            # 2. the cap re-checks on the moved body
+            for round_ in range(CAP_ROUNDS + 2):
+                data, curves, required = scan_build()
+                if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
+                    break
+                caps = _cap_curve(required, n)
+    ym = float(np.abs(torso.yield_rows[1]).max() * 1000.) if asked else 0.
+    sm = float(np.abs(torso.slide_yield_rows[1]).max() * 1000.) if asked and torso.slide_yield_rows is not None else 0.
+    for i, h in enumerate('LR'):
+        d = data[h]
+        off = np.abs(curves[h]['angles'] - d['target'])[np.isfinite(d['target'])]
         ex = np.degrees(np.maximum(off - d['necessary'][np.isfinite(d['target'])], 0.))
         report[h] = dict(samples=n, blocked=int((d['required'] < 1.).sum()), tight=int(d['tight'].sum()),
                          stretch=int(np.isnan(d['target']).sum()),
                          yield_min=round(float(caps.min()), 2), asked=asked, yield_max_mm=round(ym, 1),
+                         slide_max_mm=round(sm, 1),
                          swing_p95_deg=round(float(np.degrees(np.percentile(off, 95))), 1) if len(off) else 0.,
                          excess_p50_deg=round(float(np.percentile(ex, 50)), 1) if len(ex) else 0.,
                          excess_p95_deg=round(float(np.percentile(ex, 95)), 1) if len(ex) else 0.,

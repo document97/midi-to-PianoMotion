@@ -122,6 +122,8 @@ class Torso:
         self.cap_slopes = None
         self.yield_rows = None        # (times, shifts m): the elbows solve's wrist-deviation ask, a lean toward
         self.yield_slopes = None      # a hand whose natural hang the outline buries past the wrist's floor
+        self.slide_yield_rows = None  # ... and its seat part: a slide, which raises the palm angle where the
+        self.slide_yield_slopes = None  # lean's tilt lowers it (measured +2 deg/cm against the lean's -1.4)
         self.slide_max = slide_max(data)
         self.first = self.last = 0.
         self.spine = [dict(bone=b['bone'], head=np.array(b['head'], float), pre_inverse=np.linalg.inv(np.array(b['pre'], float)),
@@ -168,6 +170,26 @@ class Torso:
     def clear_yield(self):
         self.yield_rows = self.yield_slopes = None
 
+    def set_slide_yield(self, times, offsets):
+        """The ask's seat part: a slide (m, + the seat's own slide direction) over time -- the slide raises the
+        palm-vs-forearm angle where the lean's tilt lowers it (measured +2 deg/cm against the lean's -1.4), so
+        the two are searched jointly. Interpolated like the lean yield; None is no ask."""
+        self.slide_yield_rows = (np.asarray(times, float), np.asarray(offsets, float))
+        from .motion import pchip_slopes
+        self.slide_yield_slopes = pchip_slopes(self.slide_yield_rows[0], self.slide_yield_rows[1][:, None])
+
+    def clear_slide_yield(self):
+        self.slide_yield_rows = self.slide_yield_slopes = None
+
+    def _slide_yield(self, t):
+        if self.slide_yield_rows is None:
+            return 0.
+        from .motion import hermite_eval
+        v = float(hermite_eval(self.slide_yield_rows[0], self.slide_yield_rows[1][:, None],
+                               self.slide_yield_slopes, t)[0])
+        env = self._smooth((t - self.first + .85) / .65) * (1 - self._smooth((t - self.last) / .7))
+        return (float(np.clip(v, -self.slide_max, self.slide_max)) if self.slide_max else v) * env
+
     def _yield(self, t):
         if self.yield_rows is None:
             return 0.
@@ -182,7 +204,9 @@ class Torso:
         shift = 0.
         if len(rows):
             shift = float(np.sum(rows[:, 1] * weights) / (.25 + np.sum(weights)))
-        slide = self.slide(t)
+        slide = self.slide(t) + self._slide_yield(t)
+        if self.slide_max:              # the seat's travel: the plan's curve plus the ask's, clamped to it
+            slide = float(np.clip(slide, -self.slide_max, self.slide_max))
         if shift * slide > 0:           # the slid seat takes its part of the reach; a seat still coming back adds no lean
             shift = math.copysign(max(0., abs(shift) - abs(slide)), shift)
         shift = float(np.clip(shift, -LEAN_SHIFT, LEAN_SHIFT) * self._smooth((t - self.first + .85) / .65)

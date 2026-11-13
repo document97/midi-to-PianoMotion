@@ -86,6 +86,8 @@ def _init(context):
             torso.set_cap(*context['torso_cap'])
         if context.get('torso_yield') is not None:      # ... and leans toward a hand for the wrist's floor
             torso.set_yield(*context['torso_yield'])
+        if context.get('torso_slide_yield') is not None:    # ... and slides the seat where the lean's tilt
+            torso.set_slide_yield(*context['torso_slide_yield'])   # would lower the palm angle itself
     _ctx['torso'] = torso
     _ctx['capsules'] = {h: HandCapsules(rig, h, rig.arms[h].arm_inverse @ solvers[h].palm(rig.neutral_wrist[h], 0., 0.))
                         for h in 'LR'}
@@ -1031,6 +1033,7 @@ def run(args):
     # interpolates the curve and hands the angle to arm.pose
     t0 = time.perf_counter()
     context['elbow_swing'], context['torso_cap'], context['torso_yield'] = None, None, None
+    context['torso_slide_yield'] = None
     elbows_report = {}
     if rig.data.get('torso') and context.get('torso_rows'):
         trunk_model = elbows.load(RIG)
@@ -1043,6 +1046,7 @@ def run(args):
                                              for h, c in context['elbow_swing'].items()}
             context['torso_cap'] = torso.cap           # the yield the solve asked (the workers' torso reads it)
             context['torso_yield'] = torso.yield_rows  # the wrist-deviation ask (the workers' torso reads it)
+            context['torso_slide_yield'] = torso.slide_yield_rows   # the ask's seat part
     stages['elbows'] = time.perf_counter() - t0
 
     # 5. frames
