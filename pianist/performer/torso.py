@@ -119,6 +119,7 @@ class Torso:
         self.rows = np.zeros((0, 3))
         self.reach = {h: np.zeros((0, 3)) for h in 'LR'}
         self.cap = None               # (times, shares 0..1): how much of the lean the body keeps (elbows.py)
+        self.cap_slopes = None
         self.slide_max = slide_max(data)
         self.first = self.last = 0.
         self.spine = [dict(bone=b['bone'], head=np.array(b['head'], float), pre_inverse=np.linalg.inv(np.array(b['pre'], float)),
@@ -145,9 +146,14 @@ class Torso:
         """How much of its lean the body keeps over time (elbows.py: the elbows out of the body, the body yields
         before an elbow is raised): interpolated at ``pose``; None keeps the full lean."""
         self.cap = (np.asarray(times, float), np.asarray(shares, float))
+        from .motion import pchip_slopes
+        self.cap_slopes = pchip_slopes(self.cap[0], self.cap[1][:, None])
 
     def _cap(self, t):
-        return 1. if self.cap is None else float(np.interp(t, self.cap[0], self.cap[1]))
+        if self.cap is None:
+            return 1.
+        from .motion import hermite_eval
+        return float(hermite_eval(self.cap[0], self.cap[1][:, None], self.cap_slopes, t)[0])
 
     def _lean(self, t, cap=1.):
         """(side lean shift, turn, seat offset) at ``t``; ``cap`` (0..1) scales the lean: the body yields."""

@@ -171,6 +171,19 @@ def pchip_slopes(times, values):
     return slopes
 
 
+def hermite_eval(times, values, slopes, t):
+    """Cubic Hermite through (times, values) with ``slopes`` (pchip_slopes' output): dense sampling of a smooth
+    node curve without linear sampling's velocity kink at every node."""
+    if len(times) == 1:
+        return np.array(values[0], FLOAT)
+    i = int(np.clip(np.searchsorted(times, t, side='right') - 1, 0, len(times) - 2))
+    h = times[i + 1] - times[i]
+    s = min(max((t - times[i]) / h, 0.), 1.)
+    a, b = values[i], values[i + 1]
+    h00, h10, h01, h11 = 2 * s ** 3 - 3 * s ** 2 + 1, s ** 3 - 2 * s ** 2 + s, -2 * s ** 3 + 3 * s ** 2, s ** 3 - s ** 2
+    return h00 * a + h10 * h * slopes[i] + h01 * b + h11 * h * slopes[i + 1]
+
+
 class WristPath:
     """Wrist vector (x, y, z, yaw, roll) over time from knots (time, vector, arc of the following segment);
     an arc is a height, or (height, from, to): the rise only within those times of the segment."""
@@ -687,6 +700,7 @@ class Stroke:
     lift_height: float
     poses: tuple = None          # finger values at hover, touch, release, lift end (``finger_track``)
     clearance: tuple = None      # (times, value deltas) keeping the strike and lift over the other keys
+    clear_slopes: np.ndarray = None
 
     def base_values(self, t):
         """Strike and lift in joint space: accelerating into the key, springing off it."""
@@ -702,7 +716,9 @@ class Stroke:
         if self.clearance is None:
             return v
         times, deltas = self.clearance
-        return v + np.array([np.interp(t, times, deltas[:, k]) for k in range(4)], dtype=FLOAT)
+        if self.clear_slopes is None:
+            self.clear_slopes = pchip_slopes(times, deltas)
+        return v + hermite_eval(times, deltas, self.clear_slopes, t)
 
 
 def strokes(notes):

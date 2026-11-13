@@ -134,7 +134,11 @@ class Arm:
         upper = loc_rot_scale(shoulder, upper_q, self.scale['upper'])
         forearm = loc_rot_scale(elbow, elbow_q, self.scale['elbow'])
         twist_q = q_axis((0, 1, 0), roll)
-        palm = loc_rot_scale(wrist, self.palm_q(yaw, roll), self.scale['wrist'])
+        palm_q = self.palm_q(yaw, roll)
+        palm = loc_rot_scale(wrist, palm_q, self.scale['wrist'])
+        palm_axis = q_mat3(palm_q) @ np.array([0., 1., 0.], dtype=FLOAT)   # the palm bone's +Y: toward the fingers
+        palm_deg = 180. - math.degrees(math.acos(np.clip(float(palm_axis @ forearm_dir), -1., 1.)))
+        # the interior palm-vs-forearm angle (180 straight; the comfort line the user speaks in)
         twist4 = np.eye(4, dtype=FLOAT)
         twist4[:3, :3] = q_mat3(twist_q)
         wrist_pre = forearm @ self.elbow_twist_link @ twist4 @ self.twist_wrist_link
@@ -142,4 +146,5 @@ class Arm:
                  self.names['elbow']: mat3_q(np.linalg.inv(upper @ self.upper_elbow_link) @ forearm),
                  self.names['wrist']: mat3_q(np.linalg.inv(wrist_pre) @ palm),
                  self.names['twist']: twist_q}
-        return dict(world=palm, armature=self.arm_inverse @ palm, local=local, elbow=elbow, shoulder=shoulder, forearm=forearm)
+        return dict(world=palm, armature=self.arm_inverse @ palm, local=local, elbow=elbow, shoulder=shoulder,
+                    forearm=forearm, palm_forearm_deg=palm_deg)

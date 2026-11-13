@@ -38,7 +38,7 @@ from . import elbows
 from .contacts import HandCapsules, finger_pairs, hands_gap, pointing, raised_between
 from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contact_error, contact_waypoints, finger_track, frame_hand,
                      placed, refine_points, refine_score, strokes, waypoint, wrist_path, SIDEWAYS_FREE, YieldingPath,
-                     yield_offsets, _split, REFINE_FREE, REFINE_LATERAL, REFINE_TOLERANCE)
+                     yield_offsets, hermite_eval, pchip_slopes, _split, REFINE_FREE, REFINE_LATERAL, REFINE_TOLERANCE)
 from .kinematics import FLOAT
 from .pedal import PEDAL_LEAD, damper_depth, damper_intervals, pedal_union
 from .pose import RELAXED, hand_solvers
@@ -471,6 +471,7 @@ def _frames(times):
         out[f'{h}_child_euler'] = np.zeros((n, 5, 2, 3))
         out[f'{h}_arm_q'] = np.zeros((n, 4, 4))     # upper, elbow, wrist, twist
         out[f'{h}_arm_world'] = np.zeros((n, 2, 3))  # shoulder, elbow world (self-describing metrics)
+        out[f'{h}_palm_deg'] = np.zeros(n)           # palm long axis vs forearm axis (wrist-deviation comfort)
         out[f'{h}_contact_error'] = np.zeros(n)
         out[f'{h}_penetration'] = np.zeros(n)
         out[f'{h}_arm_ok'] = np.ones(n, dtype=bool)
@@ -510,7 +511,8 @@ def _frames(times):
                                                _ctx['solvers'][h], _ctx['ik'][h], depths, previous[h])
             arm = rig.arms[h]
             swing = _ctx.get('elbow_swing')
-            phi = np.interp(t, swing[h]['times'], swing[h]['angles']) if swing is not None and h in swing else None
+            phi = float(hermite_eval(swing[h]['times'], swing[h]['angles'][:, None],
+                                     _ctx['elbow_swing_slopes'][h], t)[0]) if swing is not None and h in swing else None
             out[f'{h}_wrist'][i] = vector
             out[f'{h}_contact_error'][i] = error
             # The key goes down as far as its finger takes it: a stretched hand that cannot reach the keybed
@@ -530,6 +532,7 @@ def _frames(times):
                 pose = arm.pose(vector[:3], vector[3], vector[4], None if pre is None else pre[h], phi)
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
                 out[f'{h}_arm_world'][i] = [pose['shoulder'], pose['elbow']]
+                out[f'{h}_palm_deg'][i] = pose['palm_forearm_deg']
             except ValueError:          # wrist beyond the unstretched arm
                 # Never leave the arm's rotations at zero (Blender collapses such a bone and the arm vanishes):
                 # stretch the arm toward the wrist instead; the hand stops just short of where it was sent.
@@ -541,6 +544,7 @@ def _frames(times):
                 pose = arm.pose(stretched, vector[3], vector[4], shoulder_pre)
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
                 out[f'{h}_arm_world'][i] = [pose['shoulder'], pose['elbow']]
+                out[f'{h}_palm_deg'][i] = pose['palm_forearm_deg']
             caps = _ctx['capsules'][h]
             segments[h] = caps.segments(values, pose['armature'])
             out[f'{h}_finger_overlap'][i] = finger_pairs(caps, segments[h])
@@ -685,11 +689,12 @@ def sideways(frames, notes, rate):
 
 def riding_sideways(frames):
     """Sideways swing of fingers 2..5 over every frame they ride their key (thumb excluded: it reaches by
-    technique): share above 10 and 15 deg, and at the joint limit. Removes the riding masks from ``frames``."""
+    technique): share above 10 and 15 deg, and at the joint limit. The masks stay in ``frames`` (saved for
+    quality_report's sustained-frame split)."""
     out = {}
     for h in 'LR':
-        riding = frames.pop(f'{h}_riding')
-        direction = np.abs(frames.pop(f'{h}_pointing'))
+        riding = frames[f'{h}_riding']
+        direction = np.abs(frames[f'{h}_pointing'])
         thumb = np.abs(frames[f'{h}_values'][:, 0, 0])[riding[:, 0]]
         swing = np.abs(frames[f'{h}_values'][:, 1:, 0])[riding[:, 1:]]
         limit = np.array([SWING_LATERAL.get(d, 25.) - 1. for d in (2, 3, 4, 5)])
@@ -1031,6 +1036,8 @@ def run(args):
             torso = Torso(rig.data['torso'], rig.arms)
             torso.set_notes(*context['torso_rows'])
             context['elbow_swing'], elbows_report = elbows.solve(torso, paths, -intro, duration, rig, trunk_model)
+            context['elbow_swing_slopes'] = {h: pchip_slopes(c['times'], c['angles'][:, None])
+                                             for h, c in context['elbow_swing'].items()}
             context['torso_cap'] = torso.cap           # the yield the solve asked (the workers' torso reads it)
     stages['elbows'] = time.perf_counter() - t0
 
