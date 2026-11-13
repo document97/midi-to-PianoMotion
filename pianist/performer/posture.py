@@ -18,6 +18,25 @@ HAND_FOLLOW = .3                # share of the forearm's inward angle the palm f
 # the hand's plan (fingering, poses, wrist path) is the same wherever the performer sits within reach, the arm
 # reaching to it from the actual seat.
 LITTLE_SIDE_DOWN = 6.           # deg: the little-finger side of the palm lower than the thumb side
+PALM_SOFT_DEG = 160.            # sustained comfort line (pianists keep ~10 deg of ulnar deviation; past 20 the
+# carpal tunnel loads): where the relaxed hand would sit below it, the palm follows the forearm further -- the
+# wrist unbends, the arm line, not the hand's bend, carries the reach
+PALM_FLOOR_DEG = 135.           # the user's transient acceptance floor: below it the body yields (torso.py), the
+# wrist never bends more; what is left after the palm's full follow is the body's share to cover
+
+
+def palm_forearm_deg(solver, wrist, yaw, roll, shoulder):
+    """The palm's long axis vs the forearm's, interior angle in degrees (180 straight): exactly what arm.pose
+    stores per frame ({h}_palm_deg), predicted here from the plan (the same palm_q and elbow geometry)."""
+    from .kinematics import q_mat3
+    arm = solver.arm
+    palm = q_mat3(arm.palm_q(yaw, roll)) @ np.array([0., 1., 0.], dtype=FLOAT)
+    try:
+        elbow = closest_elbow(shoulder, np.asarray(wrist, FLOAT), arm.l1, arm.l2, arm.side)
+    except ValueError:              # beyond the unstretched arm: the forearm is the wrist's own direction
+        return 180.
+    forearm = np.asarray(wrist, FLOAT) - elbow
+    return 180. - math.degrees(math.acos(np.clip(float(palm @ forearm) / max(np.linalg.norm(forearm), 1e-9), -1., 1.)))
 
 
 def _palm_angles(solver, yaw, roll):
@@ -60,4 +79,13 @@ def natural_orientation(solver, wrist, shoulder=None):
         forearm_yaw = 0.
     yaw = (HAND_FOLLOW * forearm_yaw - y0) / dy
     roll = (-LITTLE_SIDE_DOWN - t0) / dt
+    if abs(dy) > 1e-9:                  # the comfort corridor: where the relaxed hand would sit below the
+        now = palm_forearm_deg(solver, wrist, yaw, roll, shoulder)   # sustained line, the palm follows the
+        if now < PALM_SOFT_DEG:         # forearm further -- the wrist unbends (the arm line, not the hand's
+            full = (forearm_yaw - y0) / dy   # bend, carries the reach); never past the forearm itself
+            far = palm_forearm_deg(solver, wrist, full, roll, shoulder)
+            if far > now:
+                share = 1. if far <= PALM_SOFT_DEG else min(1., HAND_FOLLOW + (1. - HAND_FOLLOW) *
+                                                            (PALM_SOFT_DEG - now) / (far - now))
+                yaw = (share * forearm_yaw - y0) / dy
     return np.array([yaw, roll], dtype=FLOAT)
