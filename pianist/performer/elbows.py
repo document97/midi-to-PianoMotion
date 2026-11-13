@@ -186,11 +186,14 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance):
     (``required``, 1 where none is needed or helps). The arcs are read off a ladder: a ``clearance`` margin out of
     the outline where a swing reaches it, else any swing that only keeps the capsules from running in, and where
     even that is beyond every swing the body leans less (the elbow is never raised out of the trunk's height
-    range for this). A sample whose wrist is beyond the arm (the frames stage stretches it) has no bounds, no pull."""
+    range for this). A sample whose wrist is beyond the arm (the frames stage stretches it) has no bounds, no pull.
+    The scan also returns each sample's ``necessary`` swing (rad): how far the natural hang sits outside the sample's
+    free arc (0 where the hang is inside it, or where a pinned sample already takes its best possible point) -- the
+    excess-swing metric subtracts it from the curve's deviation, for free."""
     n = len(grid)
     lo, hi = np.empty(n), np.empty(n)
     target, required, deep = np.full(n, np.nan), np.ones(n), np.full(n, np.nan)
-    tight, prev = np.zeros(n, bool), None
+    necessary, tight, prev = np.zeros(n), np.zeros(n, bool), None
     for i, t in enumerate(grid):
         anchor = (.5 * (prev[0] + prev[1])) if prev is not None else 0.
         try:
@@ -216,6 +219,7 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance):
         if free.any():
             bound = _choose(_runs(free, ang), target[i], prev)
             lo[i], hi[i] = bound
+            necessary[i] = max(0., bound[0] - target[i], target[i] - bound[1])
             prev = bound
             continue
         # no swing keeps the capsules out of the outline: the body leans less until one does, the least yield
@@ -233,13 +237,14 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance):
                 required[i] = float(share)
                 bound = _choose(_runs(free, ang), target[i], prev)
                 lo[i], hi[i] = bound
+                necessary[i] = max(0., bound[0] - target[i], target[i] - bound[1])
                 prev = bound
                 break
         else:                           # no share opens an arc: the elbow takes the least deep swing there is
             best = float(ang[int(np.argmin(deep_i))])
             lo[i] = hi[i] = _near(best, anchor)
             prev = (lo[i], hi[i])
-    return dict(lo=lo, hi=hi, target=target, required=required, deep=deep, tight=tight)
+    return dict(lo=lo, hi=hi, target=target, required=required, deep=deep, necessary=necessary, tight=tight)
 
 
 def _cap_curve(required, n):
@@ -277,10 +282,14 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE):
             phi = np.where(np.isfinite(d['target']), d['target'], 0.)
         curves[h] = dict(times=grid, angles=phi)
         off = np.abs(phi - d['target'])[np.isfinite(d['target'])]
+        ex = np.degrees(np.maximum(off - d['necessary'][np.isfinite(d['target'])], 0.))
         report[h] = dict(samples=n, blocked=int((d['required'] < 1.).sum()), tight=int(d['tight'].sum()),
                          stretch=int(np.isnan(d['target']).sum()),
                          yield_min=round(float(caps.min()), 2),
                          swing_p95_deg=round(float(np.degrees(np.percentile(off, 95))), 1) if len(off) else 0.,
+                         excess_p50_deg=round(float(np.percentile(ex, 50)), 1) if len(ex) else 0.,
+                         excess_p95_deg=round(float(np.percentile(ex, 95)), 1) if len(ex) else 0.,
+                         excess_max_deg=round(float(ex.max()), 1) if len(ex) else 0.,
                          clear_p10_mm=round(float(np.nanpercentile(d['deep'], 10) * 1000), 1) if np.isfinite(d['deep']).any() else 0.)
     return curves, report
 

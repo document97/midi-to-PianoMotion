@@ -470,6 +470,7 @@ def _frames(times):
         out[f'{h}_root_q'] = np.zeros((n, 5, 4))
         out[f'{h}_child_euler'] = np.zeros((n, 5, 2, 3))
         out[f'{h}_arm_q'] = np.zeros((n, 4, 4))     # upper, elbow, wrist, twist
+        out[f'{h}_arm_world'] = np.zeros((n, 2, 3))  # shoulder, elbow world (self-describing metrics)
         out[f'{h}_contact_error'] = np.zeros(n)
         out[f'{h}_penetration'] = np.zeros(n)
         out[f'{h}_arm_ok'] = np.ones(n, dtype=bool)
@@ -528,6 +529,7 @@ def _frames(times):
             try:
                 pose = arm.pose(vector[:3], vector[3], vector[4], None if pre is None else pre[h], phi)
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
+                out[f'{h}_arm_world'][i] = [pose['shoulder'], pose['elbow']]
             except ValueError:          # wrist beyond the unstretched arm
                 # Never leave the arm's rotations at zero (Blender collapses such a bone and the arm vanishes):
                 # stretch the arm toward the wrist instead; the hand stops just short of where it was sent.
@@ -538,6 +540,7 @@ def _frames(times):
                 stretched = reach + aim * (ARM_STRETCH * (arm.l1 + arm.l2) / np.linalg.norm(aim))
                 pose = arm.pose(stretched, vector[3], vector[4], shoulder_pre)
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
+                out[f'{h}_arm_world'][i] = [pose['shoulder'], pose['elbow']]
             caps = _ctx['capsules'][h]
             segments[h] = caps.segments(values, pose['armature'])
             out[f'{h}_finger_overlap'][i] = finger_pairs(caps, segments[h])
