@@ -184,6 +184,49 @@ def hermite_eval(times, values, slopes, t):
     return h00 * a + h10 * h * slopes[i] + h01 * b + h11 * h * slopes[i + 1]
 
 
+WRIST_DAMP_TAU = .06             # s; yaw/roll only. A wrist path's knots are pchip (C1), so the attitude
+WRIST_DAMP_SUB = 8               # channels step their acceleration at every anchor (measured on dl35: yaw
+WRIST_DAMP_MAX = 40000           # p95 612, roll 341 deg/s^2, while x/y/z sit at 2-3). The corner reads as the
+
+
+def _gauss(x, step, tau):
+    """Zero-phase Gaussian of a uniform series; the ends are extrapolated linearly, not copied (copying
+    flat-lines a ramp)."""
+    r = max(1, int(round(tau / step * 2.)))
+    k = np.arange(-r, r + 1) * step
+    w = np.exp(-.5 * (k / tau) ** 2)
+    w /= w.sum()
+    pad = np.concatenate([x[0] + (x[0] - x[1]) * np.arange(r, 0, -1), x,
+                          x[-1] + (x[-1] - x[-2]) * np.arange(1, r + 1)])
+    return np.convolve(pad, w, mode='valid')
+
+
+def _dense_hermite(times, values, slopes, fine):
+    """hermite_eval over a whole grid at once."""
+    i = np.clip(np.searchsorted(times, fine, side='right') - 1, 0, len(times) - 2)
+    h = (times[i + 1] - times[i])[:, None]
+    s = np.clip(((fine - times[i]) / h[:, 0])[:, None], 0., 1.)
+    h00 = 2 * s ** 3 - 3 * s ** 2 + 1
+    h10 = s ** 3 - 2 * s ** 2 + s
+    h01 = -2 * s ** 3 + 3 * s ** 2
+    h11 = s ** 3 - s ** 2
+    return h00 * values[i] + h10 * h * slopes[i] + h01 * values[i + 1] + h11 * h * slopes[i + 1]
+
+
+def _attitude_table(times, values, slopes):
+    """(fine times, damped yaw/roll columns) or (None, None) when the path is too short to smooth. The
+    position columns are NOT touched: they keep the knots' own curve, resting segments included."""
+    if len(times) < 3 or len(times) > WRIST_DAMP_MAX:
+        return None, None
+    step = float(np.median(np.diff(times)))
+    fine = np.arange(times[0], times[-1] + step / WRIST_DAMP_SUB * .5, step / WRIST_DAMP_SUB)
+    if len(fine) < len(times) * 2:
+        return None, None
+    dense = _dense_hermite(times, values, slopes, fine)
+    h = step / WRIST_DAMP_SUB
+    return fine, np.stack([_gauss(dense[:, c], h, WRIST_DAMP_TAU) for c in (3, 4)], 1)
+
+
 class WristPath:
     """Wrist vector (x, y, z, yaw, roll) over time from knots (time, vector, arc of the following segment);
     an arc is a height, or (height, from, to): the rise only within those times of the segment."""
@@ -201,6 +244,7 @@ class WristPath:
         self.times, self.values, self.arcs = np.array(times, float), np.array(values, dtype=FLOAT), np.array(arcs, dtype=FLOAT)
         self.slopes = pchip_slopes(self.times, self.values) if len(times) > 1 else np.zeros_like(self.values)
         self.resting = np.all(np.abs(self.slopes) < 1e-12, axis=1)
+        self.att_times, self.att_values = _attitude_table(self.times, self.values, self.slopes)
         self.accents = np.zeros((0, 3))          # (start, onset, depth): the wrist sinks into loud chords
 
     def set_accents(self, notes):
@@ -245,6 +289,9 @@ class WristPath:
         if not np.isnan(lo):
             s = min(max((t - lo) / max(hi - lo, 1e-6), 0.), 1.)
         out[2] += arc * 16 * s * s * (1 - s) * (1 - s) - self.dip(t)
+        if self.att_times is not None:          # yaw/roll from their own damped table; x/y/z above untouched
+            out[3] = float(np.interp(t, self.att_times, self.att_values[:, 0]))
+            out[4] = float(np.interp(t, self.att_times, self.att_values[:, 1]))
         return out
 
 
