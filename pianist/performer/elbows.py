@@ -23,6 +23,7 @@ from .arm import closest_elbow_angle, elbow_circle
 SLICE = .01                      # m of outline per hull slice, along the trunk bone's y
 AXIS, OTHERS = 1, (0, 2)         # the slices run along the bone's y; each hull lies in its x-z
 ANGLE_STEP = 3.                  # deg between the sampled swing angles on the elbow's circle
+TRUNK_ANG_DEG = np.arange(-180., 180., ANGLE_STEP)      # the sampled circle, degrees (the verify's interp grid)
 UP = np.linspace(.36, 1., 8)     # the upper arm's capsule: shares of the shoulder->elbow segment. Not the deltoid:
                                  # its skin rides 6-7 cm off the bone (sleeve), no swing clears it -- that region is
                                  # the body-yield's to help, and demanding it here only drags the elbow into big swings
@@ -39,6 +40,12 @@ CAP_PULL = .12                   # the cap's pull to no yield: one unit of cost 
 JERK, ACC, VEL, PULL = 150., 25., 5., .3     # the swing curve's weights: one unit of cost at these
 TRACK_RATE = .25                 # m/s of wrist motion at which the curve's pull doubles: a hop is tracked in
                                  # step with the hand (a rigid chain, the elbow rides along), a hold is smoothed
+SMOOTH_TAU = .3                  # s the constraint signals (bounds, natural hang) are smoothed over where the
+                                 # wrist sits still: the body's own millimetre drift (a lean ramp) is amplified
+                                 # near tangency into visible elbow sweeps -- smoothed the elbow follows the body
+                                 # at body speed; where the wrist moves the signals are tracked exactly
+INTRUDE_OK = .001                # m of outline intrusion the smoothing may add at the bounds (about a noise unit)
+RISE_OK = .003                   # m of rise-cap slack the smoothing may add
                                  # (rad/s^3, rad/s^2, rad/s, rad off the natural hang)
 
 
@@ -203,38 +210,50 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance):
     range for this). A sample whose wrist is beyond the arm (the frames stage stretches it) has no bounds, no pull.
     The scan also returns each sample's ``necessary`` swing (rad): how far the natural hang sits outside the sample's
     free arc (0 where the hang is inside it, or where a pinned sample already takes its best possible point) -- the
-    excess-swing metric subtracts it from the curve's deviation, for free."""
+    excess-swing metric subtracts it from the curve's deviation, for free.
+    Where the wrist sits still the signals are smoothed (SMOOTH_TAU, shrinking to nothing where it moves): the
+    body's own millimetre drift -- a lean ramp engaging as a passage starts -- is amplified near tangency into
+    visible elbow sweeps that begin before the hand moves; smoothed, the elbow follows the body at body speed,
+    and every smoothed bound is verified against the sample's own depth and rise (INTRUDE_OK / RISE_OK slack)."""
     n = len(grid)
     lo, hi = np.empty(n), np.empty(n)
     target, required, deep = np.full(n, np.nan), np.ones(n), np.full(n, np.nan)
     necessary, tight, prev = np.zeros(n), np.zeros(n, bool), None
+    ws = np.full((n, 3), np.nan)        # the wrist per sample (the smoothing scales with its speed)
+    fine = np.zeros(n, bool)            # the sample has real bounds (not stretched, not wholly free)
+    depths = np.full((n, len(TRUNK_ANG_DEG)), np.nan)   # the capsule depth along the circle (the verify)
+    rises = np.full((n, len(TRUNK_ANG_DEG)), np.nan)    # ... and the elbow's rise
+    rise_caps = np.full(n, np.nan)
     for i, t in enumerate(grid):
         anchor = (.5 * (prev[0] + prev[1])) if prev is not None else 0.
         try:
             s = torso.shoulder_world(label, t)[:3, 3]
             w = np.asarray(path(t)[:3], float)
             m = torso.trunk_world(t)
+            ws[i] = w
             target[i] = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
             ang, deep_i, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, m, hand)
-            rise_cap = float(rise[int(np.argmin(np.abs(ang - target[i])))]) + RISE_LIMIT
+            depths[i], rises[i] = deep_i, rise
+            rise_caps[i] = float(rise[int(np.argmin(np.abs(ang - target[i])))]) + RISE_LIMIT
         except ValueError:              # the wrist beyond the unstretched arm at this lean: the frames stage
             lo[i], hi[i] = anchor, anchor   # stretches it (angle unused there); the curve carries on unchanged
             prev = None
             continue
         deep[i] = float(deep_i.min())
-        free = (deep_i <= -clearance) & (rise <= rise_cap)
+        free = (deep_i <= -clearance) & (rise <= rise_caps[i])
         if free.all():                  # the whole circle is free (the arm far out): no bound at all
             lo[i], hi[i] = -np.inf, np.inf
             prev = None
             continue
         if not free.any():
-            free = (deep_i <= 0.) & (rise <= rise_cap)      # the margin is beyond this pose: not running in is what there is
+            free = (deep_i <= 0.) & (rise <= rise_caps[i])      # the margin is beyond this pose: not running in is what there is
             tight[i] = free.any()
         if free.any():
             bound = _choose(_runs(free, ang), target[i], prev)
             lo[i], hi[i] = bound
             necessary[i] = max(0., bound[0] - target[i], target[i] - bound[1])
             prev = bound
+            fine[i] = True
             continue
         # no swing keeps the capsules out of the outline: the body leans less until one does, the least yield
         now = torso._cap(t)
@@ -246,19 +265,100 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance):
                 ang, deep2, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, m, hand)
             except ValueError:
                 continue
-            free = (deep2 <= 0.) & (rise <= rise_cap)
+            free = (deep2 <= 0.) & (rise <= rise_caps[i])
             if free.any():
                 required[i] = float(share)
                 bound = _choose(_runs(free, ang), target[i], prev)
                 lo[i], hi[i] = bound
                 necessary[i] = max(0., bound[0] - target[i], target[i] - bound[1])
+                depths[i], rises[i] = deep2, rise
                 prev = bound
+                fine[i] = True
                 break
         else:                           # no share opens an arc: the elbow takes the least deep swing there is
             best = float(ang[int(np.argmin(deep_i))])
             lo[i] = hi[i] = _near(best, anchor)
+            depths[i], rises[i] = deep_i, rise
             prev = (lo[i], hi[i])
-    return dict(lo=lo, hi=hi, target=target, required=required, deep=deep, necessary=necessary, tight=tight)
+            fine[i] = True
+    _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance)
+    for i in range(n):                  # the necessary swing of the (possibly smoothed) constraint
+        if np.isfinite(target[i]) and np.isfinite(lo[i]) and np.isfinite(hi[i]):
+            necessary[i] = max(0., lo[i] - target[i], target[i] - hi[i])
+    return dict(lo=lo, hi=hi, target=target, required=required, deep=deep, necessary=necessary, tight=tight,
+                depths=depths, rises=rises, rise_caps=rise_caps)
+
+
+def _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance):
+    """Smooth the scan's constraint signals along the grid where the wrist sits still (the width shrinks to
+    nothing with its speed; segments split where the signals restart). Each smoothed bound is verified against
+    the sample's own depth and rise so the smoothing breaks the clearance no more than the slack."""
+    n = len(grid)
+    d = np.linalg.norm(np.diff(ws, axis=0), axis=1) / CURVE_STEP        # (n-1,) wrist speed, nan at gaps
+    spd = np.full(n, np.inf)
+    if n > 1:
+        spd[0], spd[-1] = d[0], d[-1]
+        spd[1:-1] = np.fmax(d[:-1], d[1:])      # either neighbour moving counts as moving
+    tau = np.where(np.isfinite(spd), SMOOTH_TAU / (1. + spd / TRACK_RATE), SMOOTH_TAU)
+    barrier = ~fine | ~np.isfinite(lo) | ~np.isfinite(hi) | ~np.isfinite(target)
+    seg = np.zeros(n, int)
+    seg[barrier] = -1
+    for i in range(1, n):
+        if seg[i] >= 0:
+            seg[i] = seg[i - 1] + (1 if barrier[i - 1] else 0)
+    W = int(np.ceil(SMOOTH_TAU / CURVE_STEP)) + 1
+    for k, values in enumerate((lo, hi, target)):
+        bounds = k < 2
+        true = np.array(values, float)  # the unsmoothed constraint (the verify's reference)
+        out = np.array(values, float)
+        for i in range(n):
+            if seg[i] < 0 or (bounds and not fine[i]) or not np.isfinite(values[i]):
+                continue
+            j0, j1 = max(0, i - W), min(n, i + W + 1)
+            sl = slice(j0, j1)
+            near = seg[sl] == seg[i]
+            near &= fine[sl] if bounds else np.isfinite(true[sl])
+            if not near[i - j0]:
+                near[i - j0] = True
+            wgt = np.exp(-.5 * ((grid[sl] - grid[i]) / tau[i]) ** 2) * near
+            out[i] = float(np.sum(true[sl][near] * wgt[near]) / np.sum(wgt))
+        if bounds:
+            for i in range(n):          # verify each smoothed bound against the sample's own depth and rise
+                if seg[i] < 0 or not fine[i] or out[i] == true[i]:
+                    continue
+                out[i] = _verified(out[i], true[i], depths[i], rises[i], rise_caps[i], clearance)
+        values[:] = out
+
+
+def _verified(smooth, true, depth, rise, rise_cap, clearance):
+    """``smooth`` pulled back toward ``true`` until it breaks the sample's clearance no more than ``true`` plus
+    the slack: near tangency the true edge is the deepest legal point, off it the geometry is shallow."""
+    if not np.isfinite(depth).all() or not np.isfinite(rise).all() or not np.isfinite(rise_cap):
+        return smooth
+    xs = np.r_[TRUNK_ANG_DEG, 180.]     # the circle's sample grid closed up (the seam reads the first sample)
+    depth, rise = np.r_[depth, depth[0]], np.r_[rise, rise[0]]
+    span = true - smooth
+    lim_d = float(np.interp(_wrap_deg(true), xs, depth)) + INTRUDE_OK
+    lim_r = min(float(np.interp(_wrap_deg(true), xs, rise)) + RISE_OK, rise_cap)
+
+    def breaks(a):
+        return (float(np.interp(_wrap_deg(a), xs, depth)) > lim_d or
+                float(np.interp(_wrap_deg(a), xs, rise)) > lim_r)
+    if not breaks(smooth):
+        return smooth
+    a, b = 0., 1.                       # smooth + (true - smooth) * s: s = 1 is the true bound (legal by construction)
+    for _ in range(8):
+        m = (a + b) / 2
+        if breaks(smooth + span * m):
+            a = m
+        else:
+            b = m
+    return smooth + span * b
+
+
+def _wrap_deg(angle):
+    """An unwrapped angle (rad) into the trunk sample grid's range, degrees in [-180, 180)."""
+    return -180. + ((math.degrees(angle) + 180.) % 360.)
 
 
 def _cap_curve(required, n):
