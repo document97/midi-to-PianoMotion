@@ -645,25 +645,41 @@ def bounded_lsq(A, b, lo, hi, iterations=None):
     return lsq_linear(A, b, bounds=(lo, np.maximum(hi, lo + 1e-12)), method='bvls').x
 
 
-def chunked(A, b, lo, hi):
+def chunked(A, b, lo, hi, x0=None, dirty=None):
     """Bounded least squares, exactly (bounded_lsq; bvls stopped on its cost tolerance far from the optimum in some
     windows) over overlapping windows of samples; the first three samples of a window are fixed to the previous
-    window's solution (position, speed, acceleration carry over)."""
+    window's solution (position, speed, acceleration carry over). ``x0`` (an earlier solution) with ``dirty`` (the
+    sample span whose bounds moved since) answers the same problem again: the windows that end before the span keep
+    their samples, and past it the solve stops as soon as a window's solved start reproduces ``x0``'s -- from there
+    on the problem is the one ``x0`` already solved, window for window."""
     A = A.tocsr()
+    A.sort_indices()                    # the row's own first and last column: the row's span
     n = A.shape[1]
-    first = np.array([A.indices[A.indptr[r]:A.indptr[r + 1]].min() if A.indptr[r + 1] > A.indptr[r] else 0 for r in range(A.shape[0])])
-    last = np.array([A.indices[A.indptr[r]:A.indptr[r + 1]].max() if A.indptr[r + 1] > A.indptr[r] else 0 for r in range(A.shape[0])])
+    first = np.zeros(A.shape[0], int)
+    last = np.zeros(A.shape[0], int)
+    nz = np.diff(A.indptr) > 0
+    if nz.any():
+        first[nz] = A.indices[A.indptr[:-1][nz]]
+        last[nz] = A.indices[A.indptr[1:][nz] - 1]
     size, keep = int(CHUNK_SECONDS / PATH_STEP), int(CHUNK_KEEP / PATH_STEP)
-    x = np.zeros(n)
+    x = np.zeros(n) if x0 is None else np.array(x0, float)
+    warm = x0 is not None and dirty is not None
     i0 = 0
     while True:
         i1 = min(n, i0 + size)
+        stop = i1 >= n
+        if warm and i1 < dirty[0]:          # before the change: the window's kept samples are x0's own
+            if stop:
+                return x
+            i0 += keep - 3 if keep > 3 else keep
+            continue
         rows = np.nonzero((first >= i0) & (last < i1))[0]
         lo_w, hi_w = lo[i0:i1].copy(), hi[i0:i1].copy()
         if i0 > 0:
             lo_w[:3] = hi_w[:3] = x[i0:i0 + 3]
         sol = bounded_lsq(A[rows][:, i0:i1].toarray(), b[rows], lo_w, np.maximum(hi_w, lo_w + 1e-12))
-        stop = i1 >= n
+        if warm and not stop and i0 > dirty[1] and np.abs(sol[:3] - x[i0:i0 + 3]).max() < 1e-9:
+            return x                    # the carry-over is the earlier answer's: the rest is that answer too
         x[i0:i1 if stop else i0 + keep] = sol[:(i1 - i0) if stop else keep]
         if stop:
             return x

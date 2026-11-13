@@ -786,6 +786,15 @@ def chunks(times, count):
     return [c for c in np.array_split(times, count) if len(c)]
 
 
+def _mark(name, t0, stages):
+    """The stage's wall clock, recorded and printed as it ends: a long run says where it spent the time, and a run
+    that dies mid-piece still says what it finished before that."""
+    dt = time.perf_counter() - t0
+    stages[name] = dt
+    print(f'[stage] {name} {dt:.1f}s', flush=True)
+    return dt
+
+
 def run(args):
     started = time.perf_counter()
     stages = {}
@@ -795,7 +804,7 @@ def run(args):
 
     t0 = time.perf_counter()
     table, _ = load_or_compute(RIG, workers)
-    stages['rig_pair_table'] = time.perf_counter() - t0
+    _mark('rig_pair_table', t0, stages)
 
     # 1. note planning on the rig's own feasibility
     t0 = time.perf_counter()
@@ -819,6 +828,7 @@ def run(args):
         print(f'[planning] round {shape_round + 1}', flush=True)
         penalty = {k: AWKWARD_COST * (u - AWKWARD_FREE) for k, u in shapes.items() if u > AWKWARD_FREE}
         planned = plan_parallel(build, (inputs, args.end), dict(planner_kwargs, shape_penalty=penalty), workers=workers)
+        print(f'[stage] plan_round {shape_round + 1} {time.perf_counter() - t0:.1f}s', flush=True)
         planner, score = planned['planner'], planned['planner'].score
         rows = plan_notes(planned['state'], score)
         problems = validate(rows, score, raw['keyboard'], raw['envelopes'], raw['radii'], planner.w.hard_speed)
@@ -884,7 +894,7 @@ def run(args):
                 if pose is not None:
                     a.pose = pose
                     turned.add(id(a))
-    stages['coherence'] = time.perf_counter() - t0
+    _mark('coherence', t0, stages)
 
     # 3. wrist paths, refined until the held keys stay under the fingers
     t0 = time.perf_counter()
@@ -992,7 +1002,7 @@ def run(args):
     offsets = yield_offsets(paths, notes, duration, HANDS_APART, YIELD_SPEED, YIELD_BUSY)
     yielded = {h: round(float(np.abs(offsets[h][1]).max()) * 1000, 1) for h in 'LR'}
     paths = {h: YieldingPath(paths[h], *offsets[h]) for h in 'LR'}
-    stages['wrist_paths'] = time.perf_counter() - t0
+    _mark('wrist_paths', t0, stages)
 
 
     # 4. torso, finger keyposes
@@ -1026,7 +1036,7 @@ def run(args):
         mine = [p for (hh, _), p in zip(jobs, parts) if hh == h]
         for d in DIGITS:
             tracks[h][d].set_room(grid, np.concatenate([p[d] for p in mine]))
-    stages['finger_keyposes'] = time.perf_counter() - t0
+    _mark('finger_keyposes', t0, stages)
 
     # 4.5 elbows: one smooth swing-angle curve per arm that keeps them out of the trunk's outline (elbows.solve,
     # the trunk.json export beside the rig), the body leaning less where no swing clears; the frames stage
@@ -1040,6 +1050,13 @@ def run(args):
         if trunk_model is not None:
             torso = Torso(rig.data['torso'], rig.arms)
             torso.set_notes(*context['torso_rows'])
+            dump = os.environ.get('PIANOMOTION_ELBOW_DUMP')   # dev hook: the elbow solve's own inputs, for the bench
+            if dump:
+                import pickle
+                with open(dump, 'wb') as fh:
+                    pickle.dump(dict(paths=paths, torso=torso, rig=rig, trunk=trunk_model, t0=-intro, t1=duration),
+                                fh, protocol=4)
+                print(f'[elbows] dumped {dump}', flush=True)
             context['elbow_swing'], elbows_report = elbows.solve(torso, paths, -intro, duration, rig, trunk_model,
                                                                  solvers=performer_solvers(rig))
             context['elbow_swing_slopes'] = {h: pchip_slopes(c['times'], c['angles'][:, None])
@@ -1047,7 +1064,7 @@ def run(args):
             context['torso_cap'] = torso.cap           # the yield the solve asked (the workers' torso reads it)
             context['torso_yield'] = torso.yield_rows  # the wrist-deviation ask (the workers' torso reads it)
             context['torso_slide_yield'] = torso.slide_yield_rows   # the ask's seat part
-    stages['elbows'] = time.perf_counter() - t0
+    _mark('elbows', t0, stages)
 
     # 5. frames
     t0 = time.perf_counter()
@@ -1067,7 +1084,7 @@ def run(args):
     crossed = crossings(frames, FRAME_RATE)
     ride_swing = riding_sideways(frames)
     bodies = finger_bodies(frames, FRAME_RATE)
-    stages['frames'] = time.perf_counter() - t0
+    _mark('frames', t0, stages)
 
     # 6. outputs
     # a key lifted early is held by an extra pedal to its sound's end, or to the score's next pedal-up (which clears it)

@@ -18,16 +18,20 @@ curve and hands the angle to arm.Arm.pose.
 import hashlib
 import json
 import math
+import os
+import time
 from pathlib import Path
 
 import numpy as np
 
+from . import elbows_fast
 from .arm import closest_elbow_angle, elbow_circle
 
 SLICE = .01                      # m of outline per hull slice, along the trunk bone's y
 AXIS, OTHERS = 1, (0, 2)         # the slices run along the bone's y; each hull lies in its x-z
 ANGLE_STEP = 3.                  # deg between the sampled swing angles on the elbow's circle
 TRUNK_ANG_DEG = np.arange(-180., 180., ANGLE_STEP)      # the sampled circle, degrees (the verify's interp grid)
+TRUNK_ANG = np.radians(TRUNK_ANG_DEG)                   # ... and radians (the scan's, once instead of per sample)
 UP = np.linspace(.36, 1., 8)     # the upper arm's capsule: shares of the shoulder->elbow segment. Not the deltoid:
                                  # its skin rides 6-7 cm off the bone (sleeve), no swing clears it -- that region is
                                  # the body-yield's to help, and demanding it here only drags the elbow into big swings
@@ -84,6 +88,24 @@ RENDER_RATE = 60                 # Hz the honest scorer reads the rendered angle
                                  # and the grid's .05 s samples miss the dips between them
 ASK_LOG = None                   # dev hook: a list to append the honest trials' (pair, cost, reject) rows to
 
+# Where the scan's time goes, for the full-piece runs (PIANOMOTION_ELBOW_PROFILE=1): a scan is two hands of hull
+# tests, a build is one least-squares over the piece, and the wrist ask runs a full scan+build per candidate pair
+# per run -- the counts say which of the two the piece is paying for.
+PROFILE = os.environ.get('PIANOMOTION_ELBOW_PROFILE') == '1'
+_prof = {}
+
+
+def _tick(key, dt=0.):
+    if PROFILE:
+        hit = _prof.get(key)
+        _prof[key] = [hit[0] + 1, hit[1] + dt] if hit else [1, dt]
+
+
+def _profile_line():
+    if not (PROFILE and _prof):
+        return None
+    return 'ELBOW_PROFILE ' + json.dumps({k: dict(calls=v[0], seconds=round(v[1], 2)) for k, v in sorted(_prof.items())})
+
 
 def _ask_log(**row):
     if ASK_LOG is not None:
@@ -114,6 +136,8 @@ class Trunk:
         local = np.asarray(local, float)
         self.radius = np.asarray(radius, float).reshape(2, 2)       # per hand (upper arm, forearm)
         self.lo = float(local[:, AXIS].min())
+        self.step = SLICE
+        self._fast = None                                           # the compiled kernel's arrays, built on first use
         buckets = {}
         for k in range(int((local[:, AXIS].max() - self.lo) / SLICE) + 1):
             s = local[(local[:, AXIS] >= self.lo + k * SLICE) & (local[:, AXIS] < self.lo + (k + 1) * SLICE)][:, OTHERS]
@@ -142,6 +166,14 @@ class Trunk:
     def from_json(cls, path):
         return cls.from_dict(json.loads(Path(path).read_text(encoding='utf-8')))
 
+    def _packed(self):
+        """The kernel's copies of the hull tables, built once (None without numba: the numpy path runs)."""
+        hit = self._fast
+        if hit is None:
+            hit = elbows_fast.pack(self) if elbows_fast.available() else False
+            self._fast = hit
+        return hit or None
+
     def depth(self, points, matrix):
         """Signed depth (m) of world ``points`` in the outline, ``matrix`` the trunk bone's world matrix: -1 off
         the outline's height range; a point between hulled slices reads the nearer slice's hull (a slice the
@@ -161,7 +193,17 @@ class Trunk:
 
     def swing(self, shoulder, wrist, l1, l2, side, matrix, hand):
         """The arm's capsules' depth per swing angle (shoulder and wrist kept): (angles, depth, the elbow's rise
-        above the wrist). The free arcs are read off these by the caller (a clearance margin, or touching at all)."""
+        above the wrist). The free arcs are read off these by the caller (a clearance margin, or touching at all).
+        One sample: the compiled kernel takes it as a block of one (elbows_fast), the numpy body below is the
+        fallback where numba is missing and the reference the kernel is checked against."""
+        packed = self._packed()
+        if packed is not None:
+            m = np.asarray(matrix, float)
+            depth, rise, ok = self.swing_block(np.asarray(shoulder, float)[None], np.asarray(wrist, float)[None],
+                                               m[None, :3, :3], m[None, :3, 3], l1, l2, side, hand)
+            if not ok[0]:
+                raise ValueError('Arm target outside unstretched reach')
+            return TRUNK_ANG, depth[0], rise[0]
         center, radius, t, q = elbow_circle(shoulder, wrist, l1, l2, side)
         ang = np.radians(np.arange(-180., 180., ANGLE_STEP))
         e = center + radius * (np.cos(ang)[:, None] * t + np.sin(ang)[:, None] * q)
@@ -173,6 +215,16 @@ class Trunk:
         d_up = self.depth(up, matrix).reshape(len(UP), -1).max(0) + r_up
         d_fo = self.depth(fo, matrix).reshape(len(FO), -1).max(0) + r_fo
         return ang, np.maximum(d_up, d_fo), e[:, 2] - w[2]
+
+    def swing_block(self, S, W, R, O, l1, l2, side, hand):
+        """``swing`` for a whole scan at once: (depth, rise, ok), each (n, angles) / (n,) -- the compiled kernel,
+        one sample per thread. ``S``/``W`` the shoulders and wrists (n, 3), ``R``/``O`` the trunk matrices'
+        rotation and origin (n, 3, 3) / (n, 3). ``ok`` is False where the wrist is beyond the unstretched arm
+        (swing raises there; a scan wants the whole grid's answer and its own way of handling the stretched
+        sample -- the frames stage stretches it and the angle is unused)."""
+        r_up, r_fo = self.radius[hand]
+        return elbows_fast.swing_block(self._packed(), S, W, R, O, l1, l2, side, r_up, r_fo,
+                                       np.cos(TRUNK_ANG), np.sin(TRUNK_ANG), UP, FO)
 
 
 def _runs(free, ang):
@@ -245,7 +297,37 @@ def _rows(n, step, jerk, acc, vel, pull, target):
     return A, b
 
 
-def _scan(torso, path, grid, arm, label, hand, trunk, clearance):
+def _trace(torso, path, grid, label, kin, moved):
+    """The scan's per-sample kinematics -- the wrist, the shoulder, the trunk's world matrix, and whether the arm
+    reaches at all -- traced once per paths and cap round (``kin``, keyed by hand) and thereafter only over
+    ``moved``: the wrist-deviation ask shifts the body inside its own span, so every rescan re-traces a few dozen
+    samples instead of the piece's thousands. This pass is the single most expensive thing in the scan: each sample
+    builds the spine's chain twice (shoulder_world, trunk_world)."""
+    n = len(grid)
+    got = None if kin is None else kin.get(label)
+    if got is None or got['n'] != n or got['path'] is not path or got['grid'] is not grid:
+        got = dict(n=n, path=path, grid=grid, S=np.full((n, 3), np.nan), W=np.full((n, 3), np.nan),
+                   M=np.zeros((n, 4, 4)), have=np.zeros(n, bool))
+        if kin is not None:
+            kin[label] = got
+        todo = range(n)
+    else:
+        todo = range(n) if moved is None else (int(i) for i in np.flatnonzero(moved))
+    for i in todo:
+        t = float(grid[i])
+        try:
+            S_i = torso.shoulder_world(label, t)[:3, 3]
+            W_i = np.asarray(path(t)[:3], float)
+            M_i = torso.trunk_world(t)
+        except ValueError:              # the wrist beyond the unstretched arm at this lean: the frames stage
+            got['have'][i] = False      # stretches it (angle unused there); the curve carries on unchanged
+            continue
+        got['S'][i], got['W'][i], got['M'][i] = S_i, W_i, M_i
+        got['have'][i] = True
+    return got['S'], got['W'], got['M'], got['have']
+
+
+def _scan(torso, path, grid, arm, label, hand, trunk, clearance, kin=None, moved=None):
     """One hand's per-sample state over the grid: the natural hang (``target``), the free arcs the swing curve is
     bounded to (``lo``, ``hi``, unwrapped along the curve) and how much lean the body must give up for a free arc
     (``required``, 1 where none is needed or helps). The arcs are read off a ladder: a ``clearance`` margin out of
@@ -260,42 +342,83 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance):
     visible elbow sweeps that begin before the hand moves; smoothed, the elbow follows the body at body speed,
     and every smoothed bound is verified against the sample's own depth and rise (INTRUDE_OK / RISE_OK slack)."""
     n = len(grid)
-    lo, hi = np.empty(n), np.empty(n)
-    target, required, deep = np.full(n, np.nan), np.ones(n), np.full(n, np.nan)
-    necessary, tight, prev = np.zeros(n), np.zeros(n, bool), None
-    ws = np.full((n, 3), np.nan)        # the wrist per sample (the smoothing scales with its speed)
-    fine = np.zeros(n, bool)            # the sample has real bounds (not stretched, not wholly free)
-    depths = np.full((n, len(TRUNK_ANG_DEG)), np.nan)   # the capsule depth along the circle (the verify)
-    rises = np.full((n, len(TRUNK_ANG_DEG)), np.nan)    # ... and the elbow's rise
-    rise_caps = np.full(n, np.nan)
-    for i, t in enumerate(grid):
+    st = None if kin is None else kin.get(('state', label))
+    fresh = st is None or st['n'] != n
+    if fresh:
+        st = dict(n=n, have=np.zeros(n, bool), fine=np.zeros(n, bool), tight=np.zeros(n, bool),
+                  raw_lo=np.zeros(n), raw_hi=np.zeros(n), raw_target=np.full(n, np.nan),
+                  lo=np.zeros(n), hi=np.zeros(n), target=np.full(n, np.nan),
+                  deep=np.full(n, np.nan), necessary=np.zeros(n), required=np.ones(n),
+                  ws=np.full((n, 3), np.nan), depths=np.full((n, len(TRUNK_ANG_DEG)), np.nan),
+                  rises=np.full((n, len(TRUNK_ANG_DEG)), np.nan), rise_caps=np.full(n, np.nan))
+        if kin is not None:
+            kin[('state', label)] = st
+    # The scan's own answer is kept (``st``): a rescan of the same paths and cap only re-derives the samples the
+    # body moved on -- the ask's span -- and smooths (_relax) only around them.
+    lo, hi, target = st['lo'], st['hi'], st['target']
+    raw_lo, raw_hi, raw_target = st['raw_lo'], st['raw_hi'], st['raw_target']
+    fine, tight, required, necessary = st['fine'], st['tight'], st['required'], st['necessary']
+    ws, depths, rises, rise_caps, deep = st['ws'], st['depths'], st['rises'], st['rise_caps'], st['deep']
+    todo = np.arange(n) if (moved is None or fresh) else np.flatnonzero(moved)
+    mask = np.zeros(n, bool)
+    mask[todo] = True
+    # One pass of kinematics (shoulder, wrist, trunk matrix -- cheap), then the whole grid's hull tests in one
+    # block: the samples are independent, so the compiled kernel spreads them over the cores instead of the
+    # numpy path's per-sample temporaries. Without numba the block is skipped and the loop below swings one
+    # sample at a time, exactly as before.
+    S, W, M, have = _trace(torso, path, grid, label, kin, None if fresh else moved)
+    st['have'][todo] = have[todo]
+    reach = st['have'].copy()           # the traced reachability; the swing's verdict on top of it is this scan's
+    for i in todo[reach[todo]]:
+        ws[i] = W[i]
+    ang = TRUNK_ANG
+    if trunk._packed() is not None and (reach & mask).any():
+        idx = np.flatnonzero(reach & mask)
+        blk, ris, ok = trunk.swing_block(S[idx], W[idx], M[idx, :3, :3], M[idx, :3, 3],
+                                         arm.l1, arm.l2, arm.side, hand)
+        depths[idx], rises[idx] = blk, ris
+        reach[idx[~ok]] = False         # swing would have raised there: the scan's stretched sample, below
+    prev = None
+    if not fresh and len(todo) and todo[0] > 0:     # the bound the sample before the span carried, unwrapped
+        j = int(todo[0]) - 1
+        if fine[j] and reach[j]:
+            prev = (raw_lo[j], raw_hi[j])
+    for i in todo:
+        i = int(i)
+        t = float(grid[i])
         anchor = (.5 * (prev[0] + prev[1])) if prev is not None else 0.
-        try:
-            s = torso.shoulder_world(label, t)[:3, 3]
-            w = np.asarray(path(t)[:3], float)
-            m = torso.trunk_world(t)
-            ws[i] = w
-            target[i] = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
-            ang, deep_i, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, m, hand)
-            depths[i], rises[i] = deep_i, rise
-            rise_caps[i] = float(rise[int(np.argmin(np.abs(ang - target[i])))]) + RISE_LIMIT
-        except ValueError:              # the wrist beyond the unstretched arm at this lean: the frames stage
-            lo[i], hi[i] = anchor, anchor   # stretches it (angle unused there); the curve carries on unchanged
+        required[i] = 1.
+        if not reach[i]:
+            raw_lo[i], raw_hi[i] = anchor, anchor
+            fine[i] = False
             prev = None
             continue
+        s, w = S[i], W[i]
+        if trunk._packed() is None:     # no numba: the one-sample swing, as the scan always did
+            try:
+                _, deep_i, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, M[i], hand)
+            except ValueError:
+                lo[i], hi[i] = anchor, anchor
+                prev = None
+                continue
+            depths[i], rises[i] = deep_i, rise
+        else:
+            deep_i, rise = depths[i], rises[i]
+        raw_target[i] = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
+        rise_caps[i] = float(rise[int(np.argmin(np.abs(ang - raw_target[i])))]) + RISE_LIMIT
         deep[i] = float(deep_i.min())
         free = (deep_i <= -clearance) & (rise <= rise_caps[i])
         if free.all():                  # the whole circle is free (the arm far out): no bound at all
-            lo[i], hi[i] = -np.inf, np.inf
+            raw_lo[i], raw_hi[i] = -np.inf, np.inf
+            fine[i] = False
             prev = None
             continue
         if not free.any():
             free = (deep_i <= 0.) & (rise <= rise_caps[i])      # the margin is beyond this pose: not running in is what there is
             tight[i] = free.any()
         if free.any():
-            bound = _choose(_runs(free, ang), target[i], prev)
-            lo[i], hi[i] = bound
-            necessary[i] = max(0., bound[0] - target[i], target[i] - bound[1])
+            bound = _choose(_runs(free, ang), raw_target[i], prev)
+            raw_lo[i], raw_hi[i] = bound
             prev = bound
             fine[i] = True
             continue
@@ -305,38 +428,55 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance):
             try:
                 s = torso.shoulder_world(label, t, cap=float(share))[:3, 3]
                 m = torso.trunk_world(t, cap=float(share))
-                target[i] = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
+                raw_target[i] = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
                 ang, deep2, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, m, hand)
             except ValueError:
                 continue
             free = (deep2 <= 0.) & (rise <= rise_caps[i])
             if free.any():
                 required[i] = float(share)
-                bound = _choose(_runs(free, ang), target[i], prev)
-                lo[i], hi[i] = bound
-                necessary[i] = max(0., bound[0] - target[i], target[i] - bound[1])
+                bound = _choose(_runs(free, ang), raw_target[i], prev)
+                raw_lo[i], raw_hi[i] = bound
                 depths[i], rises[i] = deep2, rise
                 prev = bound
                 fine[i] = True
                 break
         else:                           # no share opens an arc: the elbow takes the least deep swing there is
             best = float(ang[int(np.argmin(deep_i))])
-            lo[i] = hi[i] = _near(best, anchor)
+            raw_lo[i] = raw_hi[i] = _near(best, anchor)
             depths[i], rises[i] = deep_i, rise
-            prev = (lo[i], hi[i])
+            prev = (raw_lo[i], raw_hi[i])
             fine[i] = True
-    _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance)
-    for i in range(n):                  # the necessary swing of the (possibly smoothed) constraint
-        if np.isfinite(target[i]) and np.isfinite(lo[i]) and np.isfinite(hi[i]):
-            necessary[i] = max(0., lo[i] - target[i], target[i] - hi[i])
+    for b0, b1 in _blocks(todo):        # each block of the change, not the gap between two of them
+        _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance,
+               raw=(raw_lo, raw_hi, raw_target), span=(b0, b1))
+        for i in range(max(0, b0 - 1), min(n, b1 + 1)):
+            if np.isfinite(target[i]) and np.isfinite(lo[i]) and np.isfinite(hi[i]):
+                necessary[i] = max(0., lo[i] - target[i], target[i] - hi[i])
     return dict(lo=lo, hi=hi, target=target, required=required, deep=deep, necessary=necessary, tight=tight,
                 depths=depths, rises=rises, rise_caps=rise_caps)
 
 
-def _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance):
+def _blocks(idx):
+    """The contiguous runs of ``idx`` as (start, stop) pairs: the rescan's smoothing runs per run, not over the
+    gap between two spans of the piece it did not touch."""
+    out = []
+    for i in idx:
+        i = int(i)
+        if out and i == out[-1][1]:
+            out[-1][1] = i + 1
+        else:
+            out.append([i, i + 1])
+    return out
+
+
+def _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance, raw=None, span=None):
     """Smooth the scan's constraint signals along the grid where the wrist sits still (the width shrinks to
     nothing with its speed; segments split where the signals restart). Each smoothed bound is verified against
-    the sample's own depth and rise so the smoothing breaks the clearance no more than the slack."""
+    the sample's own depth and rise so the smoothing breaks the clearance no more than the slack.
+    ``raw`` (the unsmoothed lo, hi, target) and ``span`` (the samples the last scan re-derived): a sample's window
+    is +-W wide, so only the samples within W of the change can come out differently -- the rest keeps the answer
+    it already had, which is why a rescan of one span costs a few dozen samples, not the piece."""
     n = len(grid)
     d = np.linalg.norm(np.diff(ws, axis=0), axis=1) / CURVE_STEP        # (n-1,) wrist speed, nan at gaps
     spd = np.full(n, np.inf)
@@ -351,12 +491,15 @@ def _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance):
         if seg[i] >= 0:
             seg[i] = seg[i - 1] + (1 if barrier[i - 1] else 0)
     W = int(np.ceil(SMOOTH_TAU / CURVE_STEP)) + 1
+    r0, r1 = (0, n) if span is None else (max(0, span[0] - W - 1), min(n, span[1] + W + 2))
     for k, values in enumerate((lo, hi, target)):
         bounds = k < 2
-        true = np.array(values, float)  # the unsmoothed constraint (the verify's reference)
-        out = np.array(values, float)
-        for i in range(n):
-            if seg[i] < 0 or (bounds and not fine[i]) or not np.isfinite(values[i]):
+        true = values if raw is None else raw[k]     # the unsmoothed constraint (the verify's reference)
+        out = values if raw is not None else np.array(values, float)
+        if raw is not None:                 # the samples the smoothing leaves alone keep their raw value
+            out[r0:r1] = true[r0:r1]
+        for i in range(r0, r1):
+            if seg[i] < 0 or (bounds and not fine[i]) or not np.isfinite(true[i]):
                 continue
             j0, j1 = max(0, i - W), min(n, i + W + 1)
             sl = slice(j0, j1)
@@ -367,11 +510,12 @@ def _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance):
             wgt = np.exp(-.5 * ((grid[sl] - grid[i]) / tau[i]) ** 2) * near
             out[i] = float(np.sum(true[sl][near] * wgt[near]) / np.sum(wgt))
         if bounds:
-            for i in range(n):          # verify each smoothed bound against the sample's own depth and rise
+            for i in range(r0, r1):          # verify each smoothed bound against the sample's own depth and rise
                 if seg[i] < 0 or not fine[i] or out[i] == true[i]:
                     continue
                 out[i] = _verified(out[i], true[i], depths[i], rises[i], rise_caps[i], clearance)
-        values[:] = out
+        if raw is None:
+            values[:] = out
 
 
 def _verified(smooth, true, depth, rise, rise_cap, clearance):
@@ -487,26 +631,34 @@ def _swing_of(data, curve):
     return np.where(np.isfinite(tgt), phi - tgt, 0.)
 
 
-def _build(data, paths, grid):
-    """The swing curves from one scan's bounds: the least-jerk phi inside them (solve's)."""
+def _build(data, paths, grid, cache=None, prev=None, dirty=None):
+    """The swing curves from one scan's bounds: the least-jerk phi inside them (solve's). ``cache`` keeps each
+    hand's path samples (they do not move with the body), and ``prev`` (the last curves) with ``dirty`` (the samples
+    whose bounds the last scan moved) hands the solve its own answer to continue from -- chunked's restart."""
     from .motion import chunked
     n = len(grid)
     out = {}
     for h in 'LR':
         d = data[h]
         if n >= 8:
-            pts = np.array([np.asarray(paths[h](t)[:3], float) for t in grid])
-            speed = np.r_[np.linalg.norm(np.diff(pts, axis=0), axis=1)[0],
-                          np.linalg.norm(np.diff(pts, axis=0), axis=1)] / CURVE_STEP
+            got = None if cache is None else cache.get(('pts', h))
+            if got is None or got[0] is not grid:
+                pts = np.array([np.asarray(paths[h](t)[:3], float) for t in grid])
+                got = (grid, pts, np.r_[np.linalg.norm(np.diff(pts, axis=0), axis=1)[0],
+                                        np.linalg.norm(np.diff(pts, axis=0), axis=1)] / CURVE_STEP)
+                if cache is not None:
+                    cache[('pts', h)] = got
+            speed = got[2]
             A, b = _rows(n, CURVE_STEP, JERK, ACC, VEL, PULL / (1. + speed / TRACK_RATE), d['target'])
-            phi = chunked(A, b, d['lo'], np.maximum(d['hi'], d['lo'] + 1e-12))
+            phi = chunked(A, b, d['lo'], np.maximum(d['hi'], d['lo'] + 1e-12),
+                          x0=None if prev is None else prev[h]['angles'], dirty=dirty)
         else:
             phi = np.where(np.isfinite(d['target']), d['target'], 0.)
         out[h] = dict(times=grid, angles=phi)
     return out
 
 
-def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, rescan):
+def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, rescan, kin=None, traced=None):
     """The wrist-deviation ask (torso.Torso.set_yield / set_slide_yield): where the swing keeping the elbow out
     of the outline would bend the rendered wrist past the user's floor (posture.PALM_FLOOR_DEG) -- the path's
     own yaw/roll are what the render stores (motion.frame_hand hands them to arm.pose verbatim, and across
@@ -526,9 +678,11 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
     n = len(grid)
     floor = posture.PALM_FLOOR_DEG
     ft = np.arange(float(grid[0]), float(grid[-1]) + 1. / RENDER_RATE * .5, 1. / RENDER_RATE)   # the render's axis
+    t_part = time.perf_counter()
     base_ang_g = {h: _rendered(torso, curves[h], grid, paths[h], h, rig.arms[h], solvers[h]) for h in 'LR'}
     base_ang = {h: _rendered(torso, curves[h], ft, paths[h], h, rig.arms[h], solvers[h]) for h in 'LR'}
     base_sw = {h: _swing_of(data[h], curves[h]) for h in 'LR'}
+    print(f'[elbows]   baseline {time.perf_counter() - t_part:.1f}s ({len(ft)} frames x 2 hands)', flush=True)
     shield = {h: not (base_ang[h] < floor).any() for h in 'LR'}        # never breached: the ask keeps it so
     env = {h: np.abs(base_sw[h]).max() <= math.radians(SWING_ENV_DEG) for h in 'LR'}
     plan_slide = torso.slide
@@ -578,6 +732,7 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
                                        for h, sw in zip('LR', g[1]))
 
     picks = [None] * n
+    t_pick = time.perf_counter()
     for k in range(n):
         if not ((base_ang_g['L'][k] < floor) or (base_ang_g['R'][k] < floor)):
             continue
@@ -597,6 +752,9 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
                 best = (best[0], best[1], grown(g, k))
         if best[2] < base_cost - 1e-9 and (best[0] or best[1]):
             picks[k] = (best[0], best[1])
+    _tick('picks', time.perf_counter() - t_pick)
+    print(f'[elbows]   picks {time.perf_counter() - t_pick:.1f}s, {sum(p is not None for p in picks)} of {n} samples '
+          f'want a body move', flush=True)
     torso.clear_yield()
     torso.clear_slide_yield()
 
@@ -608,15 +766,43 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
         rows[run] = ln
         srows = np.zeros(n)
         srows[run] = sl
-        torso.set_yield(grid, _ease(rows, CURVE_STEP))
-        torso.set_slide_yield(grid, _ease(srows, CURVE_STEP, YIELD_SLIDE_TAU))
+        ky = _ease(rows, CURVE_STEP)
+        ks_ = _ease(srows, CURVE_STEP, YIELD_SLIDE_TAU)
+        torso.set_yield(grid, ky)
+        torso.set_slide_yield(grid, ks_)
+        moved = None
+        if traced is not None:                  # the body moved on this span and (back) on the last one's: re-trace those
+            moved = (ky != traced.get('y', 0.)) | (ks_ != traced.get('s', 0.))
+            traced['y'], traced['s'] = ky, ks_
         try:
-            cdata, ccurves, _ = rescan()
+            t_ = time.perf_counter()
+            count[0] += 1
+            if count[0] % 20 == 0:
+                print(f'[elbows]   rescan {count[0]} {time.perf_counter() - t_runs:.1f}s', flush=True)
+            cdata, ccurves, _ = rescan(moved)
+            _tick('honest_rescan', time.perf_counter() - t_)
+            if PROFILE and count[0] <= 5:
+                print(f'[elbows]   rescan {count[0]} {time.perf_counter() - t_:.2f}s '
+                      f'moved {0 if moved is None else int(moved.sum())}', flush=True)
             kf = (ft >= float(grid[run[0]]) - .5 / RENDER_RATE) & (ft <= float(grid[run[-1]]) + .5 / RENDER_RATE)
             cost = 0.
             ks = np.asarray(run)
+            inside = np.zeros(len(grid), bool)
+            inside[run] = True      # the samples the ask moves the body on; the rest is the baseline's, sample for sample
             for h in 'LR':
-                ang = _rendered(torso, ccurves[h], ft, paths[h], h, rig.arms[h], solvers[h])
+                t_ = time.perf_counter()
+                ang = base_ang[h].copy()            # outside the span the curve did not move: the rendered angles hold
+                moved_t = np.abs(ccurves[h]['angles'] - curves[h]['angles'])
+                moved_t[inside] = 0.
+                moved_t[~np.isfinite(moved_t)] = np.inf
+                idx = np.flatnonzero(moved_t > 1e-5)     # 1e-5 rad is a thousandth of a degree: no guard turns on it
+                if len(idx):                        # the carry-over did move the curve out there: render those frames
+                    extra = ((ft >= float(grid[idx[0]]) - .5 / RENDER_RATE)
+                             & (ft <= float(grid[idx[-1]]) + .5 / RENDER_RATE) & ~kf)
+                    if extra.any():
+                        ang[extra] = _rendered(torso, ccurves[h], ft[extra], paths[h], h, rig.arms[h], solvers[h])
+                ang[kf] = _rendered(torso, ccurves[h], ft[kf], paths[h], h, rig.arms[h], solvers[h])
+                _tick('rendered', time.perf_counter() - t_)
                 sw = _swing_of(cdata[h], ccurves[h])
                 if shield[h] and ((ang[kf] < floor - 1e-9).any() or (ang[~kf] < floor - 1e-9).any()
                                   or (np.isfinite(base_ang[h]) & ~np.isfinite(ang)).any()):
@@ -641,6 +827,7 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
 
     ask = np.zeros(n)
     sask = np.zeros(n)
+    count = [0]
     trig = [k for k in range(n) if picks[k] is not None]
     runs = []
     for k in trig:                              # one span: a gap of a few samples is still one body move
@@ -649,7 +836,10 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
         else:
             runs.append([k])
     ladder = [(0., .05), (0., .08), (0., .11), (-.016, .05), (-.016, .08), (-.032, .05), (-.032, .08)]
-    for run in runs:
+    t_runs = time.perf_counter()
+    for done, run in enumerate(runs, 1):
+        if len(runs) >= 20 and done % max(1, len(runs) // 10) == 0:
+            print(f'[elbows]   ask {done}/{len(runs)} runs {time.perf_counter() - t_runs:.1f}s', flush=True)
         seen = []
         for k in run:
             if picks[k] not in seen:
@@ -689,23 +879,47 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
     data, curves, report = {}, {}, {}
     asked = 0
 
-    def scan_build():
+    kin = {}        # the traced kinematics per hand, valid while the cap and the body's own move hold
+    traced = {}     # the ask arrays the cache was traced on (what a rescan's ``moved`` is measured against)
+
+    def scan_build(moved=None):
         torso.set_cap(grid, caps)       # the scans read the shared cap from the torso
         required = np.ones(n)
         d = {}
+        t_ = time.perf_counter()
         for i, h in enumerate('LR'):
-            d[h] = _scan(torso, paths[h], grid, rig.arms[h], h, i, trunk, clearance)
+            d[h] = _scan(torso, paths[h], grid, rig.arms[h], h, i, trunk, clearance, kin=kin, moved=moved)
             required = np.minimum(required, d[h]['required'])
-        return d, _build(d, paths, grid), required
+        _tick('scan', time.perf_counter() - t_)
+        t_ = time.perf_counter()
+        span = None if moved is None or not moved.any() else (int(np.argmax(moved)), int(len(moved) - 1 - np.argmax(moved[::-1])))
+        curve = _build(d, paths, grid, cache=kin, prev=curves if span is not None else None, dirty=span)
+        _tick('build', time.perf_counter() - t_)
+        _tick('scan_build')
+        return d, curve, required
 
     # 1. the ask-free solution settles the body-yield (the honest baseline the ask is searched against)
+    t_phase = time.perf_counter()
+
+    def phase(name):
+        nonlocal t_phase
+        now = time.perf_counter()
+        print(f'[elbows] {name} {now - t_phase:.1f}s', flush=True)
+        t_phase = now
+
     for round_ in range(CAP_ROUNDS + 2):
         data, curves, required = scan_build()
         if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
             break
         caps = _cap_curve(required, n)  # the cap smooths over spans; the next round re-checks both hands on it
+        kin.clear(), traced.clear()     # a new cap leans the whole body: every sample is re-traced
+    phase(f'cap ({round_ + 1} scans, min {float(required.min()):.2f})')
     if solvers is not None:
-        ys, ss = _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, scan_build)
+        t_ask = time.perf_counter()
+        ys, ss = _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, scan_build,
+                            kin=kin, traced=traced)
+        _tick('wrist_ask', time.perf_counter() - t_ask)
+        phase('wrist ask')
         if ys.any() or ss.any():
             ys = _ease(ys, CURVE_STEP)
             torso.set_yield(grid, ys)       # the ask rides on the re-check: the next scans read it
@@ -718,7 +932,10 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
                 if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
                     break
                 caps = _cap_curve(required, n)
+                kin.clear(), traced.clear()
+            phase(f'recheck ({round_ + 1} scans, min {float(required.min()):.2f})')
     damped = {h: _damped(curves[h]) for h in 'LR'}   # what the frames will read; the report below follows it
+    phase('damped')
     ym = float(np.abs(torso.yield_rows[1]).max() * 1000.) if asked else 0.
     sm = float(np.abs(torso.slide_yield_rows[1]).max() * 1000.) if asked and torso.slide_yield_rows is not None else 0.
     for i, h in enumerate('LR'):
@@ -734,6 +951,9 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
                          excess_p95_deg=round(float(np.percentile(ex, 95)), 1) if len(ex) else 0.,
                          excess_max_deg=round(float(ex.max()), 1) if len(ex) else 0.,
                          clear_p10_mm=round(float(np.nanpercentile(d['deep'], 10) * 1000), 1) if np.isfinite(d['deep']).any() else 0.)
+    line = _profile_line()
+    if line:
+        print(line, flush=True)
     return damped, report
 
 
