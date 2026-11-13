@@ -37,6 +37,8 @@ CAP_LEVELS = 9                   # lean shares tried for a blocked sample, from 
 CAP_ROUNDS = 3                   # blocked samples ask, the smoothed cap is re-checked, twice
 CAP_PULL = .12                   # the cap's pull to no yield: one unit of cost this far off 1
 JERK, ACC, VEL, PULL = 150., 25., 5., .3     # the swing curve's weights: one unit of cost at these
+TRACK_RATE = .25                 # m/s of wrist motion at which the curve's pull doubles: a hop is tracked in
+                                 # step with the hand (a rigid chain, the elbow rides along), a hold is smoothed
                                  # (rad/s^3, rad/s^2, rad/s, rad off the natural hang)
 
 
@@ -168,15 +170,18 @@ def _choose(runs, target, prev):
 
 def _rows(n, step, jerk, acc, vel, pull, target):
     """The swing curve's sparse least squares: minimum jerk, damped acceleration, no needless speed, pulled to
-    the natural hang where it is known (solve_path's rows, one dimension)."""
+    the natural hang where it is known (solve_path's rows, one dimension). ``pull`` may be per sample: the
+    tracking tightens where the wrist itself is moving, so the elbow moves with the hand instead of being
+    smeared around its hops."""
     from scipy import sparse
     d3 = sparse.diags([-1., 3., -3., 1.], [0, 1, 2, 3], shape=(n - 3, n)) / step ** 3 / jerk
     d2 = sparse.diags([1., -2., 1.], [0, 1, 2], shape=(n - 2, n)) / step ** 2 / acc
     d1 = sparse.diags([-1., 1.], [0, 1], shape=(n - 1, n)) / step / vel
     has = np.isfinite(target)
+    pull = np.broadcast_to(np.asarray(pull, float), (n,))
     pull_rows = sparse.diags(has.astype(float) / pull, 0, shape=(n, n)).tocsr()[has]
     A = sparse.vstack([d3, d2, d1, pull_rows]).tocsr()
-    b = np.r_[np.zeros(n - 3), np.zeros(n - 2), np.zeros(n - 1), target[has] / pull]
+    b = np.r_[np.zeros(n - 3), np.zeros(n - 2), np.zeros(n - 1), target[has] / pull[has]]
     return A, b
 
 
@@ -276,7 +281,10 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE):
     for i, h in enumerate('LR'):
         d = data[h]
         if n >= 8:
-            A, b = _rows(n, CURVE_STEP, JERK, ACC, VEL, PULL, d['target'])
+            pts = np.array([np.asarray(paths[h](t)[:3], float) for t in grid])
+            speed = np.r_[np.linalg.norm(np.diff(pts, axis=0), axis=1)[0],
+                          np.linalg.norm(np.diff(pts, axis=0), axis=1)] / CURVE_STEP
+            A, b = _rows(n, CURVE_STEP, JERK, ACC, VEL, PULL / (1. + speed / TRACK_RATE), d['target'])
             phi = chunked(A, b, d['lo'], np.maximum(d['hi'], d['lo'] + 1e-12))
         else:
             phi = np.where(np.isfinite(d['target']), d['target'], 0.)
