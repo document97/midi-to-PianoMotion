@@ -84,6 +84,8 @@ def _init(context):
         torso.set_notes(*context['torso_rows'])
         if context.get('torso_cap') is not None:        # the elbows solve's ask: the body leans less here
             torso.set_cap(*context['torso_cap'])
+        if context.get('torso_yield') is not None:      # ... and leans toward a hand for the wrist's floor
+            torso.set_yield(*context['torso_yield'])
     _ctx['torso'] = torso
     _ctx['capsules'] = {h: HandCapsules(rig, h, rig.arms[h].arm_inverse @ solvers[h].palm(rig.neutral_wrist[h], 0., 0.))
                         for h in 'LR'}
@@ -1028,17 +1030,19 @@ def run(args):
     # the trunk.json export beside the rig), the body leaning less where no swing clears; the frames stage
     # interpolates the curve and hands the angle to arm.pose
     t0 = time.perf_counter()
-    context['elbow_swing'], context['torso_cap'] = None, None
+    context['elbow_swing'], context['torso_cap'], context['torso_yield'] = None, None, None
     elbows_report = {}
     if rig.data.get('torso') and context.get('torso_rows'):
         trunk_model = elbows.load(RIG)
         if trunk_model is not None:
             torso = Torso(rig.data['torso'], rig.arms)
             torso.set_notes(*context['torso_rows'])
-            context['elbow_swing'], elbows_report = elbows.solve(torso, paths, -intro, duration, rig, trunk_model)
+            context['elbow_swing'], elbows_report = elbows.solve(torso, paths, -intro, duration, rig, trunk_model,
+                                                                 solvers=performer_solvers(rig))
             context['elbow_swing_slopes'] = {h: pchip_slopes(c['times'], c['angles'][:, None])
                                              for h, c in context['elbow_swing'].items()}
             context['torso_cap'] = torso.cap           # the yield the solve asked (the workers' torso reads it)
+            context['torso_yield'] = torso.yield_rows  # the wrist-deviation ask (the workers' torso reads it)
     stages['elbows'] = time.perf_counter() - t0
 
     # 5. frames

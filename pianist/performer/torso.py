@@ -120,6 +120,8 @@ class Torso:
         self.reach = {h: np.zeros((0, 3)) for h in 'LR'}
         self.cap = None               # (times, shares 0..1): how much of the lean the body keeps (elbows.py)
         self.cap_slopes = None
+        self.yield_rows = None        # (times, shifts m): the elbows solve's wrist-deviation ask, a lean toward
+        self.yield_slopes = None      # a hand whose natural hang the outline buries past the wrist's floor
         self.slide_max = slide_max(data)
         self.first = self.last = 0.
         self.spine = [dict(bone=b['bone'], head=np.array(b['head'], float), pre_inverse=np.linalg.inv(np.array(b['pre'], float)),
@@ -155,6 +157,25 @@ class Torso:
         from .motion import hermite_eval
         return float(hermite_eval(self.cap[0], self.cap[1][:, None], self.cap_slopes, t)[0])
 
+    def set_yield(self, times, shifts):
+        """The elbows solve's wrist-deviation ask: a lean toward a hand (m, + right) over time, where the swing
+        keeping its elbow out of the outline would bend the rendered wrist past the comfort floor -- the body
+        moves instead of the wrist. Interpolated at ``pose`` like the cap; None is no ask."""
+        self.yield_rows = (np.asarray(times, float), np.asarray(shifts, float))
+        from .motion import pchip_slopes
+        self.yield_slopes = pchip_slopes(self.yield_rows[0], self.yield_rows[1][:, None])
+
+    def clear_yield(self):
+        self.yield_rows = self.yield_slopes = None
+
+    def _yield(self, t):
+        if self.yield_rows is None:
+            return 0.
+        from .motion import hermite_eval
+        v = float(hermite_eval(self.yield_rows[0], self.yield_rows[1][:, None], self.yield_slopes, t)[0])
+        env = self._smooth((t - self.first + .85) / .65) * (1 - self._smooth((t - self.last) / .7))
+        return float(np.clip(v, -LEAN_SHIFT, LEAN_SHIFT)) * env
+
     def _lean(self, t, cap=1.):
         """(side lean shift, turn, seat offset) at ``t``; ``cap`` (0..1) scales the lean: the body yields."""
         rows, weights = self._window(self.rows, t)
@@ -166,6 +187,7 @@ class Torso:
             shift = math.copysign(max(0., abs(shift) - abs(slide)), shift)
         shift = float(np.clip(shift, -LEAN_SHIFT, LEAN_SHIFT) * self._smooth((t - self.first + .85) / .65)
                       * (1 - self._smooth((t - self.last) / .7))) * cap
+        shift += self._yield(t)         # the wrist-deviation ask rides on the rows' lean, independent of the cap
         offset = np.array([slide, 0., 0.], dtype=FLOAT)
         turn = -math.radians(TURN_DEGREES) * (slide / self.slide_max if self.slide_max else 0.)
         return shift, turn, offset

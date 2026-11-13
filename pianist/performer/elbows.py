@@ -7,7 +7,10 @@ capsules are sampled at every swing angle; the free arcs are where they clear th
 swing-angle curve for the whole piece is solved like the wrist paths (bounded least squares over windows,
 motion.chunked): inside the free arcs, pulled toward the elbow's natural hang. Where no swing clears the trunk
 the upper body leans less instead (the torso's cap, torso.Torso.set_cap: the body yields before the elbow is
-raised above its natural hang), searched per sample and smoothed over time.
+raised above its natural hang), searched per sample and smoothed over time. And where a free arc exists but
+excludes the natural hang, the swing it forces rotates the forearm away from the settled palm axis -- past the
+wrist's comfort floor (posture.PALM_FLOOR_DEG) the body leans toward the hand instead (torso.Torso.set_yield:
+the ask searches the least lean that opens the hang, then the scans re-read the moved body on it).
 
 Solved once in the main process between the finger keyposes and the frames; the frames stage interpolates the
 curve and hands the angle to arm.Arm.pose.
@@ -47,6 +50,9 @@ SMOOTH_TAU = .3                  # s the constraint signals (bounds, natural han
 INTRUDE_OK = .001                # m of outline intrusion the smoothing may add at the bounds (about a noise unit)
 RISE_OK = .003                   # m of rise-cap slack the smoothing may add
                                  # (rad/s^3, rad/s^2, rad/s, rad off the natural hang)
+YIELD_STEPS = (.008, .016, .032, .064)   # m the wrist-deviation ask leans toward the hand, searched small first:
+                                 # the least lean that opens the hang (the tilt opens ~1 cm per cm of shift)
+YIELD_TAU = .12                  # s of gaussian on the ask: the lean is a body motion, it ramps at body speed
 
 
 def hull2d(points):
@@ -369,24 +375,97 @@ def _cap_curve(required, n):
     return chunked(A, b, required, np.ones(n))
 
 
-def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE):
+def _ease(values, step):
+    """A gaussian over time (YIELD_TAU): the ask's lean is a body motion, it ramps at body speed."""
+    r = max(1, int(round(YIELD_TAU / step * 2.)))
+    x = np.arange(-r, r + 1) * step
+    w = np.exp(-.5 * (x / YIELD_TAU) ** 2)
+    w /= w.sum()
+    padded = np.concatenate([np.full(r, values[0]), values, np.full(r, values[-1])])
+    return np.convolve(padded, w, mode='valid')
+
+
+def _wrist_ask(torso, data, grid, paths, rig, trunk, solvers):
+    """The wrist-deviation ask (torso.Torso.set_yield): the swing that keeps the elbow out of the outline rotates
+    the forearm away from the palm axis the plan settled (the corridor predicts with the natural hang) -- where
+    that drags the wrist's interior angle below the user's floor (posture.PALM_FLOOR_DEG), the body leans toward
+    the hand instead (the tilt opens the outline at the elbow, the reach eases with it) until the natural hang
+    itself clears. The lean is searched small first per sample (YIELD_STEPS: the least yield that opens it);
+    returns the per-sample signed shift (m, + right) combining the hands (one body tilt: the larger ask wins)."""
+    from . import posture
+    from .arm import closest_elbow
+    ask = np.zeros((2, len(grid)))
+    for i, h in enumerate('LR'):
+        d, arm, solver = data[h], rig.arms[h], solvers[h]
+        for k in range(len(grid)):
+            tgt, lo, hi = d['target'][k], d['lo'][k], d['hi'][k]
+            if not np.isfinite(tgt) or not np.isfinite(lo):
+                continue
+            realized = min(max(tgt, lo), hi)
+            if realized == tgt:     # the hang sits in the free arc: the rendered forearm is the hang's itself
+                continue
+            torso.clear_yield()     # the ask reads the body the plan settled (no yield yet)
+            t = float(grid[k])
+            try:
+                s = torso.shoulder_world(h, t)[:3, 3]
+                w = np.asarray(paths[h](t)[:3], float)
+                yaw, roll = posture.natural_orientation(solver, w, s)
+                e = closest_elbow(s, w, arm.l1, arm.l2, arm.side, angle=realized)
+                ang = posture.palm_forearm_deg(solver, w, yaw, roll, s, elbow=e)
+            except ValueError:
+                continue
+            if ang >= posture.PALM_FLOOR_DEG:
+                continue
+            sgn = 1. if w[0] >= s[0] else -1.       # toward the hand: the tilt that opens the outline there
+            got = sgn * YIELD_STEPS[-1]             # beyond the last step: the least bad there is
+            for m in YIELD_STEPS:
+                torso.set_yield(np.array([t - 1., t + 1.]), np.full(2, sgn * m))
+                try:
+                    s2 = torso.shoulder_world(h, t)[:3, 3]
+                    ang2, deep2, rise2 = trunk.swing(s2, w, arm.l1, arm.l2, arm.side, torso.trunk_world(t), i)
+                    kx = int(np.argmin(np.abs(TRUNK_ANG_DEG - _wrap_deg(tgt))))
+                    if deep2[kx] <= INTRUDE_OK:
+                        got = sgn * m
+                        break
+                except ValueError:
+                    continue
+            ask[i, k] = got
+    torso.clear_yield()
+    out = ask[0].copy()
+    take = np.abs(ask[1]) > np.abs(out)
+    out[take] = ask[1][take]
+    return out
+
+
+def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
     """Both arms' swing curves over the piece (times t0..t1): ({hand: dict(times, angles)}, report). The torso's
-    cap is set on ``torso`` (the body yields where no swing clears); the frames stage interpolates ``angles`` and
-    hands them to arm.Arm.pose."""
+    cap is set on ``torso`` (the body yields where no swing clears), and where the forced swing would bend the
+    rendered wrist past the comfort floor the body leans toward the hand instead (the wrist-deviation ask,
+    torso.set_yield, ``solvers`` given); the scans then re-read the moved body. The frames stage interpolates
+    ``angles`` and hands them to arm.Arm.pose."""
     from .motion import chunked
     grid = np.arange(t0, t1 + CURVE_STEP * .5, CURVE_STEP)
     n = len(grid)
     caps = np.ones(n)
     data, curves, report = {}, {}, {}
-    for round_ in range(CAP_ROUNDS + 1):
+    asked = 0
+    for round_ in range(CAP_ROUNDS + 2):
         torso.set_cap(grid, caps)       # the scans read the shared yield from the torso
         required = np.ones(n)
         for i, h in enumerate('LR'):
             data[h] = _scan(torso, paths[h], grid, rig.arms[h], h, i, trunk, clearance)
             required = np.minimum(required, data[h]['required'])
-        if required.min() >= 1. or round_ == CAP_ROUNDS:
+        if solvers is not None and not asked:
+            ys = _wrist_ask(torso, data, grid, paths, rig, trunk, solvers)
+            if ys.any():
+                ys = _ease(ys, CURVE_STEP)
+                torso.set_yield(grid, ys)       # the ask rides on the cap rounds: the next scans read it
+                asked = int((ys != 0.).sum())
+                continue
+        if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
             break
         caps = _cap_curve(required, n)  # the yield smooths over spans; the next round re-checks both hands on it
+    ym = float(np.abs(torso.yield_rows[1]).max() * 1000.) if asked else 0.
     for i, h in enumerate('LR'):
         d = data[h]
         if n >= 8:
@@ -402,7 +481,7 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE):
         ex = np.degrees(np.maximum(off - d['necessary'][np.isfinite(d['target'])], 0.))
         report[h] = dict(samples=n, blocked=int((d['required'] < 1.).sum()), tight=int(d['tight'].sum()),
                          stretch=int(np.isnan(d['target']).sum()),
-                         yield_min=round(float(caps.min()), 2),
+                         yield_min=round(float(caps.min()), 2), asked=asked, yield_max_mm=round(ym, 1),
                          swing_p95_deg=round(float(np.degrees(np.percentile(off, 95))), 1) if len(off) else 0.,
                          excess_p50_deg=round(float(np.percentile(ex, 50)), 1) if len(ex) else 0.,
                          excess_p95_deg=round(float(np.percentile(ex, 95)), 1) if len(ex) else 0.,

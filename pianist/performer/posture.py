@@ -25,16 +25,19 @@ PALM_FLOOR_DEG = 135.           # the user's transient acceptance floor: below i
 # wrist never bends more; what is left after the palm's full follow is the body's share to cover
 
 
-def palm_forearm_deg(solver, wrist, yaw, roll, shoulder):
+def palm_forearm_deg(solver, wrist, yaw, roll, shoulder, elbow=None):
     """The palm's long axis vs the forearm's, interior angle in degrees (180 straight): exactly what arm.pose
-    stores per frame ({h}_palm_deg), predicted here from the plan (the same palm_q and elbow geometry)."""
+    stores per frame ({h}_palm_deg), predicted here from the plan (the same palm_q and elbow geometry).
+    ``elbow``: a placed elbow (the swing curve's) instead of the natural hang -- the prediction at the forearm
+    the rendered elbow actually takes."""
     from .kinematics import q_mat3
     arm = solver.arm
     palm = q_mat3(arm.palm_q(yaw, roll)) @ np.array([0., 1., 0.], dtype=FLOAT)
-    try:
-        elbow = closest_elbow(shoulder, np.asarray(wrist, FLOAT), arm.l1, arm.l2, arm.side)
-    except ValueError:              # beyond the unstretched arm: the forearm is the wrist's own direction
-        return 180.
+    if elbow is None:
+        try:
+            elbow = closest_elbow(shoulder, np.asarray(wrist, FLOAT), arm.l1, arm.l2, arm.side)
+        except ValueError:              # beyond the unstretched arm: the forearm is the wrist's own direction
+            return 180.
     forearm = np.asarray(wrist, FLOAT) - elbow
     return 180. - math.degrees(math.acos(np.clip(float(palm @ forearm) / max(np.linalg.norm(forearm), 1e-9), -1., 1.)))
 
