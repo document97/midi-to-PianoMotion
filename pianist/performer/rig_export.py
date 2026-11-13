@@ -466,6 +466,19 @@ def trunk_data(arm, skin):
                 local=[[float(x) for x in p] for p in local], radius=radii)
 
 
+def write_trunk(out, trunk):
+    """Write trunk.json beside the rig it was traced from, stamped with that rig.json's sha256 (the way rig.json
+    stamps its scene and its calibration). performer.elbows.load rejects a pair whose stamps disagree, which is the
+    only way a stale outline -- a re-exported rig, another seat's outline -- is caught before it clears a body that
+    is not the one on screen."""
+    if not out.exists():
+        raise SystemExit(f'trunk.json needs the rig it describes: {out} is missing (export the rig first)')
+    trunk = dict(trunk, rig_sha256=hashlib.sha256(out.read_bytes()).hexdigest())
+    path = out.parent / 'trunk.json'
+    path.write_text(json.dumps(trunk), encoding='utf-8')
+    print('TRUNK_EXPORTED', path, len(trunk['local']), 'verts', 'rig', trunk['rig_sha256'][:12], flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True)
@@ -484,11 +497,9 @@ def main():
         hands[h]['lap'] = point
     out = Path(args.output)
     trunk = trunk_data(arm, skin)
-    if trunk is not None:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        (out.parent / 'trunk.json').write_text(json.dumps(trunk), encoding='utf-8')
-        print('TRUNK_EXPORTED', out.parent / 'trunk.json', len(trunk['local']), 'verts', flush=True)
     if args.trunk_only:
+        if trunk is not None:
+            write_trunk(out, trunk)
         return
     torso = None
     if body.bone is not None:
@@ -517,6 +528,8 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rig), encoding='utf-8')
     print('RIG_EXPORTED', out, 'validation', len(rig['validation']), flush=True)
+    if trunk is not None:                 # after the rig: the outline is stamped with the bytes written above
+        write_trunk(out, trunk)
 
 
 if __name__ == '__main__':

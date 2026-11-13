@@ -15,6 +15,7 @@ the ask searches the least lean that opens the hang, then the scans re-read the 
 Solved once in the main process between the finger keyposes and the frames; the frames stage interpolates the
 curve and hands the angle to arm.Arm.pose.
 """
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -37,6 +38,16 @@ CLEARANCE = 0.                   # m the arm keeps outside the outline. Zero: th
 RISE_LIMIT = .04                 # m the elbow may rise above its natural hang (an absolute wrist-relative cap would
                                  # bar the hang itself whenever the wrist rides low: hands entering or leaving)
 CURVE_STEP = .05                 # s between the swing curve's samples
+DAMP_TAU = .06                   # s: the swing curve's damping, a gaussian over time (zero phase, the same hand as
+                                 # the body ask's _ease). The curve is C1 on its .05 s grid and the frames' hermite is
+                                 # C1 too, so the acceleration steps at every knot -- measured on dl34 at p95 576
+                                 # deg/s^2 (L) / 219 (R), worst 4086 / 6939, which is what a stiff upper arm looks
+                                 # like: the elbow turns, stops turning and turns again within two frames. Damping
+                                 # costs 1.2-1.6 deg of angle and <=4 mm of elbow travel and takes those steps to
+                                 # 88 / 30.
+DAMP_SUB = 5                     # the damped curve's grid is CURVE_STEP/DAMP_SUB: fine enough that its own knots
+                                 # sit under a frame's .0167 s, so the hermite's corners fall below what a frame
+                                 # can show
 CAP_LEVELS = 9                   # lean shares tried for a blocked sample, from no yield down to none left
 CAP_ROUNDS = 3                   # blocked samples ask, the smoothed cap is re-checked, twice
 CAP_PULL = .12                   # the cap's pull to no yield: one unit of cost this far off 1
@@ -121,12 +132,15 @@ class Trunk:
             self.origin[i, m:], self.normal[i, m:] = h[0], n[0]
 
     @classmethod
-    def from_json(cls, path):
-        data = json.loads(Path(path).read_text(encoding='utf-8'))
+    def from_dict(cls, data):
         radius = data['radius']
         if isinstance(radius, dict):
             radius = [radius[h] for h in 'LR']
         return cls(data['local'], radius)
+
+    @classmethod
+    def from_json(cls, path):
+        return cls.from_dict(json.loads(Path(path).read_text(encoding='utf-8')))
 
     def depth(self, points, matrix):
         """Signed depth (m) of world ``points`` in the outline, ``matrix`` the trunk bone's world matrix: -1 off
@@ -409,6 +423,39 @@ def _ease(values, step, tau=YIELD_TAU):
     return np.convolve(padded, w, mode='valid')
 
 
+def _sample(curve, times):
+    """The curve's swing angle (deg) at ``times``, read through the frames' own hermite: what this reports is what
+    the render does."""
+    from .motion import pchip_slopes, hermite_eval
+    node = np.asarray(curve['times'], float)
+    ang = np.asarray(curve['angles'], float)[:, None]
+    sl = pchip_slopes(node, ang)
+    return np.array([float(hermite_eval(node, ang, sl, t)[0]) for t in np.atleast_1d(np.asarray(times, float))])
+
+
+def _damped(curve, tau=DAMP_TAU, sub=DAMP_SUB):
+    """The swing curve resampled ``sub`` times finer and smoothed over time: the frames' hermite is C1, so the
+    curve's .05 s knots step the acceleration (the elbow turns, stops turning and turns again within two frames, the
+    stiff upper arm). A gaussian of ``tau`` -- zero phase, so the timing is kept -- removes those steps at the cost
+    of ~1.5 deg of angle; the endpoint padding holds the clip's edges still."""
+    node = np.asarray(curve['times'], float)
+    if len(node) < 3:
+        return curve
+    step = float(np.median(np.diff(node)))
+    h = step / sub
+    fine = np.arange(node[0], node[-1] + h * .5, h)
+    dense = _sample(curve, fine)
+    r = max(1, int(round(tau / h * 2.)))
+    x = np.arange(-r, r + 1) * h
+    w = np.exp(-.5 * (x / tau) ** 2)
+    w /= w.sum()
+    # linear extrapolation, not endpoint copies: a copy pulls a ramp's level (measured .62 deg on a 1.5 deg/s ramp),
+    # a line leaves it exactly as it was (the gaussian is symmetric and normalized)
+    left = dense[0] + (dense[0] - dense[1]) * np.arange(r, 0, -1)
+    right = dense[-1] + (dense[-1] - dense[-2]) * np.arange(1, r + 1)
+    return dict(times=fine, angles=np.convolve(np.concatenate([left, dense, right]), w, mode='valid'))
+
+
 def _rendered(torso, curve, times, path, h, arm, solver):
     """The rendered palm-vs-forearm angle at ``times`` (deg): the curve's phi (hermite-interpolated, as the
     frames stage does) swings the elbow while the path's own wrist and yaw/roll aim the palm -- motion
@@ -671,11 +718,12 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
                 if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
                     break
                 caps = _cap_curve(required, n)
+    damped = {h: _damped(curves[h]) for h in 'LR'}   # what the frames will read; the report below follows it
     ym = float(np.abs(torso.yield_rows[1]).max() * 1000.) if asked else 0.
     sm = float(np.abs(torso.slide_yield_rows[1]).max() * 1000.) if asked and torso.slide_yield_rows is not None else 0.
     for i, h in enumerate('LR'):
         d = data[h]
-        off = np.abs(curves[h]['angles'] - d['target'])[np.isfinite(d['target'])]
+        off = np.abs(_sample(damped[h], grid) - d['target'])[np.isfinite(d['target'])]
         ex = np.degrees(np.maximum(off - d['necessary'][np.isfinite(d['target'])], 0.))
         report[h] = dict(samples=n, blocked=int((d['required'] < 1.).sum()), tight=int(d['tight'].sum()),
                          stretch=int(np.isnan(d['target']).sum()),
@@ -686,10 +734,41 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
                          excess_p95_deg=round(float(np.percentile(ex, 95)), 1) if len(ex) else 0.,
                          excess_max_deg=round(float(ex.max()), 1) if len(ex) else 0.,
                          clear_p10_mm=round(float(np.nanpercentile(d['deep'], 10) * 1000), 1) if np.isfinite(d['deep']).any() else 0.)
-    return curves, report
+    return damped, report
 
 
 def load(rig_path):
-    """The trunk outline beside a rig.json (rig_export writes it there), or None without one."""
+    """The trunk outline beside a rig.json (rig_export writes it there), or None without one -- or with one traced
+    from another rig: an outline from a different seat, character or export clears a body that is not there, and
+    clearing the wrong body is worse than not clearing at all (no outline, no swing, as before the export existed).
+    Pairs are checked on the rig's sha256 stamp; outlines that predate it on the trunk bone's world matrix, which
+    both files already carry."""
     path = Path(rig_path).with_name('trunk.json')
-    return Trunk.from_json(path) if path.exists() else None
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding='utf-8'))
+    stale = _stale_reason(data, Path(rig_path))
+    if stale:
+        print(f'TRUNK_STALE {path}: {stale}', flush=True)
+        return None
+    return Trunk.from_dict(data)
+
+
+def _stale_reason(data, rig_path):
+    """Why the outline and the rig do not belong together, or None when they do (or when the older outline carries
+    nothing to check against: a stale-looking pair is no proof of a stale one)."""
+    want = data.get('rig_sha256')
+    if want:
+        try:
+            have = hashlib.sha256(rig_path.read_bytes()).hexdigest()
+        except OSError:
+            return f'{rig_path} is unreadable'
+        return None if have == want else f'traced from rig {want[:12]}, this rig is {have[:12]}'
+    rig = json.loads(rig_path.read_text(encoding='utf-8'))
+    traced, bone = data.get('matrix'), data.get('bone')
+    neutral, world = rig.get('neutral_bones', {}).get(bone), rig.get('arm_world')
+    if traced is None or neutral is None or world is None:
+        return None
+    seat = np.asarray(world, float) @ np.asarray(neutral, float)
+    gap = float(np.abs(np.asarray(traced, float) - seat).max())
+    return None if gap < 1e-3 else f'traced at another seat (trunk bone {gap * 1000:.0f} mm off)'
