@@ -23,10 +23,13 @@ from .arm import closest_elbow_angle, elbow_circle
 SLICE = .01                      # m of outline per hull slice, along the trunk bone's y
 AXIS, OTHERS = 1, (0, 2)         # the slices run along the bone's y; each hull lies in its x-z
 ANGLE_STEP = 3.                  # deg between the sampled swing angles on the elbow's circle
-UP = np.linspace(.10, 1., 12)    # the upper arm's capsule: shares of the shoulder->elbow segment, from the deltoid
-                                 # (below it the arm's root sits inside the shoulder at any swing: not this fix's job)
+UP = np.linspace(.36, 1., 8)     # the upper arm's capsule: shares of the shoulder->elbow segment. Not the deltoid:
+                                 # its skin rides 6-7 cm off the bone (sleeve), no swing clears it -- that region is
+                                 # the body-yield's to help, and demanding it here only drags the elbow into big swings
 FO = np.linspace(0., 1., 12)     # ... the forearm's: shares of the elbow->wrist segment
-CLEARANCE = .006                 # m the arm keeps outside the outline (the outline is sampled, the skin is not)
+CLEARANCE = 0.                   # m the arm keeps outside the outline. Zero: the outline is sampled, the skin is not,
+                                 # and the necessary-swing study (median 12 deg, p90 25) was measured at touch level --
+                                 # a margin here sits at the bounds' edge and multiplies into visible swings
 RISE_LIMIT = .04                 # m the elbow may rise above its natural hang (an absolute wrist-relative cap would
                                  # bar the hang itself whenever the wrist rides low: hands entering or leaving)
 CURVE_STEP = .05                 # s between the swing curve's samples
