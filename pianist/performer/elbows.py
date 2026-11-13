@@ -170,18 +170,27 @@ def _choose(runs, target, prev):
 
 def _rows(n, step, jerk, acc, vel, pull, target):
     """The swing curve's sparse least squares: minimum jerk, damped acceleration, no needless speed, pulled to
-    the natural hang where it is known (solve_path's rows, one dimension). ``pull`` may be per sample: the
-    tracking tightens where the wrist itself is moving, so the elbow moves with the hand instead of being
-    smeared around its hops."""
+    the natural hang where it is known (solve_path's rows, one dimension). What is damped is the deviation from
+    the natural hang, not the curve: where the hang is known the smoothness rows apply to (x - target), so the
+    curve carries the target's own motion -- the elbow rides each wrist hop like a rigid chain and its velocity
+    dies as the wrist lands (no glide while the hand sits) -- and where it is unknown they apply to x itself.
+    ``pull`` may be per sample: tracking tightens where the wrist itself is moving."""
     from scipy import sparse
+    t = np.asarray(target, float)
     d3 = sparse.diags([-1., 3., -3., 1.], [0, 1, 2, 3], shape=(n - 3, n)) / step ** 3 / jerk
     d2 = sparse.diags([1., -2., 1.], [0, 1, 2], shape=(n - 2, n)) / step ** 2 / acc
     d1 = sparse.diags([-1., 1.], [0, 1], shape=(n - 1, n)) / step / vel
-    has = np.isfinite(target)
+    has = np.isfinite(t)
     pull = np.broadcast_to(np.asarray(pull, float), (n,))
     pull_rows = sparse.diags(has.astype(float) / pull, 0, shape=(n, n)).tocsr()[has]
     A = sparse.vstack([d3, d2, d1, pull_rows]).tocsr()
-    b = np.r_[np.zeros(n - 3), np.zeros(n - 2), np.zeros(n - 1), target[has] / pull[has]]
+    ok3 = np.convolve(has, np.ones(4, int), 'valid') == 4      # all four targets known: deviation rows
+    ok2 = np.convolve(has, np.ones(3, int), 'valid') == 3
+    ok1 = has[:-1] & has[1:]
+    b = np.r_[np.where(ok3, d3 @ t, 0.),            # the row's rhs is the target's own derivative
+              np.where(ok2, d2 @ t, 0.),
+              np.where(ok1, d1 @ t, 0.),
+              t[has] / pull[has]]
     return A, b
 
 
