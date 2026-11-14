@@ -290,7 +290,7 @@ class PoseSolver:
         # the wrist's lateral-bend wall (coherence.RADIAL_CAP): the forearm from the rig's shoulder to this wrist,
         # the thumb direction folded into the forearm's plane -- the anchor pose too must earn a thumb-side lean
         from .arm import closest_elbow
-        from .coherence import RADIAL_CAP, RADIAL_SCALE
+        from .coherence import RADIAL_CAP, ULNAR_CAP, RADIAL_SCALE
         radial = None
         try:
             arm = self.arm
@@ -302,7 +302,7 @@ class PoseSolver:
             n = np.linalg.norm(thumb)
             if n > 1e-9:
                 thumb /= n
-                radial = np.array([*f, *thumb, RADIAL_CAP, RADIAL_SCALE, 1.], dtype=FLOAT)
+                radial = np.array([*f, *thumb, RADIAL_CAP, ULNAR_CAP, RADIAL_SCALE, 1.], dtype=FLOAT)
         except ValueError:
             pass
 
@@ -320,7 +320,8 @@ class PoseSolver:
                 p = palm[:3, 1]
                 pp = p - (p @ radial[:3]) * radial[:3]
                 dev = math.degrees(math.asin(max(-1., min(1., float(pp @ radial[3:6])))))
-                out.append([prior * max(0., dev - radial[6]) / radial[7]])
+                over = max(0., dev - radial[6]) + max(0., -dev - radial[7])   # + thumb side, - little-finger side
+                out.append([prior * over / radial[8]])
             for d in digits:
                 out.append(prior * (vals[d] - shape[d]) / VALUE_SCALE)
             return np.concatenate(out)

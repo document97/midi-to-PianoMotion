@@ -37,13 +37,15 @@ KEY_TOL = 4.                    # deg the fingers may sit off the keys' length a
 KEY_FLOOR = 145.                # deg on the palm-vs-forearm angle: the turn never folds the wrist past it
 KEY_STEP = 1.                   # deg per yaw step while walking out from the relaxed yaw
 KEY_TRAVEL = 35.                # deg the wrist may deflect either way (radial/ulnar, the hand's own travel)
-KEY_RADIAL_MAX = 8.             # deg the palm may lean toward the thumb side (radial deviation) while a key is
-# played: a pianist's wrist bends toward the little finger (ulnar, ~30 deg of travel) and keeps the thumb side
-# nearly straight -- where the keys would ask for a radial lean the player moves the forearm instead (the elbow,
-# the seat), never wrenches the hand over. Measured on the daylight piece the render sat radial on 15% of the
-# right hand's played frames (p50 8, p90 13, worst 33 deg) -- the angle the user flagged as never seen in real
-# playing. The ulnar side keeps the full travel; the radial side stops at this cap and the search falls back to
-# the most upright feasible pose (the fingers may then sit off the keys: the hand reads right before it reads aimed).
+KEY_RADIAL_MAX = 12.            # deg the palm may lean toward the thumb side (radial deviation) while a key is
+# played: a modest thumb-side lean reads fine -- the user finds ten-odd degrees barely noticeable -- but past it
+# the hand reads wrenched, and where the keys would ask for that the player moves the forearm instead (the elbow,
+# the seat). The render sat radial on 15% of the right hand's played frames (p50 8, p90 13, worst 33 deg) before
+# the cap; the search stops here and falls back to the most upright feasible pose (the fingers may then sit off
+KEY_ULNAR_MAX = 15.             # deg the palm may lean toward the little-finger side (ulnar deviation) while a key
+# is played: the side real playing bends toward freely, yet the user's screenshot shows a deep ulnar kink (26 deg,
+# the palm 151) as by far the ugliest read -- the forearm must move instead, which is what a real player does
+# (measured before the cap: 70% of the left hand's played frames past 15 deg, worst 44)
 
 
 def palm_forearm_deg(solver, wrist, yaw, roll, shoulder, elbow=None):
@@ -98,14 +100,15 @@ def radial_dev(arm, yaw, roll, forearm, side):
 
 def turn_to_keys(arm, wrist, yaw, roll, elbow, tol=KEY_TOL, floor=KEY_FLOOR,
                  travel=KEY_TRAVEL, step=KEY_STEP, rolls=(0.,), strict=False,
-                 side=0., radial_max=KEY_RADIAL_MAX):
+                 side=0., radial_max=KEY_RADIAL_MAX, ulnar_max=KEY_ULNAR_MAX):
     """((yaw, roll), palm-vs-forearm deg) for a hand at ``wrist`` on the forearm from ``elbow``: the least turn of
     the relaxed yaw that puts the fingers down the keys, walked outward one degree at a time (nearest first, so the
     first hit is the least turn). ``rolls``: the roll offsets tried, each one before the next -- the yaw is searched
     to the end of its travel within the first; ``(0.,)`` keeps the planned roll (the little-finger side down), the
     wide set lets a hand whose plane cannot turn roll the forearm to buy the keys. ``side`` (+1 right, -1 left)
-    engages the radial cap: a lean toward the thumb side past ``radial_max`` is refused (KEY_RADIAL_MAX) -- the
-    player moves the forearm there, not the wrist, so the fingers may end up off the keys with the hand upright.
+    engages the lean caps: a lean toward the thumb side past ``radial_max`` or toward the little-finger side past
+    ``ulnar_max`` is refused (KEY_RADIAL_MAX / KEY_ULNAR_MAX) -- the player moves the forearm there, not the wrist,
+    so the fingers may end up off the keys with the hand upright.
 
     Two searches meet here, and the floor settles them: a pose that folds the wrist past ``floor`` is not taken even
     where it straightens the hand on the keys. Where the travel runs out first (the forearm arrives from too far
@@ -127,8 +130,9 @@ def turn_to_keys(arm, wrist, yaw, roll, elbow, tol=KEY_TOL, floor=KEY_FLOOR,
                 d = palm_vs(arm, y, r, forearm)
                 if d < floor:           # the wrist's floor: this way is closed, the other side may still be open
                     continue
-                if side and sgn == -side and radial_dev(arm, y, r, f, side) > radial_max:
-                    continue            # a radial (thumb-side) lean past the cap: the hand reads wrench -- the
+                dev = radial_dev(arm, y, r, f, side) if side else 0.   # + toward the thumb, - toward the little finger
+                if side and ((sgn == -side and dev > radial_max) or (sgn == side and -dev > ulnar_max)):
+                    continue            # a lean past either cap: the hand reads wrenched -- the
                 f_deg = abs(finger_deg(arm, y, r))   # forearm should have moved, so this pose is not taken
                 if f_deg <= tol:
                     return (y, r), d    # nearest first in this order, so the least roll and the least turn

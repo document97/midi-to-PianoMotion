@@ -36,12 +36,17 @@ LATERAL_HINGE = 4.              # ... beyond it, deg per unit: the hand moves ov
                                 # contact (1 mm off the key = 5 units), and a settle that loses a key is not taken
 NEUTRAL_ORIENTATION = np.array([15., 12.], dtype=FLOAT)               # weak pull of yaw, roll toward the hand's natural
                                                          # orientation on its forearm (posture.natural_orientation)
-RADIAL_CAP = 8.                 # deg the palm may lean toward the thumb side while a key is played (posture.KEY_RADIAL_MAX):
-                                # a pianist bends the wrist toward the little finger and moves the forearm -- the elbow, the
-                                # seat -- where the keys would ask for a thumb-side wrench; the render sat radial on 15% of the
-                                # right hand's played frames (p50 8, p90 13, worst 33 deg), an angle never seen in real playing
+RADIAL_CAP = 12.                # deg the palm may lean toward the thumb side while a key is played (posture.KEY_RADIAL_MAX):
+                                # a modest thumb-side lean reads fine -- the user finds ten-odd degrees barely noticeable --
+                                # but past that the hand reads wrenched; the render sat radial on 15% of the right hand's
+                                # played frames (p50 8, p90 13, worst 33 deg) before the wall
+ULNAR_CAP = 15.                 # deg the palm may lean toward the little finger side while a key is played (posture.KEY_ULNAR_MAX):
+                                # the side real playing bends toward freely, yet the user's screenshot shows a deep ulnar kink
+                                # (26 deg, palm 151) as by far the ugliest read -- a wall here is what makes the solve spend
+                                # its wrist travel (+-5 cm) and move the forearm instead, which is exactly what a real player
+                                # does (measured before the wall: 70% of the left hand's played frames past 15 deg, worst 44)
 RADIAL_SCALE = 3.               # deg per unit past the cap: soft (1 mm off a key = 5 units) so a chord that truly needs it
-                                # keeps its keys, but the solve now has a reason to spend its wrist travel (+-5 cm) and finger
+                                # keeps its keys, but the solve now has a reason to spend its wrist travel and finger
                                 # swing instead of wrenching the hand over
 POSITION_TRAVEL = .05
 PALM_HEIGHT = .035              # the wrist at least this far above the white key tops while playing (m; the palm tilted up, arm.PALM_PITCH): the palm
@@ -92,7 +97,7 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
         n = np.linalg.norm(thumb)
         if n > 1e-9:
             thumb /= n
-            radial = np.array([*f, *thumb, RADIAL_CAP, RADIAL_SCALE, 1.], dtype=FLOAT)
+            radial = np.array([*f, *thumb, RADIAL_CAP, ULNAR_CAP, RADIAL_SCALE, 1.], dtype=FLOAT)
     except ValueError:
         pass
     free_digits = [d for d in DIGITS if d not in digits]
@@ -169,7 +174,8 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
             p = palm[:3, 1]
             pp = p - (p @ radial[:3]) * radial[:3]
             dev = math.degrees(math.asin(max(-1., min(1., float(pp @ radial[3:6])))))
-            out.append([max(0., dev - radial[6]) / radial[7]])
+            over = max(0., dev - radial[6]) + max(0., -dev - radial[7])   # + toward the thumb, - toward the little finger
+            out.append([over / radial[8]])
         for d in digits:
             out.append((vals[d] - shape[d]) / VALUE_SCALE)
         return np.concatenate(out)
