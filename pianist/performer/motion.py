@@ -247,6 +247,12 @@ class WristPath:
         self.att_times, self.att_values = _attitude_table(self.times, self.values, self.slopes)
         self.accents = np.zeros((0, 3))          # (start, onset, depth): the wrist sinks into loud chords
 
+    def set_attitude(self, times, yaw, roll):
+        """Yaw and roll from their own table (attitude.settle: the palm turned onto the forearm the elbows solve
+        placed), read by ``__call__`` through np.interp; the knots' position columns and their curve stand."""
+        self.att_times = np.asarray(times, float)
+        self.att_values = np.stack([np.asarray(yaw, float), np.asarray(roll, float)], 1)
+
     def set_accents(self, notes):
         """Arm weight in loud chords: the wrist sinks from shortly before the touch to the onset and
         springs back after (deepest of overlapping accents). ``notes``: this hand's NoteMotions."""

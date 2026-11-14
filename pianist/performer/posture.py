@@ -72,25 +72,33 @@ def standard_shoulder(solver):
     return _standard_shoulder(solver.arm, solver.rig.neutral_wrist[solver.hand])
 
 
-def natural_orientation(solver, wrist, shoulder=None):
+def natural_orientation(solver, wrist, shoulder=None, elbow=None):
     """(yaw, roll) parameters of the relaxed hand with the wrist at ``wrist`` (world), its forearm from ``shoulder``:
-    the standard seat's (``standard_shoulder``) unless given (the hand on the lap: the actual body's)."""
+    the standard seat's (``standard_shoulder``) unless given (the hand on the lap: the actual body's).
+    ``elbow`` (world) replaces the elbow the standard seat's natural hang predicts: the second orientation pass
+    hands it the elbow the swing curve actually places, so the comfort corridor sees the arm the render will have
+    (the trunk holds that elbow wide, and the forearm's own yaw grows from 4 deg to 11-39 -- the palm was left bent
+    against it while the corridor, reading the natural hang, thought the wrist was straight)."""
     y0, dy, t0, dt = _calibration(solver)
     arm = solver.arm
     shoulder = standard_shoulder(solver) if shoulder is None else np.asarray(shoulder, FLOAT)
-    try:
-        elbow = closest_elbow(shoulder, np.asarray(wrist, FLOAT), arm.l1, arm.l2, arm.side)
-        forearm = np.asarray(wrist, FLOAT) - elbow
-        forearm_yaw = math.degrees(math.atan2(forearm[0], forearm[1]))
-    except ValueError:
+    if elbow is None:
+        try:
+            elbow = closest_elbow(shoulder, np.asarray(wrist, FLOAT), arm.l1, arm.l2, arm.side)
+        except ValueError:
+            elbow = None
+    if elbow is None:
         forearm_yaw = 0.
+    else:
+        forearm = np.asarray(wrist, FLOAT) - np.asarray(elbow, FLOAT)
+        forearm_yaw = math.degrees(math.atan2(forearm[0], forearm[1]))
     yaw = (HAND_FOLLOW * forearm_yaw - y0) / dy
     roll = (-LITTLE_SIDE_DOWN - t0) / dt
     if PALM_CORRIDOR and abs(dy) > 1e-9:    # the comfort corridor: where the relaxed hand would sit below the
-        now = palm_forearm_deg(solver, wrist, yaw, roll, shoulder)   # sustained line, the palm follows the
-        if now < PALM_SOFT_DEG:         # forearm further -- the wrist unbends (the arm line, not the hand's
+        now = palm_forearm_deg(solver, wrist, yaw, roll, shoulder, elbow=elbow)   # sustained line, the palm follows
+        if now < PALM_SOFT_DEG:         # the forearm further -- the wrist unbends (the arm line, not the hand's
             full = (forearm_yaw - y0) / dy   # bend, carries the reach); never past the forearm itself
-            far = palm_forearm_deg(solver, wrist, full, roll, shoulder)
+            far = palm_forearm_deg(solver, wrist, full, roll, shoulder, elbow=elbow)
             if far > now:
                 share = 1. if far <= PALM_SOFT_DEG else min(1., HAND_FOLLOW + (1. - HAND_FOLLOW) *
                                                             (PALM_SOFT_DEG - now) / (far - now))

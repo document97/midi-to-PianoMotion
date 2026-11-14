@@ -20,11 +20,37 @@ LEAN_SHIFT, LEAN_LIMIT_DEGREES = .2, 25.    # m the lean follows a far hand at m
 # back slowly, over SLIDE_BACK s after them, holding its place between the notes of a passage.
 SLIDE_SHARE, SLIDE_SECONDS, SLIDE_AHEAD, SLIDE_BACK = .4, .6, .6, 3.
 SHOULDER_FORWARD, SHOULDER_UP = .10, .025
+# The seat's own travel is quantized: the body answers the music's far ends, it does not fidget. Every note's excess
+# (over LEAN_NEAR) asks the seat to move a little, and the positive and negative asks are subtracted, so a passage that
+# alternates ends asks a few millimetres one way, then the other -- a hip that slides 3 mm every few seconds, which the
+# eye reads as fidgeting. The committed place moves only when the ask leaves a DEADBAND around it (HYST keeps a value
+# sitting on the edge from re-committing) and the place has been held DWELL s: a small ask is the LEAN's to cover.
+# The quantized curve is then smoothed (TAU) so a commit is a slow shift, not a step.
+SLIDE_DEADBAND, SLIDE_HYST, SLIDE_DWELL, SLIDE_TAU = .025, .010, 2., .5
+SLIDE_GRID = .01                # m: the place commits on a 10 mm grid, so a 26 mm ask and a 30 mm ask land alike
+SLIDE_STEP = .02
+# The lean follows a hand from LEAN_NEAR out (m past the standard seat's wrist): inside that the hand is close
+# enough that neither the seat nor the chest has to move. It used to be .15 m, which left every small ask to the
+# seat alone -- the hips did the fidgeting the chest could have covered with two degrees of tilt.
+LEAN_NEAR = .05
 # The side lean and the turn are shared up the spine, the upper bones more (shares 1 : 2 : 3 ... from the lowest): the
 # chest leans and turns further than the belly. The forward lean stays a hinge at the hips (the back straight).
-# The chest turns toward the side the seat has slid to, TURN_DEGREES at the full slide; the neck takes back
+# The chest turns toward the hand the lean is for (the lean's own shift, not the seat's: the seat's small travel
+# used to swing the shoulders and the head with it, which magnified the fidgeting); the neck takes back
 # HEAD_STEADY of the spine's side lean and turn, so the head moves less than the chest.
 TURN_DEGREES, HEAD_STEADY = 8., .5
+
+
+def _gauss_time(values, step, tau):
+    """A zero-phase gaussian over a uniform series; the ends are extrapolated linearly, not copied (copying
+    flat-lines a ramp)."""
+    r = max(1, int(round(tau / step * 2.)))
+    k = np.arange(-r, r + 1) * step
+    w = np.exp(-.5 * (k / tau) ** 2)
+    w /= w.sum()
+    pad = np.concatenate([values[0] + (values[0] - values[1]) * np.arange(r, 0, -1), values,
+                          values[-1] + (values[-1] - values[-2]) * np.arange(1, r + 1)])
+    return np.convolve(pad, w, mode='valid')
 
 
 def _about(point, rotation):
@@ -213,7 +239,8 @@ class Torso:
                       * (1 - self._smooth((t - self.last) / .7))) * cap
         shift += self._yield(t)         # the wrist-deviation ask rides on the rows' lean, independent of the cap
         offset = np.array([slide, 0., 0.], dtype=FLOAT)
-        turn = -math.radians(TURN_DEGREES) * (slide / self.slide_max if self.slide_max else 0.)
+        # the chest turns toward the hand the body is leaning for; the seat's own travel does not turn it
+        turn = -math.radians(TURN_DEGREES) * float(np.clip(shift / max(LEAN_SHIFT, 1e-9), -1., 1.))
         return shift, turn, offset
 
     def _shoulders(self, t, chain):
@@ -252,7 +279,15 @@ class Torso:
 
     def slide(self, t):
         """m the seat has slid along the bench (+x) at ``t``: toward each side, the most any note asks, reached
-        SLIDE_AHEAD s before it and let go over SLIDE_BACK s after it."""
+        SLIDE_AHEAD s before it and let go over SLIDE_BACK s after it -- then quantized (SLIDE_DEADBAND) and
+        smoothed (SLIDE_TAU): a small ask is the lean's, the seat's place changes rarely and slowly."""
+        if not self.slide_max:
+            return 0.
+        times, values = self._slide_curve()
+        return float(np.interp(t, times, values))
+
+    def _slide_raw(self, t):
+        """The unquantized ask at ``t`` (the seat's curve before the deadband)."""
         if not self.slide_max:
             return 0.
         need = self._slide_need()
@@ -263,6 +298,33 @@ class Torso:
         reach = np.where(lag < 0, self._smooth(1 + lag / SLIDE_AHEAD), 1 - self._smooth(lag / SLIDE_BACK))
         out = max(0., float(np.max(need[:, 1] * reach))) - max(0., float(np.max(-need[:, 1] * reach)))
         return out * (1 - self._smooth((t - self.last) / .7))
+
+    def _slide_curve(self):
+        """(times, m) of the seat's plan travel: the raw ask quantized to a committed place -- moved only when the
+        ask leaves SLIDE_DEADBAND around it (plus SLIDE_HYST once the place is committed) and the place has been
+        held SLIDE_DWELL s -- then smoothed over SLIDE_TAU and rate-limited. Built once per notes set."""
+        key = (id(self.rows), self.first, self.last, self.slide_max)
+        got = getattr(self, '_slide_cache', None)
+        if got is not None and got[0] == key:
+            return got[1], got[2]
+        if not self.slide_max or not len(self.rows):
+            self._slide_cache = (key, np.zeros(2), np.zeros(2))
+            return self._slide_cache[1], self._slide_cache[2]
+        times = np.arange(self.first - 1., self.last + SLIDE_BACK + 1., SLIDE_STEP)
+        raw = np.array([self._slide_raw(float(t)) for t in times])
+        place, held = 0., times[0] - SLIDE_DWELL
+        committed = np.empty(len(times))
+        for i, t in enumerate(times):
+            away = abs(raw[i] - place)
+            if away > SLIDE_DEADBAND and t - held >= SLIDE_DWELL:
+                # the ask has to keep going the same way: a value dancing on the edge of the band settles nothing
+                j = min(i + 1, len(times) - 1)
+                if away > SLIDE_DEADBAND + SLIDE_HYST or (raw[i] - place) * (raw[j] - place) > 0:
+                    place, held = round(float(raw[i]) / SLIDE_GRID) * SLIDE_GRID, t
+            committed[i] = place
+        values = _gauss_time(committed, SLIDE_STEP, SLIDE_TAU)
+        self._slide_cache = (key, times, values)
+        return times, values
 
     def protraction(self, h, t):
         """Share (0..1) of the full shoulder offset at ``t``."""

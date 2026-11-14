@@ -33,7 +33,7 @@ from .checks import BRUSH_DEPTH, Heightfield, stretched
 from .coherence import (COHERENCE_ROUNDS, MOTION_CUT_SECONDS, ORIENTATION_PULLS, free_releases, least_sunk, neighbour_targets,
                         settle, sunk, vector_of, wide_settle)
 from .kinematics import DIGITS, SWING_LATERAL, Rig
-from .torso import Torso, reach_window
+from .torso import LEAN_NEAR, Torso, reach_window
 from . import elbows
 from .contacts import HandCapsules, finger_pairs, hands_gap, pointing, raised_between
 from .motion import (CLEAR_STEP, REFINE_STEP, FingerIK, room_corrections, contact_error, contact_waypoints, finger_track, frame_hand,
@@ -57,6 +57,17 @@ def run_rig(run):
     report = json.loads((Path(run) / 'report.json').read_text(encoding='utf-8'))
     return HERE / 'rig_cache' / report.get('rig', LEGACY_RIG)
 FRAME_RATE = 60.                  # samples per second (written as fractional scene frames)
+# The second orientation pass (section 4.6: the hands re-aim at the forearms the elbows placed) is an A/B switch:
+# PIANOMOTION_REAIM=0 gives the single-pass behaviour, for comparing against an older run without editing code.
+REAIM_OFF = os.environ.get('PIANOMOTION_REAIM', '1').lower() in ('0', 'off', 'false', 'no')
+# The attitude refine (section 4.65) follows the same switch: on a held chord the settle lets the palm sag onto the
+# forearm the trunk forces, so anchors are inserted wherever the yaw sits ATT_GATE degrees off what the placed elbow
+# asks, ATT_STEP s apart, and settled with the palm's own yaw as the target -- the wrist moves with it, by the pull.
+ATT_STEP, ATT_GATE, ATT_ROUNDS, ATT_TURN = .3, 8., 2, 12.   # ATT_TURN: deg the target moves per round
+# The attitude anchors' own pull: the wrist's place weighs more than in the orientation pulls (a hand that drifts
+# across its keys to straighten its wrist trades one fault for another), the palm's yaw a little less.
+ATT_PULLS = (np.array([.08, .03, .015, 1., 1.], dtype=FLOAT),)
+APPLY_IDLE = os.environ.get('PIANOMOTION_IDLE_ATT', '1').lower() not in ('0', 'off', 'false', 'no')
 TAIL_SECONDS = 2.4                # after the source end: the hands lift off and come to rest (silent)
 REST_OFFSET = np.array([0., -.04, .03])    # before and after the piece the hands rest on the lap: the wrist this far
                                   # from the thigh's top (rig_export.lap) where the palm lies
@@ -873,14 +884,16 @@ def run(args):
     # orientation on its forearm (plus what its keys ask of it), smoothed over the neighbours.
     posture_solvers = performer_solvers(Rig(RIG))
     natural = {id(a): natural_orientation(posture_solvers[a.hand], a.pose.wrist) for a in anchors}
-    turned = set()
-    with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
-        free_starts(pool, [(a.hand, a.contacts(notes)) for a in anchors], starts)
-        for round_ in range(COHERENCE_ROUNDS):
+
+    def cohere(anchors, natural, rounds, pool):
+        """Settle each anchor toward ``natural`` (its hand's relaxed orientation), smoothed over the neighbours;
+        an anchor whose settle succeeded keeps its own orientation and only takes the neighbour's wrist pull."""
+        turned = set()
+        for round_ in range(rounds):
             order, jobs = [], []
             for h in 'LR':
                 mine = sorted((a for a in anchors if a.hand == h), key=lambda a: a.time)
-                offsets = [np.zeros(2) if id(a) in turned else natural[id(a)] for a in mine]
+                offsets = [np.zeros(2) if id(a) in turned else natural.get(id(a), np.zeros(2)) for a in mine]
                 for a, target in zip(mine, neighbour_targets(mine, offsets)):
                     order.append(a)
                     contacts = a.contacts(notes)
@@ -890,10 +903,14 @@ def run(args):
                     jobs.append((h, contacts, vector_of(a.pose), a.pose.values, target, ORIENTATION_PULLS,
                                  max(a.pose.contact_error, .0005), round_ == 0 and stretched(c.pitch for c in contacts),
                                  (starts[h, tuple(contacts)],) if round_ == 0 and len(contacts) > 1 else ()))
-            for a, pose in zip(order, progress_map(pool, _settle, jobs, f'coherence {round_ + 1}/{COHERENCE_ROUNDS}')):
+            for a, pose in zip(order, progress_map(pool, _settle, jobs, f'coherence {round_ + 1}/{rounds}')):
                 if pose is not None:
                     a.pose = pose
                     turned.add(id(a))
+
+    with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
+        free_starts(pool, [(a.hand, a.contacts(notes)) for a in anchors], starts)
+        cohere(anchors, natural, COHERENCE_ROUNDS, pool)
     _mark('coherence', t0, stages)
 
     # 3. wrist paths, refined until the held keys stay under the fingers
@@ -964,8 +981,8 @@ def run(args):
                 # into another basin (the thumb's joint across the next key)
                 took = max((o for o in anchors if o.hand == a.hand and o.time <= a.time and a.held
                             and set(a.held) <= set(o.incoming) | set(o.held)), key=lambda o: o.time, default=None)
-                starts = ((vector_of(took.pose), took.pose.values),) if took else ()
-                jobs.append((a.hand, a.contacts(notes), v, values, v, (NEAR_PATH,), REACH_TOLERANCE, False, starts))
+                seeds = ((vector_of(took.pose), took.pose.values),) if took else ()
+                jobs.append((a.hand, a.contacts(notes), v, values, v, (NEAR_PATH,), REACH_TOLERANCE, False, seeds))
             poses = progress_map(pool, _settle, jobs, 'intermediate poses', 2)
             kept = [replace(a, pose=p) for a, p in zip(new, poses)
                     if p is not None and gentle(a, p, paths[a.hand], [o for o in anchors + new if o.hand == a.hand])]
@@ -1005,7 +1022,7 @@ def run(args):
     _mark('wrist_paths', t0, stages)
 
 
-    # 4. torso, finger keyposes
+    # 4. the torso's rows and the context the arm and finger stages read
     t0 = time.perf_counter()
     torso_rows, reach_rows = [], {'L': [], 'R': []}
     if rig.data.get('torso'):
@@ -1014,7 +1031,7 @@ def run(args):
             wrist = np.asarray(paths[n.hand](n.onset)[:3], float)
             delta = wrist[0] - reference[n.hand][0, 3]
             weight = (n.velocity / 127) ** .6
-            torso_rows.append((n.onset, math.copysign(max(0., abs(delta) - .15), delta), weight))
+            torso_rows.append((n.onset, math.copysign(max(0., abs(delta) - LEAN_NEAR), delta), weight))
             arm = rig.arms[n.hand]
             reach_rows[n.hand].append((n.onset, np.linalg.norm(wrist - reference[n.hand][:3, 3]) / (arm.l1 + arm.l2), weight))
     first = min(n.onset for n in notes.values())
@@ -1023,20 +1040,6 @@ def run(args):
     for n in notes.values():
         by_pitch.setdefault(n.pitch, []).append(n)
     context = dict(base, paths=paths, waypoints=waypoints, torso_rows=(torso_rows, first, last, reach_rows), by_pitch=by_pitch)
-    with ProcessPoolExecutor(min(workers, 10), initializer=_init, initargs=(context,)) as pool:
-        tracks = {'L': {}, 'R': {}}
-        for (h, d), track in progress_map(pool, _track, [(h, d) for h in 'LR' for d in DIGITS], 'finger tracks'):
-            tracks[h][d] = track
-    # free fingers after the spacing: a smooth lift where the swing sank them into the keys
-    grid = np.arange(-intro, duration + CLEAR_STEP, CLEAR_STEP)
-    with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(context, tracks=tracks),)) as pool:
-        jobs = [(h, part) for h in 'LR' for part in chunks(grid, workers * 2)]
-        parts = progress_map(pool, _room, jobs, 'finger room')
-    for h in 'LR':
-        mine = [p for (hh, _), p in zip(jobs, parts) if hh == h]
-        for d in DIGITS:
-            tracks[h][d].set_room(grid, np.concatenate([p[d] for p in mine]))
-    _mark('finger_keyposes', t0, stages)
 
     # 4.5 elbows: one smooth swing-angle curve per arm that keeps them out of the trunk's outline (elbows.solve,
     # the trunk.json export beside the rig), the body leaning less where no swing clears; the frames stage
@@ -1065,6 +1068,130 @@ def run(args):
             context['torso_yield'] = torso.yield_rows  # the wrist-deviation ask (the workers' torso reads it)
             context['torso_slide_yield'] = torso.slide_yield_rows   # the ask's seat part
     _mark('elbows', t0, stages)
+
+    # 4.6 The hands re-aim at the forearms the elbows actually placed. The first settle aimed each hand at the
+    # forearm of the *standard seat's* elbow (the hand's plan does not depend on where the performer sits); the swing
+    # curve then moves that elbow out of the trunk's way, and on the daylight piece the rendered forearm's yaw comes
+    # out at p50 11 / p95 39 deg where the corridor predicted 4 -- so the palm is left bent 25-40 deg against the arm
+    # it has (60 % of the left hand's frames below 160). With the curve known, the anchors settle again on the
+    # forearm that is really there (posture.natural_orientation's forearm_yaw), and the wrist paths are rebuilt
+    # through the new poses: the settle moves the wrist as well as the palm, so the fingers keep their keys.
+    if context['elbow_swing'] is not None and not REAIM_OFF:
+        t0 = time.perf_counter()
+        from . import attitude
+        natural2 = attitude.aim(posture_solvers, anchors, context['elbow_swing'], torso)
+        for a in anchors:       # an anchor the curve could not place an elbow for keeps its first-pass target
+            if id(a) not in natural2:
+                natural2[id(a)] = natural.get(id(a), natural_orientation(posture_solvers[a.hand], a.pose.wrist))
+        moved = float(np.median([np.linalg.norm(natural2[id(a)] - natural.get(id(a), natural2[id(a)]))
+                                 for a in anchors])) if anchors else 0.
+        print(f'[reaim] {len(natural2)} anchors, orientation target moved p50 {moved:.1f} deg', flush=True)
+        with ProcessPoolExecutor(workers, initializer=_init, initargs=(base,)) as pool:
+            free_starts(pool, [(a.hand, a.contacts(notes)) for a in anchors], starts)   # the refine's own anchors
+            cohere(anchors, natural2, 1, pool)
+        paths = paths_for(anchors)
+        waypoints = contact_waypoints(placed(anchors, paths, posture_solvers, notes), notes)
+        _mark('reaim', t0, stages)
+
+        # 4.65 the attitude refine: across a held chord the settle lets the palm sag onto the forearm the trunk
+        # forces (the contacts win, measured at 131-158 deg against the corridor's 160-162), and the anchors' own
+        # palms are square only at the strike. Wherever the path's yaw sits far from what the placed elbow asks, an
+        # anchor goes in and is settled with that yaw as the target: the settle moves the wrist with the palm, so the
+        # keys are kept, which turning the yaw alone does not (measured: 17 deg at a fixed wrist, fingers 49 mm off).
+        t0 = time.perf_counter()
+        inserted = 0
+        for att_round in range(ATT_ROUNDS):
+            want = attitude.targets(paths, context['elbow_swing'], torso, posture_solvers, -intro, duration, ATT_STEP)
+            new = []
+            for h in 'LR':
+                times_h, yaw_h = want[h]
+                for t, y in zip(times_h, yaw_h):
+                    if not np.isfinite(y):
+                        continue
+                    v = np.asarray(paths[h](float(t)), float)
+                    if abs(y - v[3]) < ATT_GATE:
+                        continue
+                    y = v[3] + float(np.clip(y - v[3], -ATT_TURN, ATT_TURN))
+                    held = tuple(k for k, n in hand_notes[h].items() if n.touch <= t <= n.release)
+                    if not held:            # an idle hand keeps no key; its own yaw loses nothing
+                        continue
+                    new.append((Anchor(h, -1, float(t), float(v[0]), (), held), float(y)))
+            if not new:
+                break
+            with ProcessPoolExecutor(workers, initializer=_init, initargs=(context,)) as pool:
+                jobs = []
+                for a, y in new:
+                    v = np.asarray(paths[a.hand](a.time), float)
+                    values = {notes[k].digit: waypoint(waypoints[k], a.time)[1] for k in a.held if k in waypoints}
+                    jobs.append((a.hand, a.contacts(notes), v, values, np.r_[v[:3], y, v[4]], ATT_PULLS,
+                                 REACH_TOLERANCE, False, ()))
+                poses = progress_map(pool, _settle, jobs, f'attitude {att_round + 1}/{ATT_ROUNDS}')
+                near = {h: [o for o in anchors if o.hand == h] + [a for a, _ in new if a.hand == h] for h in 'LR'}
+                kept = []
+                for (a, _), p in zip(new, poses):
+                    if p is None or p.contact_error > REACH_TOLERANCE:
+                        continue
+                    if not gentle(a, p, paths[a.hand], near[a.hand]):
+                        continue
+                    # the guard: the turn has to leave the wrist better off, not worse (the settle answers to the
+                    # keys first, and a pose that both keeps them and folds the wrist is not an improvement)
+                    before = attitude.palm_at(posture_solvers[a.hand], torso, context['elbow_swing'], a.hand,
+                                              np.asarray(paths[a.hand](a.time), float), a.time)
+                    after = attitude.palm_at(posture_solvers[a.hand], torso, context['elbow_swing'], a.hand,
+                                             vector_of(p), a.time)
+                    if after < before - 1.:
+                        continue
+                    kept.append(replace(a, pose=p))
+            if not kept:
+                break
+            context['paths'] = paths
+            with ProcessPoolExecutor(workers, initializer=_init, initargs=(context,)) as pool:
+                parts = progress_map(pool, _family, [list(c) for c in
+                                                     np.array_split(np.array(kept, dtype=object), max(1, len(kept) // 2))
+                                                     if len(c)], 'attitude families')
+                for a, sl in zip(kept, [sl for part in parts for sl in part]):
+                    a.family = sl
+            anchors = anchors + kept
+            inserted += len(kept)
+            paths = paths_for(anchors)
+            waypoints = contact_waypoints(placed(anchors, paths, posture_solvers, notes), notes)
+            print(f'[attitude] round {att_round + 1}: {len(kept)} of {len(new)} anchors settle on the placed elbow',
+                  flush=True)
+        if inserted:
+            print(f'[attitude] {inserted} anchors inserted, palm target {attitude.TARGET_DEG:.0f} deg', flush=True)
+        # 4.66 an idle hand keeps no key, so nothing is bought by its own yaw: the palm turns onto the forearm there
+        # too (a folded wrist in the air reads as a stiff hand), smoothed and rate-limited, the playing frames
+        # untouched.
+        if APPLY_IDLE:
+            want = attitude.targets(paths, context['elbow_swing'], torso, posture_solvers, -intro, duration, ATT_STEP)
+            for h in 'LR':
+                tm = want[h][0]
+                busy = np.zeros(len(tm), bool)
+                for n in hand_notes[h].values():
+                    busy |= (tm >= n.touch - .15) & (tm <= n.release + .15)
+                paths[h].set_attitude(*attitude.idle_attitude(paths[h], want[h], busy))
+            print('[attitude] idle stretches turned onto the forearm', flush=True)
+        offsets = yield_offsets(paths, notes, duration, HANDS_APART, YIELD_SPEED, YIELD_BUSY)
+        paths = {h: YieldingPath(paths[h], *offsets[h]) for h in 'LR'}
+        context['paths'], context['waypoints'] = paths, waypoints
+        _mark('attitude', t0, stages)
+
+    # 4.7 finger keyposes on the settled wrists
+    t0 = time.perf_counter()
+    with ProcessPoolExecutor(min(workers, 10), initializer=_init, initargs=(context,)) as pool:
+        tracks = {'L': {}, 'R': {}}
+        for (h, d), track in progress_map(pool, _track, [(h, d) for h in 'LR' for d in DIGITS], 'finger tracks'):
+            tracks[h][d] = track
+    # free fingers after the spacing: a smooth lift where the swing sank them into the keys
+    grid = np.arange(-intro, duration + CLEAR_STEP, CLEAR_STEP)
+    with ProcessPoolExecutor(workers, initializer=_init, initargs=(dict(context, tracks=tracks),)) as pool:
+        jobs = [(h, part) for h in 'LR' for part in chunks(grid, workers * 2)]
+        parts = progress_map(pool, _room, jobs, 'finger room')
+    for h in 'LR':
+        mine = [p for (hh, _), p in zip(jobs, parts) if hh == h]
+        for d in DIGITS:
+            tracks[h][d].set_room(grid, np.concatenate([p[d] for p in mine]))
+    _mark('finger_keyposes', t0, stages)
 
     # 5. frames
     t0 = time.perf_counter()
@@ -1128,6 +1255,11 @@ def run(args):
                     penetration_frames_over_3mm={h: int((frames[f'{h}_penetration'] > .003).sum()) for h in 'LR'},
                     worst_penetration_mm={h: float(frames[f'{h}_penetration'].max() * 1000) for h in 'LR'},
                     arm_out_of_reach_frames={h: int((~frames[f'{h}_arm_ok']).sum()) for h in 'LR'},
+                    palm_vs_forearm_deg={h: dict(p50=round(float(np.median(frames[f'{h}_palm_deg'])), 1),
+                                                 p5=round(float(np.percentile(frames[f'{h}_palm_deg'], 5)), 1),
+                                                 min=round(float(frames[f'{h}_palm_deg'].min()), 1),
+                                                 below_160=round(float((frames[f'{h}_palm_deg'] < 160).mean()), 3))
+                                        for h in 'LR'},
                     elbow_swing=elbows_report),
         seconds=dict(stages, total=time.perf_counter() - started), workers=workers,
         music_seconds=duration - TAIL_SECONDS, intro_seconds=intro)
