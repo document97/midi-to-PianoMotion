@@ -7,6 +7,7 @@ turned slightly inward, with the little-finger side ~7 deg lower. With the elbow
 angle and the wrist (ulnar deviation) takes the rest.
 """
 import math
+import os
 
 import numpy as np
 
@@ -23,6 +24,9 @@ PALM_SOFT_DEG = 160.            # sustained comfort line (pianists keep ~10 deg 
 # wrist unbends, the arm line, not the hand's bend, carries the reach
 PALM_FLOOR_DEG = 135.           # the user's transient acceptance floor: below it the body yields (torso.py), the
 # wrist never bends more; what is left after the palm's full follow is the body's share to cover
+# The corridor is an A/B switch too: PIANOMOTION_PALM_CORRIDOR=0 gives the hand the 11.11 behaviour (HAND_FOLLOW
+# only), for comparing a run against an older one without editing code
+PALM_CORRIDOR = os.environ.get('PIANOMOTION_PALM_CORRIDOR', '1').lower() not in ('0', 'off', 'false', 'no')
 
 
 def palm_forearm_deg(solver, wrist, yaw, roll, shoulder, elbow=None):
@@ -82,7 +86,7 @@ def natural_orientation(solver, wrist, shoulder=None):
         forearm_yaw = 0.
     yaw = (HAND_FOLLOW * forearm_yaw - y0) / dy
     roll = (-LITTLE_SIDE_DOWN - t0) / dt
-    if abs(dy) > 1e-9:                  # the comfort corridor: where the relaxed hand would sit below the
+    if PALM_CORRIDOR and abs(dy) > 1e-9:    # the comfort corridor: where the relaxed hand would sit below the
         now = palm_forearm_deg(solver, wrist, yaw, roll, shoulder)   # sustained line, the palm follows the
         if now < PALM_SOFT_DEG:         # forearm further -- the wrist unbends (the arm line, not the hand's
             full = (forearm_yaw - y0) / dy   # bend, carries the reach); never past the forearm itself
