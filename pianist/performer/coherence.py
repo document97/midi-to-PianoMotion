@@ -19,7 +19,8 @@ from .checks import stretched
 from . import fast_settle
 from .anchors import KEY_TRAVEL
 from .kinematics import DIGITS, FLOAT
-from .posture import natural_orientation
+from .arm import closest_elbow
+from .posture import natural_orientation, standard_shoulder
 from .motion import SIDEWAYS_FREE, pad_residual, sweeps, DEPART_DELAY, FLOOR_SCALE, MOVE_BASE_SECONDS, MOVE_SPEED, UNHURRIED, KeyFloor, KeySurface
 from .pose import CONTACT_TOLERANCE, RELAXED, hand_shape, ROLL_BOUNDS, VALUE_SCALE, WEB_SCALE, YAW_BOUNDS, HandPose, PoseSolver, wrist_steps
 
@@ -35,6 +36,13 @@ LATERAL_HINGE = 4.              # ... beyond it, deg per unit: the hand moves ov
                                 # contact (1 mm off the key = 5 units), and a settle that loses a key is not taken
 NEUTRAL_ORIENTATION = np.array([15., 12.], dtype=FLOAT)               # weak pull of yaw, roll toward the hand's natural
                                                          # orientation on its forearm (posture.natural_orientation)
+RADIAL_CAP = 8.                 # deg the palm may lean toward the thumb side while a key is played (posture.KEY_RADIAL_MAX):
+                                # a pianist bends the wrist toward the little finger and moves the forearm -- the elbow, the
+                                # seat -- where the keys would ask for a thumb-side wrench; the render sat radial on 15% of the
+                                # right hand's played frames (p50 8, p90 13, worst 33 deg), an angle never seen in real playing
+RADIAL_SCALE = 3.               # deg per unit past the cap: soft (1 mm off a key = 5 units) so a chord that truly needs it
+                                # keeps its keys, but the solve now has a reason to spend its wrist travel (+-5 cm) and finger
+                                # swing instead of wrenching the hand over
 POSITION_TRAVEL = .05
 PALM_HEIGHT = .035              # the wrist at least this far above the white key tops while playing (m; the palm tilted up, arm.PALM_PITCH): the palm
 PALM_SCALE = .004               # stays off the keys and the fingers reach down arched (m per unit, one-sided)
@@ -70,6 +78,23 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
     stretch = stretched(depths)
     vals = dict(values)
     natural = natural_orientation(solver, vector[:3])
+    # the wrist's lateral-bend wall (RADIAL_CAP): the forearm from the standard seat's natural hang -- the hand's
+    # plan must not depend on where the performer sits -- and the thumb direction folded into the forearm's plane
+    radial = None
+    try:
+        arm = solver.arm
+        elbow = closest_elbow(standard_shoulder(solver), np.asarray(vector[:3], FLOAT),
+                              arm.l1, arm.l2, arm.side)
+        f = (np.asarray(vector[:3], FLOAT) - np.asarray(elbow, FLOAT))
+        f /= max(np.linalg.norm(f), 1e-9)
+        thumb = np.array([-arm.side, 0., 0.], dtype=FLOAT)
+        thumb -= (thumb @ f) * f
+        n = np.linalg.norm(thumb)
+        if n > 1e-9:
+            thumb /= n
+            radial = np.array([*f, *thumb, RADIAL_CAP, RADIAL_SCALE, 1.], dtype=FLOAT)
+    except ValueError:
+        pass
     free_digits = [d for d in DIGITS if d not in digits]
     shape = hand_shape(solver.span(depths))
     # free fingers preferably clear the keys keeping their curve (the knuckle opened FREE_CURVED_LIFT), so the wrist
@@ -140,6 +165,11 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
         out.append((v[:5] - target) / pull)
         out.append([max(0., solver.white_top + PALM_HEIGHT - v[2]) / PALM_SCALE])
         out.append((v[3:5] - natural) / NEUTRAL_ORIENTATION)
+        if radial is not None:
+            p = palm[:3, 1]
+            pp = p - (p @ radial[:3]) * radial[:3]
+            dev = math.degrees(math.asin(max(-1., min(1., float(pp @ radial[3:6])))))
+            out.append([max(0., dev - radial[6]) / radial[7]])
         for d in digits:
             out.append((vals[d] - shape[d]) / VALUE_SCALE)
         return np.concatenate(out)
@@ -164,7 +194,7 @@ def settle(solver, contacts, vector, values, target, pull, iterations=25, front=
                          else solver.regions.keys[c.pitch]['bounds_min'][1] + front)
         prob = fast_settle.problem(ordered, digits, start, lower, upper, values, depths, edges, blacks,
                                    [solver.regions.centre(c.pitch)[0] for c in ordered], target, pull, natural, shape,
-                                   curved_free, np.array(FREE_LIFTED), stretch, steps, iterations, True)
+                                   curved_free, np.array(FREE_LIFTED), stretch, steps, iterations, True, radial)
         x, used = fast_settle.solve(fast_settle.pack(solver), prob)
         x = np.asarray(x, FLOAT)
     else:

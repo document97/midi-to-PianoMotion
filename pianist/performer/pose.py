@@ -287,6 +287,24 @@ class PoseSolver:
         stretch = stretched(c.pitch for c in contacts)
         web = self.web_limit(digits)
         shape = hand_shape(self.span(c.pitch for c in contacts))
+        # the wrist's lateral-bend wall (coherence.RADIAL_CAP): the forearm from the rig's shoulder to this wrist,
+        # the thumb direction folded into the forearm's plane -- the anchor pose too must earn a thumb-side lean
+        from .arm import closest_elbow
+        from .coherence import RADIAL_CAP, RADIAL_SCALE
+        radial = None
+        try:
+            arm = self.arm
+            elbow = closest_elbow(arm.pre_upper_world[:3, 3], np.asarray(wrist, FLOAT), arm.l1, arm.l2, arm.side)
+            f = np.asarray(wrist, FLOAT) - np.asarray(elbow, FLOAT)
+            f /= max(np.linalg.norm(f), 1e-9)
+            thumb = np.array([-arm.side, 0., 0.], dtype=FLOAT)
+            thumb -= (thumb @ f) * f
+            n = np.linalg.norm(thumb)
+            if n > 1e-9:
+                thumb /= n
+                radial = np.array([*f, *thumb, RADIAL_CAP, RADIAL_SCALE, 1.], dtype=FLOAT)
+        except ValueError:
+            pass
 
         def residuals(v, prior, clear):
             w, ya, ro, vals = unpack(v)
@@ -298,6 +316,11 @@ class PoseSolver:
                 if clear:
                     out.append(self.clearance_residual(c.digit, vals, palm, depths, c.pitch, stretch))
             out.append(prior * (v[:5] - prior_wrist) / WRIST_SCALE)
+            if radial is not None:
+                p = palm[:3, 1]
+                pp = p - (p @ radial[:3]) * radial[:3]
+                dev = math.degrees(math.asin(max(-1., min(1., float(pp @ radial[3:6])))))
+                out.append([prior * max(0., dev - radial[6]) / radial[7]])
             for d in digits:
                 out.append(prior * (vals[d] - shape[d]) / VALUE_SCALE)
             return np.concatenate(out)
@@ -318,7 +341,7 @@ class PoseSolver:
             # the same seeds, phases and solves compiled (fast_settle)
             x, it = fast_settle.solve_pose(fast_settle.pack(self), fast_settle.pose_problem(
                 contacts, digits, x, lower, upper, values, depths, prior_wrist, shape, stretch, steps, seeds, SEED_ITERATIONS,
-                iterations, clearance))
+                iterations, clearance, radial))
             x = np.asarray(x, FLOAT)
         else:
             it, best = 0, None

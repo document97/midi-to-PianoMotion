@@ -126,8 +126,9 @@ def pack(solver):
 
 
 def problem(contacts, digits, x, lower, upper, values, depths, edges, blacks, centres, target, pull, natural, shape,
-            curved_free, lifted, stretch, steps, iterations, curved):
-    """One settle problem as arrays (contacts sorted by digit)."""
+            curved_free, lifted, stretch, steps, iterations, curved, radial=None):
+    """One settle problem as arrays (contacts sorted by digit). ``radial``: the wrist's lateral-bend wall as one
+    row -- forearm unit (3), thumb-perpendicular unit (3), cap deg, scale, enabled -- or None for no wall."""
     table = np.zeros(128, F)
     for p, d in depths.items():
         table[p] = d
@@ -138,12 +139,14 @@ def problem(contacts, digits, x, lower, upper, values, depths, edges, blacks, ce
             np.array(centres, F), np.asarray(target, F), np.asarray(pull, F), np.asarray(natural, F),
             np.array([shape[d] for d in digits], F).reshape(k, 4),
             np.array([curved_free.get(d, np.zeros(4)) for d in DIGITS], F), np.asarray(lifted, F),
-            bool(stretch), np.asarray(steps, F), int(iterations), bool(curved))
+            bool(stretch), np.asarray(steps, F), int(iterations), bool(curved),
+            np.asarray(radial, F) if radial is not None else np.zeros(9, F))
 
 
 def pose_problem(contacts, digits, x, lower, upper, values, depths, prior_wrist, shape, stretch, steps, seeds,
-                 seed_iterations, iterations, clearance):
-    """One PoseSolver.solve problem as arrays (contacts sorted by digit)."""
+                 seed_iterations, iterations, clearance, radial=None):
+    """One PoseSolver.solve problem as arrays (contacts sorted by digit). ``radial``: the lateral-bend wall, one
+    row -- forearm unit (3), thumb-perpendicular unit (3), cap deg, scale, enabled -- or None for no wall."""
     table = np.zeros(128, F)
     for p, d in depths.items():
         table[p] = d
@@ -151,7 +154,8 @@ def pose_problem(contacts, digits, x, lower, upper, values, depths, prior_wrist,
     return (np.array(digits, I), np.array([c.pitch for c in contacts], I), np.array([c.depth for c in contacts], F),
             np.asarray(x, F), np.asarray(lower, F), np.asarray(upper, F), np.array([values[d] for d in DIGITS], F), table,
             np.asarray(prior_wrist, F), np.array([shape[d] for d in digits], F).reshape(k, 4), bool(stretch),
-            np.asarray(steps, F), np.array(seeds, F).reshape(-1, 3), int(seed_iterations), int(iterations), bool(clearance))
+            np.asarray(steps, F), np.array(seeds, F).reshape(-1, 3), int(seed_iterations), int(iterations), bool(clearance),
+            np.asarray(radial, F) if radial is not None else np.zeros(9, F))
 
 
 def solve_pose(hand_pack, prob):
@@ -421,7 +425,7 @@ def residuals(H, Q, x, curved, vals, mats, alt, work, loc, world, out, C):
     fp, pad, clear, const, pm, table, ks, spacing, web, sc, per_digit, neutral_or, value_scale = (
         H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8], H[9], H[10], H[11], H[12])
     (digits, pitches, depths, _x, _lo, _up, _values, dtable, edges, blacks, centres, target, pull, natural, shape,
-     curved_free, lifted, stretch, _steps, _it, _curved) = Q
+     curved_free, lifted, stretch, _steps, _it, _curved, radial) = Q
     k = len(digits)
     pose_mats(H, Q, x, vals, mats, work, C)
     palm = np.empty((3, 4))
@@ -545,6 +549,17 @@ def residuals(H, Q, x, curved, vals, mats, alt, work, loc, world, out, C):
     m += 1
     for j in range(2):
         out[m] = (x[3 + j] - natural[j]) / neutral_or[j]
+        m += 1
+    if radial[8] > 0.:
+        # the wrist's lateral-bend wall: the palm's long axis (palm column 1) folded against the forearm plane,
+        # leaning past the cap toward the thumb side costs (coherence.RADIAL_CAP / RADIAL_SCALE)
+        p0, p1, p2 = palm[0, 1], palm[1, 1], palm[2, 1]
+        f0, f1, f2 = radial[0], radial[1], radial[2]
+        pdot = p0 * f0 + p1 * f1 + p2 * f2
+        pp0, pp1, pp2 = p0 - pdot * f0, p1 - pdot * f1, p2 - pdot * f2
+        tdot = pp0 * radial[3] + pp1 * radial[4] + pp2 * radial[5]
+        dev = math.degrees(math.asin(max(-1., min(1., tdot))))   # thumb-perp arrives a unit vector
+        out[m] = max(0., dev - radial[6]) / radial[7]
         m += 1
     for i in range(k):
         for j in range(4):
@@ -727,6 +742,7 @@ def pose_residuals(H, Q, x, prior, clear, vals, mats, work, loc, world, out, C):
     pad, clearskin, pm, table, web, sc, value_scale = H[1], H[2], H[4], H[5], H[8], H[9], H[12]
     wrist_scale, clear_scale = H[13][2], H[13][3][0]
     digits, pitches, depths, dtable, prior_wrist, shape, stretch = Q[0], Q[1], Q[2], Q[7], Q[8], Q[9], Q[10]
+    radial = Q[16]
     k = len(digits)
     vals[:, :] = Q[6]
     for i in range(k):
@@ -765,6 +781,16 @@ def pose_residuals(H, Q, x, prior, clear, vals, mats, work, loc, world, out, C):
                 m += 1
     for j in range(5):
         out[m] = prior * (x[j] - prior_wrist[j]) / wrist_scale[j]
+        m += 1
+    if radial[8] > 0.:
+        # the wrist's lateral-bend wall (coherence.RADIAL_CAP), the pose solve's share
+        p0, p1, p2 = palm[0, 1], palm[1, 1], palm[2, 1]
+        f0, f1, f2 = radial[0], radial[1], radial[2]
+        pdot = p0 * f0 + p1 * f1 + p2 * f2
+        pp0, pp1, pp2 = p0 - pdot * f0, p1 - pdot * f1, p2 - pdot * f2
+        tdot = pp0 * radial[3] + pp1 * radial[4] + pp2 * radial[5]
+        dev = math.degrees(math.asin(max(-1., min(1., tdot))))
+        out[m] = prior * max(0., dev - radial[6]) / radial[7]
         m += 1
     for i in range(k):
         for j in range(4):
