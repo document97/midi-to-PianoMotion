@@ -69,9 +69,11 @@ ATT_STEP, ATT_GATE, ATT_ROUNDS, ATT_TURN = .3, 8., 2, 12.   # ATT_TURN: deg the 
 ATT_PULLS = (np.array([.08, .03, .015, 1., 1.], dtype=FLOAT),)
 APPLY_IDLE = os.environ.get('PIANOMOTION_IDLE_ATT', '1').lower() not in ('0', 'off', 'false', 'no')
 TAIL_SECONDS = 2.4                # after the source end: the hands lift off and come to rest (silent)
-REST_OFFSET = np.array([0., -.04, .03])    # before and after the piece the hands rest on the lap: the wrist this far
-                                  # from the thigh's top (rig_export.lap) where the palm lies
-REST_YAW = 30.                    # deg the resting hands are turned in toward each other
+REST_OFFSET = np.array([0., -.02, .01])    # before and after the piece the hands rest on the lap: the wrist this far
+                                  # from the thigh's top (rig_export.lap) where the palm lies -- close enough that the
+                                  # palm and fingertips actually touch the thigh; the old 3 cm hover read as a claw
+                                  # floating in front of the lap
+REST_YAW = 20.                    # deg the resting hands are turned in toward each other
 INTRO_SECONDS = 2.                # the hands rest at least this long before the first note, then come onto the keys:
                                   # a piece starting sooner is preceded by silence (motion and audio start that much later)
 WARM_FRAMES = 12                 # frames solved before a chunk (discarded) so the warm start carries over
@@ -1169,12 +1171,16 @@ def run(args):
         # untouched.
         if APPLY_IDLE:
             want = attitude.targets(paths, context['elbow_swing'], torso, posture_solvers, -intro, duration, ATT_STEP)
+            from .motion import KeyFloor
+            # the wrist rides ~4 cm above the white keys' top when playing and sits below it on the lap, so the
+            # line between (the key tops themselves) splits resting from aiming on any seat height
+            aim_z = KeyFloor(posture_solvers['R'].regions).white_top + .01
             for h in 'LR':
                 tm = want[h][0]
                 busy = np.zeros(len(tm), bool)
                 for n in hand_notes[h].values():
                     busy |= (tm >= n.touch - .15) & (tm <= n.release + .15)
-                paths[h].set_attitude(*attitude.idle_attitude(paths[h], want[h], busy))
+                paths[h].set_attitude(*attitude.idle_attitude(paths[h], want[h], busy, aim_z=aim_z))
             print('[attitude] idle stretches turned onto the forearm', flush=True)
         offsets = yield_offsets(paths, notes, duration, HANDS_APART, YIELD_SPEED, YIELD_BUSY)
         paths = {h: YieldingPath(paths[h], *offsets[h]) for h in 'LR'}

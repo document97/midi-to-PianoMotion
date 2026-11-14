@@ -65,6 +65,9 @@ LIFT_HEIGHTS = (0., .003, .01, .04, .065)      # ... and the wrist's rise (m) at
 LIFT_LOUDNESS = ((40., 110.), (.75, 1.35))     # velocity of the chord struck -> share of that rise (a loud chord from higher)
 LIFT_SCALE = 1.                  # the piece's own share (inputs/<piece>/motion.json "lift"): its character, lyrical to spirited
 LEAD_IN_SECONDS = 1.2            # from the rest pose to the first anchor
+REST_HOLD = 1.0                  # the hands stay on the lap this long after the video starts: the first travel used to
+                                 # begin at settle - 1.2, which on the daylight piece fell at t=-.35 -- the video opened
+                                 # on a hand already floating up, one hand mid-air and the other still resting
 LIFT_HEIGHT = .008               # pad above the key top at the end of a lift (m)
 HOVER_HEIGHT = (.002, .025)      # pad above the key before the stroke: soft starts on the key, loud from above
 RELAX_GAP_SECONDS = .6           # free time after which a finger returns to the relaxed hand
@@ -703,7 +706,9 @@ def wrist_path(anchors, notes, strokes, rest, duration):
 
     first, v0 = anchors[0], _vector(anchors[0])
     settle = ready(first)
-    leave = settle - LEAD_IN_SECONDS
+    # the hands hold the rest pose at least REST_HOLD after the video starts: an earlier leave would open on a hand
+    # already floating up from the lap (never earlier than .5 s of travel, which a lap-to-keys lift must keep)
+    leave = max(settle - LEAD_IN_SECONDS, min(REST_HOLD, settle - .5))
     last = anchors[-1]
     vl = _vector(last)
     end = max([last.time] + [n.release for n in notes.values()]) + KEY_RETURN_SECONDS

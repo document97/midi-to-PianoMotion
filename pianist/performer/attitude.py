@@ -120,23 +120,28 @@ def aim(solvers, anchors, curves, torso):
     return out
 
 
-def idle_attitude(path, want, busy, rate=1. / 60., tau=.15, gate=3., speed=160.):
+def idle_attitude(path, want, busy, rate=1. / 60., tau=.15, gate=3., speed=90., aim_z=None):
     """(times, yaw, roll) for a path whose *idle* stretches (``busy`` false) turn the palm onto the forearm: no key
     is held there, so nothing is bought by keeping the path's own yaw -- the wrist is simply folded in the air, which
     reads as a stiff hand. The playing frames keep the path's yaw exactly; the turn is smoothed and rate-limited so
-    the hand comes off a chord already turning, not a frame after it."""
+    the hand comes off a chord already turning, not a frame after it. ``aim_z``: the wrist height below which the
+    hand stops aiming -- a hand still on the lap (the piece has not started, or it is over) keeps its own relaxed
+    yaw instead of snapping keyboardward at the first frame; the aim engages as the hand rises past it, so the turn
+    reads as part of the lift, the way a real hand turns while it travels to the keys."""
     times = np.arange(want[0][0], want[0][-1], rate)
     cur = np.array([np.asarray(path(float(t)), float) for t in times])
     playing = np.interp(times, want[0], busy.astype(float)) > .05      # any overlap counts: a key is being kept
+    aiming = np.ones(len(times), bool) if aim_z is None else cur[:, 2] >= aim_z
     out = []
     for k, own in ((1, cur[:, 3]), (2, cur[:, 4])):
         goal = np.interp(times, want[0], want[k])
-        v = np.where(playing, own, np.where(np.abs(goal - own) > gate, goal, own))
-        # The idle stretch's target (smoothed); the playing frames' target is the path's own wrist itself. Both are
-        # reached by one bounded-speed chase from the wrist's real value, so the switch between them is a walk, not
-        # a jump -- the old splice (own forced on the playing frames, the smoothed curve on the idle ones) jumped
-        # the whole |goal-own| in the first idle frame, 9.6 deg in one 1/60 s frame at t=4.18 on the daylight piece.
-        target = np.where(playing, own, _gauss(v, rate, tau))
+        v = np.where(playing | ~aiming, own, np.where(np.abs(goal - own) > gate, goal, own))
+        # The idle stretch's target (smoothed); the playing frames' -- and the resting hand's -- target is the
+        # path's own wrist itself. Both are reached by one bounded-speed chase from the wrist's real value, so the
+        # switch between them is a walk, not a jump -- the old splice (own forced on the playing frames, the
+        # smoothed curve on the idle ones) jumped the whole |goal-own| in the first idle frame, 9.6 deg in one
+        # 1/60 s frame at t=4.18 on the daylight piece.
+        target = np.where(playing | ~aiming, own, _gauss(v, rate, tau))
         out.append(_follow(own, target, speed * rate))
     return times, out[0], out[1]      # the playing frames keep the path's own wrist exactly
 
