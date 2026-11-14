@@ -1362,7 +1362,14 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
 
     def shape_at(t):
         pitches = [n.pitch for n in mine_hand if n.touch - PREPARE_SECONDS <= t <= n.release]
-        return hand_shape(solver.span(pitches))[digit] if pitches else ARCHED[digit]
+        if pitches:
+            return hand_shape(solver.span(pitches))[digit]
+        if not mine_hand:
+            return ARCHED[digit]
+        # Nothing on the keys: the shape of the keys nearest in time, not the empty hand's arch. A free finger that
+        # straightened out and curled back between two chords read as the hand fidgeting while it held nothing.
+        near = min(mine_hand, key=lambda n: min(abs(t - (n.touch - PREPARE_SECONDS)), abs(t - n.release)))
+        return hand_shape(solver.span([near.pitch]))[digit]
 
     # before the hand's first stroke and after its last the hand is at rest, its fingers loose (RELAXED): they
     # take the playing shape as the arm brings the hand onto the keys and let it go as it leaves

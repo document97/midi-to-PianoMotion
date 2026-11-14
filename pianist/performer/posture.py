@@ -13,6 +13,7 @@ import numpy as np
 
 from .arm import closest_elbow, standard_shoulder as _standard_shoulder
 from .kinematics import FLOAT
+from .pose import ROLL_BOUNDS
 
 HAND_FOLLOW = .3                # share of the forearm's inward angle the palm follows
 # The forearm the hand's orientation follows is taken from a standard seat (arm.STANDARD_SHOULDER), not the scene's:
@@ -27,6 +28,22 @@ PALM_FLOOR_DEG = 135.           # the user's transient acceptance floor: below i
 # The corridor is an A/B switch too: PIANOMOTION_PALM_CORRIDOR=0 gives the hand the 11.11 behaviour (HAND_FOLLOW
 # only), for comparing a run against an older one without editing code
 PALM_CORRIDOR = os.environ.get('PIANOMOTION_PALM_CORRIDOR', '1').lower() not in ('0', 'off', 'false', 'no')
+# The palm's yaw above continues the forearm, and the forearm says nothing about the keyboard: measured on the
+# daylight piece the fingers then sit p50 13 deg / p95 27 deg off the keys' length while the palm-vs-forearm angle
+# is a comfortable 160 -- the hand square to its own arm and crooked on the keys, which is the angle the eye reads.
+# So the planned yaw turns to the keys first, and the corridor is a floor the turn may not fold past, not the aim.
+KEY_AIM = os.environ.get('PIANOMOTION_KEY_AIM', '1').lower() not in ('0', 'off', 'false', 'no')
+KEY_TOL = 4.                    # deg the fingers may sit off the keys' length and still count as down the keys
+KEY_FLOOR = 145.                # deg on the palm-vs-forearm angle: the turn never folds the wrist past it
+KEY_STEP = 1.                   # deg per yaw step while walking out from the relaxed yaw
+KEY_TRAVEL = 35.                # deg the wrist may deflect either way (radial/ulnar, the hand's own travel)
+KEY_RADIAL_MAX = 8.             # deg the palm may lean toward the thumb side (radial deviation) while a key is
+# played: a pianist's wrist bends toward the little finger (ulnar, ~30 deg of travel) and keeps the thumb side
+# nearly straight -- where the keys would ask for a radial lean the player moves the forearm instead (the elbow,
+# the seat), never wrenches the hand over. Measured on the daylight piece the render sat radial on 15% of the
+# right hand's played frames (p50 8, p90 13, worst 33 deg) -- the angle the user flagged as never seen in real
+# playing. The ulnar side keeps the full travel; the radial side stops at this cap and the search falls back to
+# the most upright feasible pose (the fingers may then sit off the keys: the hand reads right before it reads aimed).
 
 
 def palm_forearm_deg(solver, wrist, yaw, roll, shoulder, elbow=None):
@@ -44,6 +61,82 @@ def palm_forearm_deg(solver, wrist, yaw, roll, shoulder, elbow=None):
             return 180.
     forearm = np.asarray(wrist, FLOAT) - elbow
     return 180. - math.degrees(math.acos(np.clip(float(palm @ forearm) / max(np.linalg.norm(forearm), 1e-9), -1., 1.)))
+
+
+def palm_vs(arm, yaw, roll, forearm):
+    """The palm's long axis vs a forearm vector, interior angle in degrees (180 straight)."""
+    from .kinematics import q_mat3
+    palm = q_mat3(arm.palm_q(yaw, roll)) @ np.array([0., 1., 0.], dtype=FLOAT)
+    forearm = np.asarray(forearm, FLOAT)
+    return 180. - math.degrees(math.acos(np.clip(float(palm @ forearm) / max(np.linalg.norm(forearm), 1e-9), -1., 1.)))
+
+
+def finger_deg(arm, yaw, roll):
+    """Where the fingers point, in deg off the keys' length: 0 is straight down the keyboard, +-90 across the keys,
+    and past 90 the hand points back at the player (which a keyboard never wants). The palm's world orientation is
+    q(yaw, roll) alone -- the elbow enters the wrist's comfort, not where the fingers point."""
+    from .kinematics import q_mat3
+    axis = q_mat3(arm.palm_q(yaw, roll)) @ np.array([0., 1., 0.], dtype=FLOAT)
+    return math.degrees(math.atan2(float(axis[0]), float(axis[1])))
+
+
+def radial_dev(arm, yaw, roll, forearm, side):
+    """Deg the palm's long axis leans toward the thumb side (+) or the little-finger side (-) of the forearm:
+    the wrist's lateral bend, measured on the palm axis the way the render has it. +side*0 is never right: the
+    thumb sits toward the keys' far end on each hand, so the thumb direction is -side on the world x."""
+    from .kinematics import q_mat3
+    p = q_mat3(arm.palm_q(yaw, roll)) @ np.array([0., 1., 0.], dtype=FLOAT)
+    f = np.asarray(forearm, FLOAT)
+    p = p - (p @ f) * f
+    th = np.array([-side, 0., 0.], dtype=FLOAT)
+    th = th - (th @ f) * f
+    n = np.linalg.norm(th)
+    if n < 1e-9:
+        return 0.
+    return math.degrees(math.asin(max(-1., min(1., float(p @ th) / n))))
+
+
+def turn_to_keys(arm, wrist, yaw, roll, elbow, tol=KEY_TOL, floor=KEY_FLOOR,
+                 travel=KEY_TRAVEL, step=KEY_STEP, rolls=(0.,), strict=False,
+                 side=0., radial_max=KEY_RADIAL_MAX):
+    """((yaw, roll), palm-vs-forearm deg) for a hand at ``wrist`` on the forearm from ``elbow``: the least turn of
+    the relaxed yaw that puts the fingers down the keys, walked outward one degree at a time (nearest first, so the
+    first hit is the least turn). ``rolls``: the roll offsets tried, each one before the next -- the yaw is searched
+    to the end of its travel within the first; ``(0.,)`` keeps the planned roll (the little-finger side down), the
+    wide set lets a hand whose plane cannot turn roll the forearm to buy the keys. ``side`` (+1 right, -1 left)
+    engages the radial cap: a lean toward the thumb side past ``radial_max`` is refused (KEY_RADIAL_MAX) -- the
+    player moves the forearm there, not the wrist, so the fingers may end up off the keys with the hand upright.
+
+    Two searches meet here, and the floor settles them: a pose that folds the wrist past ``floor`` is not taken even
+    where it straightens the hand on the keys. Where the travel runs out first (the forearm arrives from too far
+    sideways) the least crooked feasible pose is returned, unless ``strict`` -- then the relaxed yaw stands, for a
+    caller that would rather not move at all than move to somewhere it did not want."""
+    forearm = np.asarray(wrist, FLOAT)[:3] - np.asarray(elbow, FLOAT)
+    f = forearm / max(np.linalg.norm(forearm), 1e-9)
+    here = abs(finger_deg(arm, yaw, roll))
+    if here <= tol:
+        return (float(yaw), float(roll)), palm_vs(arm, yaw, roll, forearm)
+    best, best_palm = (here, float(yaw), float(roll)), palm_vs(arm, yaw, roll, forearm)
+    for droll in rolls:
+        r = roll + droll
+        if not (ROLL_BOUNDS[0] <= r <= ROLL_BOUNDS[1]):
+            continue
+        for k in range(1, int(travel / step) + 1):
+            for sgn in (-1., 1.):
+                y = yaw + sgn * k * step
+                d = palm_vs(arm, y, r, forearm)
+                if d < floor:           # the wrist's floor: this way is closed, the other side may still be open
+                    continue
+                if side and sgn == -side and radial_dev(arm, y, r, f, side) > radial_max:
+                    continue            # a radial (thumb-side) lean past the cap: the hand reads wrench -- the
+                f_deg = abs(finger_deg(arm, y, r))   # forearm should have moved, so this pose is not taken
+                if f_deg <= tol:
+                    return (y, r), d    # nearest first in this order, so the least roll and the least turn
+                if f_deg < best[0]:
+                    best, best_palm = (f_deg, y, r), d
+    if strict:
+        return (float(yaw), float(roll)), palm_vs(arm, yaw, roll, forearm)
+    return (best[1], best[2]), best_palm
 
 
 def _palm_angles(solver, yaw, roll):
@@ -72,13 +165,15 @@ def standard_shoulder(solver):
     return _standard_shoulder(solver.arm, solver.rig.neutral_wrist[solver.hand])
 
 
-def natural_orientation(solver, wrist, shoulder=None, elbow=None):
+def natural_orientation(solver, wrist, shoulder=None, elbow=None, keys=True):
     """(yaw, roll) parameters of the relaxed hand with the wrist at ``wrist`` (world), its forearm from ``shoulder``:
     the standard seat's (``standard_shoulder``) unless given (the hand on the lap: the actual body's).
     ``elbow`` (world) replaces the elbow the standard seat's natural hang predicts: the second orientation pass
     hands it the elbow the swing curve actually places, so the comfort corridor sees the arm the render will have
     (the trunk holds that elbow wide, and the forearm's own yaw grows from 4 deg to 11-39 -- the palm was left bent
-    against it while the corridor, reading the natural hang, thought the wrist was straight)."""
+    against it while the corridor, reading the natural hang, thought the wrist was straight).
+    ``keys``: the hand is over the keyboard, so the yaw turns to the keys (``KEY_AIM``) instead of only continuing
+    the forearm -- see the constant. False for the hand on the lap, where there is no keyboard to point down."""
     y0, dy, t0, dt = _calibration(solver)
     arm = solver.arm
     shoulder = standard_shoulder(solver) if shoulder is None else np.asarray(shoulder, FLOAT)
@@ -94,7 +189,9 @@ def natural_orientation(solver, wrist, shoulder=None, elbow=None):
         forearm_yaw = math.degrees(math.atan2(forearm[0], forearm[1]))
     yaw = (HAND_FOLLOW * forearm_yaw - y0) / dy
     roll = (-LITTLE_SIDE_DOWN - t0) / dt
-    if PALM_CORRIDOR and abs(dy) > 1e-9:    # the comfort corridor: where the relaxed hand would sit below the
+    if KEY_AIM and keys and elbow is not None:   # the keys are the aim; the corridor's line is this turn's floor
+        (yaw, roll), _ = turn_to_keys(arm, wrist, yaw, roll, elbow, strict=True, side=arm.side)
+    elif PALM_CORRIDOR and abs(dy) > 1e-9:  # the comfort corridor: where the relaxed hand would sit below the
         now = palm_forearm_deg(solver, wrist, yaw, roll, shoulder, elbow=elbow)   # sustained line, the palm follows
         if now < PALM_SOFT_DEG:         # the forearm further -- the wrist unbends (the arm line, not the hand's
             full = (forearm_yaw - y0) / dy   # bend, carries the reach); never past the forearm itself

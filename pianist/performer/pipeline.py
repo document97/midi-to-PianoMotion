@@ -60,9 +60,9 @@ FRAME_RATE = 60.                  # samples per second (written as fractional sc
 # The second orientation pass (section 4.6: the hands re-aim at the forearms the elbows placed) is an A/B switch:
 # PIANOMOTION_REAIM=0 gives the single-pass behaviour, for comparing against an older run without editing code.
 REAIM_OFF = os.environ.get('PIANOMOTION_REAIM', '1').lower() in ('0', 'off', 'false', 'no')
-# The attitude refine (section 4.65) follows the same switch: on a held chord the settle lets the palm sag onto the
-# forearm the trunk forces, so anchors are inserted wherever the yaw sits ATT_GATE degrees off what the placed elbow
-# asks, ATT_STEP s apart, and settled with the palm's own yaw as the target -- the wrist moves with it, by the pull.
+# The attitude refine (section 4.65) follows the same switch: the hand is turned to point down the keys (attitude),
+# so anchors are inserted wherever the path's yaw sits ATT_GATE degrees off that, ATT_STEP s apart, and settled with
+# the aligned yaw as the target -- the wrist moves with it, by the pull, so the keys are kept.
 ATT_STEP, ATT_GATE, ATT_ROUNDS, ATT_TURN = .3, 8., 2, 12.   # ATT_TURN: deg the target moves per round
 # The attitude anchors' own pull: the wrist's place weighs more than in the orientation pulls (a hand that drifts
 # across its keys to straighten its wrist trades one fault for another), the palm's yaw a little less.
@@ -922,7 +922,8 @@ def run(args):
     rest = {}
     for h in 'LR':      # on the lap: the palm on the thigh (rig_export.lap), the hand turned in a little
         wrist = np.array(rig.data['hands'][h]['lap'], dtype=float) + REST_OFFSET
-        orientation = np.array(natural_orientation(rest_solvers[h], wrist, rest_solvers[h].arm.pre_upper_world[:3, 3]), dtype=float)
+        orientation = np.array(natural_orientation(rest_solvers[h], wrist, rest_solvers[h].arm.pre_upper_world[:3, 3],
+                                                   keys=False), dtype=float)
         orientation[0] += REST_YAW * (1. if h == 'R' else -1.)
         rest[h] = np.r_[wrist, orientation]
     hand_notes = {h: {k: n for k, n in notes.items() if n.hand == h} for h in 'LR'}
@@ -1104,26 +1105,27 @@ def run(args):
             want = attitude.targets(paths, context['elbow_swing'], torso, posture_solvers, -intro, duration, ATT_STEP)
             new = []
             for h in 'LR':
-                times_h, yaw_h = want[h]
-                for t, y in zip(times_h, yaw_h):
-                    if not np.isfinite(y):
+                times_h, yaw_h, roll_h = want[h]
+                for t, y, r in zip(times_h, yaw_h, roll_h):
+                    if not (np.isfinite(y) and np.isfinite(r)):
                         continue
                     v = np.asarray(paths[h](float(t)), float)
-                    if abs(y - v[3]) < ATT_GATE:
+                    if abs(y - v[3]) < ATT_GATE and abs(r - v[4]) < ATT_GATE:
                         continue
                     y = v[3] + float(np.clip(y - v[3], -ATT_TURN, ATT_TURN))
+                    r = v[4] + float(np.clip(r - v[4], -ATT_TURN, ATT_TURN))
                     held = tuple(k for k, n in hand_notes[h].items() if n.touch <= t <= n.release)
-                    if not held:            # an idle hand keeps no key; its own yaw loses nothing
+                    if not held:            # an idle hand keeps no key; its own wrist loses nothing
                         continue
-                    new.append((Anchor(h, -1, float(t), float(v[0]), (), held), float(y)))
+                    new.append((Anchor(h, -1, float(t), float(v[0]), (), held), (float(y), float(r))))
             if not new:
                 break
             with ProcessPoolExecutor(workers, initializer=_init, initargs=(context,)) as pool:
                 jobs = []
-                for a, y in new:
+                for a, (y, r) in new:
                     v = np.asarray(paths[a.hand](a.time), float)
                     values = {notes[k].digit: waypoint(waypoints[k], a.time)[1] for k in a.held if k in waypoints}
-                    jobs.append((a.hand, a.contacts(notes), v, values, np.r_[v[:3], y, v[4]], ATT_PULLS,
+                    jobs.append((a.hand, a.contacts(notes), v, values, np.r_[v[:3], y, r], ATT_PULLS,
                                  REACH_TOLERANCE, False, ()))
                 poses = progress_map(pool, _settle, jobs, f'attitude {att_round + 1}/{ATT_ROUNDS}')
                 near = {h: [o for o in anchors if o.hand == h] + [a for a, _ in new if a.hand == h] for h in 'LR'}
@@ -1133,13 +1135,16 @@ def run(args):
                         continue
                     if not gentle(a, p, paths[a.hand], near[a.hand]):
                         continue
-                    # the guard: the turn has to leave the wrist better off, not worse (the settle answers to the
-                    # keys first, and a pose that both keeps them and folds the wrist is not an improvement)
-                    before = attitude.palm_at(posture_solvers[a.hand], torso, context['elbow_swing'], a.hand,
-                                              np.asarray(paths[a.hand](a.time), float), a.time)
+                    # the guard: the pose has to straighten the hand on the keyboard (the fingers closer to the keys'
+                    # length) and still sit above the wrist's floor -- a settle that keeps the keys by folding the
+                    # wrist is the trade this pass exists to refuse
+                    before_v = np.asarray(paths[a.hand](a.time), float)
                     after = attitude.palm_at(posture_solvers[a.hand], torso, context['elbow_swing'], a.hand,
                                              vector_of(p), a.time)
-                    if after < before - 1.:
+                    if after < attitude.MIN_DEG - 1.:
+                        continue
+                    if attitude.finger_at(posture_solvers[a.hand], vector_of(p)) >= \
+                            attitude.finger_at(posture_solvers[a.hand], before_v) - 1.:
                         continue
                     kept.append(replace(a, pose=p))
             if not kept:
@@ -1158,7 +1163,7 @@ def run(args):
             print(f'[attitude] round {att_round + 1}: {len(kept)} of {len(new)} anchors settle on the placed elbow',
                   flush=True)
         if inserted:
-            print(f'[attitude] {inserted} anchors inserted, palm target {attitude.TARGET_DEG:.0f} deg', flush=True)
+            print(f'[attitude] {inserted} anchors inserted, wrist floor {attitude.MIN_DEG:.0f} deg', flush=True)
         # 4.66 an idle hand keeps no key, so nothing is bought by its own yaw: the palm turns onto the forearm there
         # too (a folded wrist in the air reads as a stiff hand), smoothed and rate-limited, the playing frames
         # untouched.
@@ -1260,6 +1265,13 @@ def run(args):
                                                  min=round(float(frames[f'{h}_palm_deg'].min()), 1),
                                                  below_160=round(float((frames[f'{h}_palm_deg'] < 160).mean()), 3))
                                         for h in 'LR'},
+                    # the hand on the keyboard, not on its own arm: the middle finger's direction seen from above
+                    # against the keys' length (deg), the number the eye reads as "the hand is crooked on the keys"
+                    fingers_vs_keys_deg={h: dict(p50=round(float(np.median(np.abs(frames[f'{h}_pointing'][:, 2]))), 1),
+                                                 p95=round(float(np.percentile(np.abs(frames[f'{h}_pointing'][:, 2]), 95)), 1),
+                                                 max=round(float(np.abs(frames[f'{h}_pointing'][:, 2]).max()), 1),
+                                                 over_20=round(float((np.abs(frames[f'{h}_pointing'][:, 2]) > 20).mean()), 3))
+                                         for h in 'LR'},
                     elbow_swing=elbows_report),
         seconds=dict(stages, total=time.perf_counter() - started), workers=workers,
         music_seconds=duration - TAIL_SECONDS, intro_seconds=intro)

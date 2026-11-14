@@ -1,10 +1,17 @@
-"""The palm follows the forearm the render actually has.
+"""The palm points down the keys, on the forearm the render actually has.
 
 posture.natural_orientation plans the hand's orientation from the *standard seat's* elbow -- the hand's plan must not
 depend on where the performer sits -- while the elbows solve then places that elbow where the trunk's outline allows.
 Those are not the same elbow: on the daylight piece the rendered forearm's own yaw comes out p50 11 deg, p95 39 deg
-where the corridor's prediction sat at 4. Across a held chord the settle lets the palm sag onto the arm it has, and
-two thirds of the left hand's frames sit below 160 deg (p5 139), which reads as a wrist folded the wrong way.
+where the corridor's prediction sat at 4.
+
+The corridor's objective was the wrist itself ("keep palm and forearm near straight"), and a straight wrist says
+nothing about where the hand points: measured on the daylight piece, the fingers sit p50 13 deg, p95 27 deg off the
+keys' length while the palm-vs-forearm angle is a comfortable 160 -- the hand is square to its own arm and crooked on
+the keyboard, which is the angle the eye reads. So the objective here is the keyboard: the fingers point down the
+keys (along the keyboard's length), and the palm-vs-forearm angle is a floor the turn may not cross (MIN_DEG), not a
+target. Aligning the fingers costs almost nothing on that floor: p50 needs a 12.5 deg yaw turn (p95 27.5), and the
+resulting angle is p5 145, p50 160 -- as comfortable as now, and better on the left hand's p5.
 
 Two things are offered here, both reading the elbow the swing curve places (arm.closest_elbow with its angle):
 
@@ -12,23 +19,24 @@ Two things are offered here, both reading the elbow the swing curve places (arm.
   posture.natural_orientation's ``elbow``. The settle then moves the wrist and the palm together, so the fingers keep
   their keys; aiming the palm alone (turning the yaw at a fixed wrist) does not -- measured on the first 12 s, a
   17 deg turn pushed the fingers 49 mm off their keys.
-* ``targets`` -- for the attitude refine: per frame, the least yaw turn that reaches TARGET_DEG, which is where the
+* ``targets`` -- for the attitude refine: per frame, the yaw that puts the fingers on the keys, which is where the
   refine inserts an anchor (the wrist moves with the palm, by the settle's own pull).
 """
 import math
 
 import numpy as np
 
-from .kinematics import FLOAT, q_mat3
+from .kinematics import FLOAT
+from .posture import finger_deg, palm_vs as _palm_deg
 
-TARGET_DEG = 163.        # the palm-vs-forearm angle aimed at where the arm can give it (180 straight)
+MIN_DEG = 145.           # floor on the palm-vs-forearm angle (180 straight): the wrist may not fold past this
+REAIM_TURN = 5.          # deg the bulk re-aim may ask per anchor on the yaw
+REAIM_ROLL = 4.          # ... and on the roll: a large ask makes the settle run the forearm to its ROLL_BOUNDS (20
+                         # deg) to meet it, which folds the wrist further than the keys gain
+ALIGN_TOL = 4.           # deg the fingers may sit off the keys' length and still count as pointing down the keys
 STEP = .1                # s of the targets grid
-SCAN = 9                 # points between the palm's own yaw and the forearm's while looking for the least turn
-
-
-def _palm_deg(arm, yaw, roll, forearm):
-    axis = q_mat3(arm.palm_q(yaw, roll)) @ np.array([0., 1., 0.], dtype=FLOAT)
-    return 180. - math.degrees(math.acos(np.clip(float(axis @ forearm) / max(np.linalg.norm(forearm), 1e-9), -1., 1.)))
+DEG_STEP = 1.            # deg per yaw step while walking out from the path's own yaw
+YAW_TRAVEL = 35.         # deg the wrist may deflect either way (radial/ulnar, the hand's own travel)
 
 
 def _curve(data, h):
@@ -56,23 +64,29 @@ def palm_at(solver, torso, curves, hand, v, t):
     return _palm_deg(arm, float(v[3]), float(v[4]), np.asarray(v[:3], float) - elbow)
 
 
-def _frame_yaw(arm, v, elbow, y0, dy):
-    """(yaw, angle) for this frame: the least turn that puts the palm within TARGET_DEG of its forearm -- the path's
-    own yaw where it is close enough already, or where the forearm gives no more."""
-    forearm = v[:3] - elbow
-    here = _palm_deg(arm, v[3], v[4], forearm)
-    if here >= TARGET_DEG:
-        return v[3], here
-    full = (math.degrees(math.atan2(forearm[0], forearm[1])) - y0) / dy if abs(dy) > 1e-9 else v[3]
-    best = _palm_deg(arm, full, v[4], forearm)
-    if best <= here:                   # the forearm gives no more: leave the palm where the path put it
-        return v[3], here
-    aim = min(TARGET_DEG, best)
-    for k in range(1, SCAN + 1):
-        y = v[3] + (full - v[3]) * k / SCAN
-        if _palm_deg(arm, y, v[4], forearm) >= aim:
-            return y, aim
-    return full, best
+def finger_at(solver, v):
+    """|deg| the fingers sit off the keys' length for a wrist vector ``v``: the refine's check that an anchor actually
+    straightened the hand on the keyboard, not only on its own arm. (The palm's world orientation is q(yaw, roll)
+    alone -- the elbow enters the wrist's comfort, not where the fingers point.)"""
+    return abs(finger_deg(solver.arm, float(v[3]), float(v[4])))
+
+
+def _frame_yaw(arm, v, elbow, y0=0., dy=0.):
+    """((yaw, roll), palm-vs-forearm deg) for this frame: the least turn of the path's own wrist that puts the fingers
+    down the keys (posture.turn_to_keys, walked out one degree at a time, nearest first).
+
+    Roll is searched with the yaw, a few degrees either side, because the two trade against each other: a yaw ask the
+    hand cannot meet in the plane is met by rolling the forearm (the settle took roll to its -20 bound on the 30 s
+    test and folded the wrist to 132 deg), so a target that names only the yaw is a target the settle answers by
+    folding. Where the plane cannot give the turn, the unrolled hand can.
+
+    The floor bounds both: a pose that folds the wrist past MIN_DEG is not taken, even where it straightens the hand
+    on the keyboard -- the two asks trade off at the extremes and the comfort floor wins. Where the travel runs out
+    before the fingers are on the keys (the forearm comes in from too far sideways) the least crooked feasible pose is
+    returned, so the hand still ends up closer than the path had it."""
+    from .posture import turn_to_keys
+    return turn_to_keys(arm, v[:3], float(v[3]), float(v[4]), elbow, tol=ALIGN_TOL, floor=MIN_DEG,
+                        travel=YAW_TRAVEL, step=DEG_STEP, rolls=(0., -3., 3., -6., 6.), side=arm.side)
 
 
 def aim(solvers, anchors, curves, torso):
@@ -99,24 +113,32 @@ def aim(solvers, anchors, curves, torso):
             except ValueError:
                 continue
             v = np.asarray(vector_of(a.pose), float)
-            y, _ = _frame_yaw(arm, v, elbow, y0, dy)
-            out[id(a)] = np.array([y, v[4]], dtype=FLOAT)
+            (y, r), _ = _frame_yaw(arm, v, elbow, y0, dy)
+            y = v[3] + float(np.clip(y - v[3], -REAIM_TURN, REAIM_TURN))    # the refine adds the rest, guarded
+            r = v[4] + float(np.clip(r - v[4], -REAIM_ROLL, REAIM_ROLL))
+            out[id(a)] = np.array([y, r], dtype=FLOAT)
     return out
 
 
-def idle_attitude(path, want, busy, rate=1. / 60., tau=.15, gate=6., speed=160.):
+def idle_attitude(path, want, busy, rate=1. / 60., tau=.15, gate=3., speed=160.):
     """(times, yaw, roll) for a path whose *idle* stretches (``busy`` false) turn the palm onto the forearm: no key
     is held there, so nothing is bought by keeping the path's own yaw -- the wrist is simply folded in the air, which
     reads as a stiff hand. The playing frames keep the path's yaw exactly; the turn is smoothed and rate-limited so
     the hand comes off a chord already turning, not a frame after it."""
     times = np.arange(want[0][0], want[0][-1], rate)
     cur = np.array([np.asarray(path(float(t)), float) for t in times])
-    goal = np.interp(times, want[0], want[1])
     playing = np.interp(times, want[0], busy.astype(float)) > .05      # any overlap counts: a key is being kept
-    yaw = np.where(playing, cur[:, 3], np.where(np.abs(goal - cur[:, 3]) > gate, goal, cur[:, 3]))
-    yaw = _gauss(yaw, rate, tau)
-    yaw = _rate_limit(yaw, rate, speed)
-    return times, np.where(playing, cur[:, 3], yaw), cur[:, 4]        # the playing frames keep the path's own yaw
+    out = []
+    for k, own in ((1, cur[:, 3]), (2, cur[:, 4])):
+        goal = np.interp(times, want[0], want[k])
+        v = np.where(playing, own, np.where(np.abs(goal - own) > gate, goal, own))
+        # The idle stretch's target (smoothed); the playing frames' target is the path's own wrist itself. Both are
+        # reached by one bounded-speed chase from the wrist's real value, so the switch between them is a walk, not
+        # a jump -- the old splice (own forced on the playing frames, the smoothed curve on the idle ones) jumped
+        # the whole |goal-own| in the first idle frame, 9.6 deg in one 1/60 s frame at t=4.18 on the daylight piece.
+        target = np.where(playing, own, _gauss(v, rate, tau))
+        out.append(_follow(own, target, speed * rate))
+    return times, out[0], out[1]      # the playing frames keep the path's own wrist exactly
 
 
 def _gauss(values, step, tau):
@@ -139,9 +161,23 @@ def _rate_limit(values, step, rate):
     return out
 
 
+def _follow(cur, goal, limit):
+    """``cur`` chased toward ``goal`` at ``limit`` per step: the chase starts from where the wrist really is, so a
+    playing/idle switch cannot jump. When the goal moves slower than the limit (the playing frames' own path does)
+    the chase sits exactly on it, so the playing frames keep the path's own wrist as before; when the goal steps
+    away (an idle turn) the wrist walks there at the bounded rate instead of teleporting the difference."""
+    out = np.empty_like(cur)
+    prev = float(cur[0])
+    out[0] = prev
+    for i in range(1, len(cur)):
+        prev += min(max(float(goal[i]) - prev, -limit), limit)
+        out[i] = prev
+    return out
+
+
 def targets(paths, curves, torso, solvers, t0, t1, step=STEP):
-    """{hand: (times, yaw)}: what the palm's yaw would be at each grid time if it followed the placed elbow -- the
-    attitude refine inserts an anchor wherever this sits far from the path's own yaw."""
+    """{hand: (times, yaw, roll)}: where the wrist would sit at each grid time if the fingers pointed down the keys on
+    the elbow the swing curve places -- the attitude refine inserts an anchor wherever this sits far from the path."""
     from .arm import closest_elbow
     from .motion import hermite_eval
     from .posture import _calibration
@@ -152,6 +188,7 @@ def targets(paths, curves, torso, solvers, t0, t1, step=STEP):
         arm = solvers[h].arm
         y0, dy, _, _ = _calibration(solvers[h])
         yaw = np.full(len(times), np.nan)
+        roll = np.full(len(times), np.nan)
         for i, t in enumerate(times):
             v = np.asarray(paths[h](float(t)), float)
             try:
@@ -160,6 +197,6 @@ def targets(paths, curves, torso, solvers, t0, t1, step=STEP):
                 elbow = closest_elbow(shoulder, v[:3], arm.l1, arm.l2, arm.side, angle=phi)
             except ValueError:
                 continue
-            yaw[i] = _frame_yaw(arm, v, elbow, y0, dy)[0]
-        out[h] = (times, yaw)
+            (yaw[i], roll[i]), _ = _frame_yaw(arm, v, elbow, y0, dy)
+        out[h] = (times, yaw, roll)
     return out
