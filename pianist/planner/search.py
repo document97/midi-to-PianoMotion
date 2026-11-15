@@ -23,6 +23,11 @@ CROSSING_AGAIN_SECONDS = .6
 HANDS_NEAR_SECONDS = .4         # a hand's keys of this recent past still mark where its fingers are
 HAND_EDGE = .01                 # a hand reaches this far beyond the finger next to the other hand (m)
 REPEAT_MAX_COST = 3.            # a finger hop costs at most this: well under an omitted note (omission >= 8)
+ARCH_PEAK_SECONDS = .8          # a same-finger hop this long squeezes the whole relax cycle (lift .3 + prepare .22,
+                                # motion.py) into the gap: the full up-and-down arch lands inside the phrase and reads
+                                # as a flick. Below the glide window the finger barely leaves its key (a glide);
+                                # above the fade the arch gets its dwell and reads as natural relaxation
+ARCH_FADE_SECONDS = 1.4         # the flick charge fades out by this gap
 
 
 def _thumb_reach(finger):
@@ -34,6 +39,17 @@ def _thumb_reach(finger):
 def _crossed(direction, f1, p1, f2, p2):
     """Two non-thumb fingers whose order across the hand contradicts their keys' order."""
     return f1 >= 2 and f2 >= 2 and f1 != f2 and p1 != p2 and direction * (p1 - p2) * (f1 - f2) < 0
+
+
+def _arch_squeeze(gap):
+    """(0..1) how visibly the same finger's relax cycle is compressed between two keys: 0 below the glide
+    window (the finger barely leaves its key), rising to the peak where the fixed lift+prepare cycle just
+    fits into the gap with no dwell left, easing back to 0 once the arch reads as unhurried relaxation."""
+    lo, peak, hi = REPEAT_SECONDS, ARCH_PEAK_SECONDS, ARCH_FADE_SECONDS
+    if gap <= lo or gap >= hi:
+        return 0.
+    x = (gap - lo) / (peak - lo) if gap <= peak else (hi - gap) / (hi - peak)
+    return x * x * (3. - 2. * x)          # smoothstep: no cliff at either end
 
 
 @dataclass(frozen=True)
@@ -320,8 +336,13 @@ class Planner:
                 crossings += _thumb_reach(f)
             for used_finger, used_pitch, used_touch in hs.last_finger_use:
                 if used_finger == f and used_pitch != p and not shifted:
-                    soon = max(0., 1. - (group.touch - used_touch) / REPEAT_SECONDS)
-                    cost += min(w.repeat_finger * soon * (.5 + min(abs(p - used_pitch), 12) / 6.), REPEAT_MAX_COST)
+                    gap = group.touch - used_touch
+                    hop = .5 + min(abs(p - used_pitch), 12) / 6.      # a further jump costs more
+                    soon = max(0., 1. - gap / REPEAT_SECONDS)         # a fast figure must not hop a finger
+                    cost += min(w.repeat_finger * soon * hop, REPEAT_MAX_COST)
+                    squeeze = _arch_squeeze(gap)                      # the compressed arch between keys: the
+                    if squeeze > 0.:                                  # visible flick -- prefer a free finger
+                        cost += min(w.repeat_finger * squeeze * hop, REPEAT_MAX_COST)
                 elif used_finger != f and used_pitch == p:
                     cost += w.key_finger_change * max(0., 1. - (group.touch - used_touch) / KEY_REPEAT_SECONDS)
                 if used_touch < hs.last_touch - 1e-9:
