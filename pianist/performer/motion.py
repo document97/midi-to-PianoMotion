@@ -21,6 +21,9 @@ result equals the serial one.
 """
 from dataclasses import dataclass, replace
 
+import json
+import os
+
 import numpy as np
 
 from planner.music import KEY_RETURN_SECONDS
@@ -520,6 +523,22 @@ def solve_path(anchors, notes, strokes, t0, t1):
             lb[k], ub[k] = v, v
             target[k] = v
             continue
+        # past the settle the hold's family may take over only where the next chord holds these keys
+        # too (the hand sets off while it keeps them); otherwise the hand stays at its place while its
+        # keys are down -- the planner's travel model departs no sooner than the releases, and a wide
+        # family box (a stretched chord's) lets the wrist slide clean off its own place inside a short
+        # press, where the fingers cannot follow (the dragged thumb of the daylight piece's frame 2395)
+        down_ids = [q for q in keys if notes[q].touch <= t + 1e-9 and t <= notes[q].release + 1e-9]
+        carried = i + 1 < len(rows) and all(q in rows[i + 1][3] for q in down_ids)
+        if not carried:
+            # the family box would let the wrist slide off its place while its keys are still down and the
+            # pads cannot follow (a stretched chord's box is 27+ mm wide: the dragged thumb of the daylight
+            # piece's frame 4783). Pinning the whole palm can cost the fingers' IK some reach on a short
+            # press the hand departs from mid-key (R 66 @41.4, ~20 mm, frame 2482) -- tried pinning the
+            # side alone, but the free axes slide on (L 70.1's 13 mm came back): keep the full pin.
+            lb[k], ub[k] = v, v
+            target[k] = v
+            continue
         places = v[None] if a.family is None else a.family[0]
         if i + 1 < len(rows) and all(q in rows[i + 1][3] for q in keys
                                      if notes[q].touch <= t + 1e-9 and t <= notes[q].release + 1e-9):
@@ -554,6 +573,16 @@ def solve_path(anchors, notes, strokes, t0, t1):
             mid = (free + touch) / 2
             core = sel & (np.abs(times - mid) <= LIFT_SPAN * window / 2 + PATH_STEP / 2)
             lb[core, 2] = np.maximum(lb[core, 2], (va[2] + vb[2]) / 2 + lift)
+    if os.environ.get('PIANOMOTION_DEBUG_SEGMENTS'):       # diagnosis only: the anchors' places and pair windows
+        win = float(os.environ.get('PIANOMOTION_DEBUG_AT') or 0.)
+        sel_dbg = (times > win - .4) & (times < win + .4)
+        dbg = dict(rows=[dict(time=float(r[0].time), x=float(r[1][0])) for r in rows if abs(r[0].time - win) < 4.],
+                   pairs=[dict(a_t=float(a.time), va_x=float(va[0]), b_t=float(b.time), vb_x=float(vb[0]))
+                          for (a, va, _, ka), (b, vb, sb, kb) in zip(rows, rows[1:]) if abs(a.time - win) < 4.],
+                   bounds=[[float(t), float(lb[k, 0]), float(ub[k, 0]), int(holding[k])]
+                           for k, t in enumerate(times) if sel_dbg[k]])
+        with open(os.environ['PIANOMOTION_DEBUG_SEGMENTS'], 'a') as f:
+            json.dump(dbg, f)
     # landings: (sample, speed scale per dimension) for each first touch of an anchor after a free time or a move
     land = []
     for a, va, sa, ka in rows[1:]:
@@ -713,8 +742,22 @@ def wrist_path(anchors, notes, strokes, rest, duration):
     vl = _vector(last)
     end = max([last.time] + [n.release for n in notes.values()]) + KEY_RETURN_SECONDS
     times, values = solve_path(anchors, notes, strokes, settle, end)
+    if os.environ.get('PIANOMOTION_DEBUG_SEGMENTS'):       # diagnosis only: the solved grid around the window
+        win = float(os.environ.get('PIANOMOTION_DEBUG_AT') or 0.)
+        with open(os.environ['PIANOMOTION_DEBUG_SEGMENTS'], 'a') as f:
+            json.dump(dict(grid=[[float(t), float(v[0])] for t, v in zip(times, values)
+                                 if abs(t - win) < 0.7][::2]), f)
     knots = [(min(0., leave - 1e-3), rest, 0.), (leave, rest, _arc(rest, v0, True))]
     knots += [(t, v, 0.) for t, v in zip(times, values)]
+    # The knots carry the solved hold: between them the spline cuts corners where the bounds change,
+    # and a staccato press (about 40 ms) holds one or two of the PATH_STEP knots -- the smoothed curve
+    # then skims off the chord's place while its pads are still down (the dragged thumb of the daylight
+    # piece's frame 2395). So every press window's edges become knots, at the path's own solved values:
+    # the curve cannot leave a place it is bounded to before the sampled window says so.
+    edges = sorted({round(t, 6) for a in anchors for k in list(a.incoming) + list(a.held)
+                    for t in (notes[k].touch, notes[k].release)})
+    knots += [(t, np.array([np.interp(t, times, values[:, d]) for d in range(values.shape[1])], FLOAT), 0.)
+              for t in edges if times[0] < t < times[-1]]
     knots[-1] = (times[-1], values[-1], _arc(vl, rest, True))
     knots.append((end + LEAD_IN_SECONDS, rest, 0.))
     if end + LEAD_IN_SECONDS < duration:
