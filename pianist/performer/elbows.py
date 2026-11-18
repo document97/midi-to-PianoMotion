@@ -56,6 +56,7 @@ CAP_LEVELS = 9                   # lean shares tried for a blocked sample, from 
 CAP_ROUNDS = 3                   # blocked samples ask, the smoothed cap is re-checked, twice
 CAP_PULL = .12                   # the cap's pull to no yield: one unit of cost this far off 1
 JERK, ACC, VEL, PULL = 150., 25., 5., .3     # the swing curve's weights: one unit of cost at these
+DWELL_SAMPLES = 5                # bounds samples a constraint must hold for (~0.2 s) before the solve believes it
 TRACK_RATE = .25                 # m/s of wrist motion at which the curve's pull doubles: a hop is tracked in
                                  # step with the hand (a rigid chain, the elbow rides along), a hold is smoothed
 SMOOTH_TAU = .3                  # s the constraint signals (bounds, natural hang) are smoothed over where the
@@ -631,6 +632,16 @@ def _swing_of(data, curve):
     return np.where(np.isfinite(tgt), phi - tgt, 0.)
 
 
+def _dwell(bound, width=DWELL_SAMPLES):
+    """The scan's per-sample bounds median-filtered over ``width`` samples: a constraint that the geometry
+    asserts for under ~0.2 s is a transient of the moving body (the forearm skims the outline for two
+    samples and the arc snaps shut), not a place the elbow can stay -- left in, the solve dives to meet it
+    and springs past the target when it lifts (a 33 deg S-swing around a 16 deg target, measured). The
+    median keeps every constraint the geometry holds for keeps."""
+    from scipy.ndimage import median_filter
+    return median_filter(np.asarray(bound, float), size=width, mode='nearest')
+
+
 def _build(data, paths, grid, cache=None, prev=None, dirty=None):
     """The swing curves from one scan's bounds: the least-jerk phi inside them (solve's). ``cache`` keeps each
     hand's path samples (they do not move with the body), and ``prev`` (the last curves) with ``dirty`` (the samples
@@ -650,7 +661,8 @@ def _build(data, paths, grid, cache=None, prev=None, dirty=None):
                     cache[('pts', h)] = got
             speed = got[2]
             A, b = _rows(n, CURVE_STEP, JERK, ACC, VEL, PULL / (1. + speed / TRACK_RATE), d['target'])
-            phi = chunked(A, b, d['lo'], np.maximum(d['hi'], d['lo'] + 1e-12),
+            lo, hi = _dwell(d['lo']), _dwell(d['hi'])
+            phi = chunked(A, b, lo, np.maximum(hi, lo + 1e-12),
                           x0=None if prev is None else prev[h]['angles'], dirty=dirty)
         else:
             phi = np.where(np.isfinite(d['target']), d['target'], 0.)
@@ -887,7 +899,7 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
         required = np.ones(n)
         d = {}
         t_ = time.perf_counter()
-        for i, h in enumerate('LR'):
+        for i, h in enumerate('LR'):    # measured -- threads lost to GIL contention (scan 77.6s -> 100.7s)
             d[h] = _scan(torso, paths[h], grid, rig.arms[h], h, i, trunk, clearance, kin=kin, moved=moved)
             required = np.minimum(required, d[h]['required'])
         _tick('scan', time.perf_counter() - t_)
@@ -936,6 +948,24 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
             phase(f'recheck ({round_ + 1} scans, min {float(required.min()):.2f})')
     damped = {h: _damped(curves[h]) for h in 'LR'}   # what the frames will read; the report below follows it
     phase('damped')
+    if os.environ.get('PIANOMOTION_DEBUG_ELBOWS'):       # diagnosis only: the swing curve against its bounds
+        import json as _json
+        if os.environ.get('PIANOMOTION_DEBUG_ELBOWS_ALL'):   # the whole grid (locating a report's excess peaks)
+            sel = np.ones(n, bool)
+        else:
+            raw = [float(x) for x in (os.environ.get('PIANOMOTION_DEBUG_AT') or '').split(',') if x.strip()]
+            sel = np.zeros(n, bool)
+            for win in (raw or [0.]):
+                sel |= (grid > win - 1.2) & (grid < win + 1.2)
+        rows = {}
+        for h in 'LR':
+            d = data[h]
+            ang = _sample(damped[h], grid[sel])
+            rows[h] = [[float(t), math.degrees(lo), math.degrees(hi), math.degrees(tg), math.degrees(nc), float(rq), float(a)]
+                       for t, lo, hi, tg, nc, rq, a in zip(grid[sel], d['lo'][sel], d['hi'][sel], d['target'][sel],
+                                                           d['necessary'][sel], d['required'][sel], ang)]
+        with open(os.environ['PIANOMOTION_DEBUG_ELBOWS'], 'a') as f:
+            _json.dump(rows, f)
     ym = float(np.abs(torso.yield_rows[1]).max() * 1000.) if asked else 0.
     sm = float(np.abs(torso.slide_yield_rows[1]).max() * 1000.) if asked and torso.slide_yield_rows is not None else 0.
     for i, h in enumerate('LR'):

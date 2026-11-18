@@ -26,6 +26,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'lib'))
 
+from performer.kinematics import LAP_POINT            # noqa: E402  the standard seat's resting points
 from arm_driver import ArmDriver                       # noqa: E402
 from body_driver import BodyDriver, apply_seating      # noqa: E402
 from key_geometry import measured_keyboard             # noqa: E402
@@ -357,11 +358,18 @@ def validation_poses(arm, skin, drivers, cal, hands, count, seed):
 LAP_ALONG = .35                 # the hands rest on the thighs this share of the way from hip to knee ...
 LAP_OUT = .03                   # ... this far outside the thigh bone (m), on the top surface (the clothes on the thigh)
 
+# LAP_POINT, the approved standard-seat resting points, lives in kinematics (the single source of truth read by
+# every Rig too); import it here so an export writes exactly what the solver enforces.
+
 
 def lap(arm, skin):
-    """{hand: (x, y, z)}: the top of each thigh (the clothes on it) where a hand rests before and after the piece:
-    the first skin from above not carried by an arm (its bones and what hangs from them, the sleeves: the arms lie
-    over the thighs here)."""
+    """{hand: (x, y, z)}: the approved resting point on each thigh, in world space. See LAP_POINT."""
+    return {h: tuple(v) for h, v in LAP_POINT.items()}
+
+
+def lap_measured(arm, skin):
+    """The ray-cast measurement LAP_POINT was taken from: the top of each thigh (the clothes on it), the first
+    skin from above not carried by an arm. Kept to re-measure the standard seat if the body or seat ever changes."""
     from mathutils import Vector
     world = arm.matrix_world
     evaluated = skin.evaluated_get(bpy.context.evaluated_depsgraph_get())

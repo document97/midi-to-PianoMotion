@@ -152,8 +152,9 @@ def native_check(skin, rig_path, motion, frames):
         coords, _ = mesh_world(skin)
         for h in 'LR':
             vector = motion[f'{h}_wrist'][i]
+            pitch = float(motion[f'{h}_pitch'][i]) if f'{h}_pitch' in motion else None
             # the wrist bone in armature space follows from the wrist vector alone (no arm or torso needed)
-            arm_pose = dict(armature=rig.arms[h].arm_inverse @ solvers[h].palm(vector[:3], vector[3], vector[4]))
+            arm_pose = dict(armature=rig.arms[h].arm_inverse @ solvers[h].palm(vector[:3], vector[3], vector[4], pitch))
             values = {d: motion[f'{h}_values'][i, d - 1] for d in range(1, 6)}
             for d in range(1, 6):
                 predicted = rig.pad_points(h, d, arm_pose['armature'], values)

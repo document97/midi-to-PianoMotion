@@ -1,6 +1,7 @@
 """Torso lean toward a hand playing far out (numpy version of lib/body_driver.BodyDriver.pose), on a constant forward lean;
 the shoulders brought forward (the collarbone turned) when a hand reaches far."""
 import math
+import os
 
 import numpy as np
 
@@ -33,12 +34,19 @@ SLIDE_STEP = .02
 # enough that neither the seat nor the chest has to move. It used to be .15 m, which left every small ask to the
 # seat alone -- the hips did the fidgeting the chest could have covered with two degrees of tilt.
 LEAN_NEAR = .05
+# The lean's own commitment, in the seat's spirit: the rows' windowed average is smoothed (LEAN_TAU) and
+# rate-limited (LEAN_RATE), so a figure that glances a side for a second glances -- the chest does not dart
+# 7 cm toward it in .3 s and back (measured at the user's 860). A passage that holds a side still leans in,
+# arriving over ~1 s: the hands travel further than that to get there, so the lean is not late.
+LEAN_TAU, LEAN_RATE, LEAN_STEP = .35, .09, .05
 # The side lean and the turn are shared up the spine, the upper bones more (shares 1 : 2 : 3 ... from the lowest): the
 # chest leans and turns further than the belly. The forward lean stays a hinge at the hips (the back straight).
 # The chest turns toward the hand the lean is for (the lean's own shift, not the seat's: the seat's small travel
 # used to swing the shoulders and the head with it, which magnified the fidgeting); the neck takes back
 # HEAD_STEADY of the spine's side lean and turn, so the head moves less than the chest.
-TURN_DEGREES, HEAD_STEADY = 8., .5
+TURN_DEGREES, HEAD_STEADY = 8., .85    # HEAD_STEADY was .5: the head rode half the chest's side lean and the user
+                                       # reads a tilted head on a body that only leans a little -- a real player
+                                       # keeps the head nearly level and just translates it with the chest
 
 
 def _gauss_time(values, step, tau):
@@ -60,10 +68,11 @@ def _about(point, rotation):
     return m
 
 
-def spine_transforms(shift, turn, heads, top, height, offset=(0., 0., 0.)):
+def spine_transforms(shift, turn, heads, top, height, offset=(0., 0., 0.), sway=0.):
     """Cumulative world transforms of the spine bones (lowest first; ``heads``: their heads, ``top``: where the neck
-    starts): the seat slid by ``offset``, the forward lean at the lowest head, the side lean toward a hand ``shift`` m
-    out (soft limit) and the ``turn`` (rad, about the vertical) shared up the spine. The shares are scaled so the top
+    starts): the seat slid by ``offset``, the forward lean at the lowest head (plus the intro's ``sway`` deg,
+    + backward / - forward), the side lean toward a hand ``shift`` m out (soft limit) and the ``turn`` (rad, about
+    the vertical) shared up the spine. The shares are scaled so the top
     moves sideways as a rigid lean of the whole back about its lowest head would (what the reach is planned on)."""
     heads = np.asarray(heads, float)
     limit = math.radians(LEAN_LIMIT_DEGREES)
@@ -74,7 +83,8 @@ def spine_transforms(shift, turn, heads, top, height, offset=(0., 0., 0.)):
     gain = rise[0] / max(float(np.sum(shares * rise)), 1e-9)
     t = np.eye(4)
     t[:3, 3] = offset
-    t = t @ _about(heads[0], axis_matrix((1., 0., 0.), -math.radians(FORWARD_LEAN_DEGREES)).astype(float))
+    t = t @ _about(heads[0], axis_matrix((1., 0., 0.),
+                    math.radians(-FORWARD_LEAN_DEGREES + sway)).astype(float))
     out = []
     for head, share in zip(heads, shares):
         here = (t @ np.r_[head, 1.])[:3]
@@ -149,7 +159,10 @@ class Torso:
         self.yield_rows = None        # (times, shifts m): the elbows solve's wrist-deviation ask, a lean toward
         self.yield_slopes = None      # a hand whose natural hang the outline buries past the wrist's floor
         self.slide_yield_rows = None  # ... and its seat part: a slide, which raises the palm angle where the
-        self.slide_yield_slopes = None  # lean's tilt lowers it (measured +2 deg/cm against the lean's -1.4)
+        self.slide_yield_slopes = None
+        self.sway_rows = None         # (times, deg +back/-forward): the intro's deliberate body sway
+        self.sway_slopes = None  # lean's tilt lowers it (measured +2 deg/cm against the lean's -1.4)
+        self.slide_return = None      # (s0, s1): the closing gesture eases the seat back to its opening place
         self.slide_max = slide_max(data)
         self.first = self.last = 0.
         self.spine = [dict(bone=b['bone'], head=np.array(b['head'], float), pre_inverse=np.linalg.inv(np.array(b['pre'], float)),
@@ -207,6 +220,25 @@ class Torso:
     def clear_slide_yield(self):
         self.slide_yield_rows = self.slide_yield_slopes = None
 
+    def set_slide_return(self, s0, s1):
+        """The closing gesture: the seat, slid toward the last notes, eases back to where it opened so the
+        hands land on the thighs in the SAME seat as the intro's first frame (the user's spec). ``s0`` is the
+        return's start, ``s1`` the moment the hands rest."""
+        self.slide_return = (float(s0), float(s1))
+
+    def set_sway(self, times, degrees):
+        """The intro's body sway (deg, + backward / - forward) on top of the hips' forward lean: the drawing
+        arms tip the chest back a hair, the reaching arms carry it a little forward (the user's spec)."""
+        self.sway_rows = (np.asarray(times, float), np.asarray(degrees, float))
+        from .motion import pchip_slopes
+        self.sway_slopes = pchip_slopes(self.sway_rows[0], self.sway_rows[1][:, None])
+
+    def _sway(self, t):
+        if self.sway_rows is None:
+            return 0.
+        from .motion import hermite_eval
+        return float(hermite_eval(self.sway_rows[0], self.sway_rows[1][:, None], self.sway_slopes, t)[0])
+
     def _slide_yield(self, t):
         if self.slide_yield_rows is None:
             return 0.
@@ -224,12 +256,34 @@ class Torso:
         env = self._smooth((t - self.first + .85) / .65) * (1 - self._smooth((t - self.last) / .7))
         return float(np.clip(v, -LEAN_SHIFT, LEAN_SHIFT)) * env
 
+    def _shift_curve(self):
+        """(times, m) the rows' windowed average, smoothed (LEAN_TAU) and rate-limited (LEAN_RATE): the
+        lean's commitment, built once per notes set. The per-call gaussian window alone answered a 1.4 s
+        figure with a .3 s dart (23 cm/s) -- faster than any deliberate human lean."""
+        key = (id(self.rows), self.first, self.last)
+        got = getattr(self, '_shift_cache', None)
+        if got is not None and got[0] == key:
+            return got[1], got[2]
+        times = np.arange(self.first - 1., self.last + 1., LEAN_STEP)
+        if len(self.rows):
+            values = np.empty(len(times))
+            for i, t in enumerate(times):
+                near = self.rows[np.abs(self.rows[:, 0] - t) < .8]
+                w = np.exp(-.5 * ((near[:, 0] - t) / .35) ** 2) * near[:, 2]
+                values[i] = float(np.sum(near[:, 1] * w) / (.25 + np.sum(w)))
+        else:
+            values = np.zeros(len(times))
+        values = _gauss_time(values, LEAN_STEP, LEAN_TAU)
+        for i in range(1, len(values)):          # rate limit, forward pass (the tau already made it smooth)
+            d = values[i] - values[i - 1]
+            values[i] = values[i - 1] + math.copysign(min(abs(d), LEAN_RATE * LEAN_STEP), d)
+        self._shift_cache = (key, times, values)
+        return times, values
+
     def _lean(self, t, cap=1.):
         """(side lean shift, turn, seat offset) at ``t``; ``cap`` (0..1) scales the lean: the body yields."""
-        rows, weights = self._window(self.rows, t)
-        shift = 0.
-        if len(rows):
-            shift = float(np.sum(rows[:, 1] * weights) / (.25 + np.sum(weights)))
+        st, sv = self._shift_curve()
+        shift = float(np.interp(t, st, sv)) if len(st) else 0.
         slide = self.slide(t) + self._slide_yield(t)
         if self.slide_max:              # the seat's travel: the plan's curve plus the ask's, clamped to it
             slide = float(np.clip(slide, -self.slide_max, self.slide_max))
@@ -284,7 +338,16 @@ class Torso:
         if not self.slide_max:
             return 0.
         times, values = self._slide_curve()
-        return float(np.interp(t, times, values))
+        v = float(np.interp(t, times, values))
+        if self.slide_return is not None and t > self.slide_return[0]:
+            # The seat's staged place is latched: it does not walk back on its own after the last note. During
+            # the closing gesture ease it to the opening place so the resting hands meet the thighs exactly as
+            # they did in the intro's first frame -- wrist, pitch AND the whole upper body share one seat.
+            s0, s1 = self.slide_return
+            w = self._smooth((t - s0) / max(s1 - s0, 1e-6))
+            # the opening seat is the curve's first latched place, before any note asked it to travel
+            v = v * (1. - w) + float(values[0]) * w
+        return v
 
     def _slide_raw(self, t):
         """The unquantized ask at ``t`` (the seat's curve before the deadband)."""
@@ -342,9 +405,16 @@ class Torso:
     def pose(self, t):
         """({bone: local quaternion} of the spine and the neck, {hand: shoulder pre-matrix}, {hand: collarbone local
         quaternion}, the seat's slide along the bench as a world offset)."""
-        shift, turn, offset = self._lean(t, self._cap(t))
+        cap = self._cap(t)
+        shift, turn, offset = self._lean(t, cap)
+        if os.environ.get('PIANOMOTION_DEBUG_TORSO'):    # diagnosis only: the lean's components per frame
+            import json as _json
+            with open(os.environ['PIANOMOTION_DEBUG_TORSO'], 'a') as f:
+                _json.dump([[float(t), float(shift), math.degrees(turn), float(cap), float(self._yield(t)),
+                             float(self._slide_yield(t)), float(self.slide(t)), float(offset[0])]], f)
         heads = [b['head'] for b in self.spine]
-        chain = spine_transforms(shift, turn, heads, self.neck['head'], self.height, offset)
+        sway = self._sway(t)
+        chain = spine_transforms(shift, turn, heads, self.neck['head'], self.height, offset, sway)
         spine_q, below = {}, np.eye(4)
         below[:3, 3] = offset
         for b, moved in zip(self.spine, chain):
@@ -352,8 +422,8 @@ class Torso:
             below = moved
         transform = chain[-1]
         # the neck takes back part of the side lean and turn (not the forward lean): the head steadier than the chest
-        lean_only = spine_transforms(shift, turn, heads, self.neck['head'], self.height)[-1][:3, :3] \
-            @ np.linalg.inv(spine_transforms(0., 0., heads, self.neck['head'], self.height)[-1][:3, :3])
+        lean_only = spine_transforms(shift, turn, heads, self.neck['head'], self.height, sway=sway)[-1][:3, :3] \
+            @ np.linalg.inv(spine_transforms(0., 0., heads, self.neck['head'], self.height, sway=sway)[-1][:3, :3])
         steady = np.eye(4)
         steady[:3, :3] = _half(lean_only, HEAD_STEADY).T
         n = self.neck
@@ -364,7 +434,8 @@ class Torso:
     def shoulder_world(self, h, t, cap=None):
         """The hand's shoulder pre-matrix at ``t`` (pose's pre[h]) for a lean ``cap``: the elbow-swing search."""
         shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
-        chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height, offset)
+        chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
+                                 offset, self._sway(t))
         return self._shoulders(t, chain[-1])[0][h]
 
     def trunk_world(self, t, cap=None):
@@ -372,5 +443,6 @@ class Torso:
         The lowest spine bone takes its share of the lean about the neutral pose (spine_transforms) on top of its
         exported world matrix."""
         shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
-        chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height, offset)
+        chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
+                                 offset, self._sway(t))
         return (chain[0] @ self.spine[0]['world']).astype(FLOAT)

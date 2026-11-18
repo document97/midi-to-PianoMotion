@@ -50,8 +50,10 @@ class Heightfield:
         self.origin = allpts[:, :2].min(axis=0) - CELL
         size = np.ceil((allpts[:, :2].max(axis=0) + CELL - self.origin) / CELL).astype(int) + 1
         self.top = np.full(size, -np.inf, dtype=FLOAT)
+        self.bottom = np.full(size, np.inf, dtype=FLOAT)
         self.pitch = np.zeros(size, dtype=np.int16)
         for pitch, t in tris.items():
+            low = t[:, :, 2].min()
             n = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
             n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
             for a, b, c in t[n[:, 2] > .5]:
@@ -72,6 +74,9 @@ class Heightfield:
                 higher = z[inside] > self.top[cells]
                 self.top[cells[0][higher], cells[1][higher]] = z[inside][higher]
                 self.pitch[cells[0][higher], cells[1][higher]] = pitch
+                lower = self.bottom[cells]
+                under = np.where(lower > low, low, lower)
+                self.bottom[cells[0], cells[1]] = under
         # per cell: metres to the nearest cell of another key (or none) sideways or toward the player, the shortest way
         # out of the key for a finger beside it (the ``escape`` measure)
         same = lambda a, b: (self.pitch[a] == self.pitch[b]) & np.isfinite(self.top[a]) & np.isfinite(self.top[b])
@@ -86,7 +91,9 @@ class Heightfield:
 
     def penetration(self, points, depths, own=None, brush=False):
         """Per point: metres below the (pressed) key surface under it; ``own``: (pitch, mask) allowance;
-        ``brush``: unplayed keys other than ``own`` may be pushed down silently (``brushed``)."""
+        ``brush``: unplayed keys other than ``own`` may be pushed down silently (``brushed``).
+        A point below the key solid's underside is not in the key at all (a finger resting on the lap
+        sits under the key fronts, and the pull-out transits there): not counted."""
         idx = np.floor((points[:, :2] - self.origin) / CELL).astype(int)
         ok = (idx[:, 0] >= 0) & (idx[:, 1] >= 0) & (idx[:, 0] < self.top.shape[0]) & (idx[:, 1] < self.top.shape[1])
         out = np.zeros(len(points), dtype=FLOAT)
@@ -94,7 +101,8 @@ class Heightfield:
         top = self.top[ix, iy]
         pitch = self.pitch[ix, iy]
         lowered = top - depth_table(depths)[pitch].astype(FLOAT)
-        pen = np.where(np.isfinite(top), lowered - points[ok, 2], 0.)
+        below_solid = points[ok, 2] < self.bottom[ix, iy]
+        pen = np.where(np.isfinite(top) & ~below_solid, lowered - points[ok, 2], 0.)
         if own is not None:
             own_pitch, mask = own
             allow = mask[ok] & (pitch == own_pitch)

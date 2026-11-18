@@ -177,9 +177,9 @@ class PoseSolver:
         xs = [self.regions.centre(p)[0] for p in pitches]
         return float(max(xs) - min(xs)) if xs else 0.
 
-    def palm(self, wrist, yaw, roll):
+    def palm(self, wrist, yaw, roll, pitch=None):
         m = np.eye(4, dtype=FLOAT)
-        m[:3, :3] = q_mat3(self.arm.palm_q(yaw, roll)) * self.arm.scale['wrist']
+        m[:3, :3] = q_mat3(self.arm.palm_q(yaw, roll, pitch)) * self.arm.scale['wrist']
         m[:3, 3] = wrist
         return m
 

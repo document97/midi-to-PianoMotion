@@ -342,6 +342,8 @@ def neighbour_targets(anchors, offsets=None):
     ``offsets`` (yaw, roll per anchor) are added first: the hand's natural orientation on its forearm, for
     anchors still solved square to the keys."""
     out = []
+    if not anchors:                 # a tail / single-hand clip can leave the other hand with no anchors
+        return out
     times = np.array([a.time for a in anchors])
     vectors = np.array([vector_of(a.pose) for a in anchors], dtype=FLOAT)
     if offsets is not None:

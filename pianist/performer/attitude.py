@@ -23,6 +23,7 @@ Two things are offered here, both reading the elbow the swing curve places (arm.
   refine inserts an anchor (the wrist moves with the palm, by the settle's own pull).
 """
 import math
+import os
 
 import numpy as np
 
@@ -132,10 +133,34 @@ def idle_attitude(path, want, busy, rate=1. / 60., tau=.15, gate=3., speed=90., 
     cur = np.array([np.asarray(path(float(t)), float) for t in times])
     playing = np.interp(times, want[0], busy.astype(float)) > .05      # any overlap counts: a key is being kept
     aiming = np.ones(len(times), bool) if aim_z is None else cur[:, 2] >= aim_z
+    if os.environ.get('PIANOMOTION_DEBUG_ATTITUDE'):       # diagnosis only: the idle-aim chase's inputs
+        import json as _json
+        raw = [float(x) for x in (os.environ.get('PIANOMOTION_DEBUG_AT') or '').split(',') if x.strip()]
+        sel = np.zeros(len(times), bool)
+        for win in (raw or [0.]):
+            sel |= (times > win - 1.5) & (times < win + 1.5)
+        with open(os.environ['PIANOMOTION_DEBUG_ATTITUDE'], 'a') as f:
+            _json.dump(dict(rows=[[float(t), float(g), float(o), bool(p), bool(a)]
+                                  for t, g, o, p, a in zip(times[sel], np.interp(times, want[0], want[1])[sel],
+                                                           cur[sel, 3], playing[sel], aiming[sel])]), f)
     out = []
     for k, own in ((1, cur[:, 3]), (2, cur[:, 4])):
         goal = np.interp(times, want[0], want[k])
-        v = np.where(playing | ~aiming, own, np.where(np.abs(goal - own) > gate, goal, own))
+        # The idle aim engages past ``gate`` and holds until the gap nearly closes (a Schmitt trigger). A plain
+        # per-frame threshold re-flips the target wherever the goal drifts back across the band's edge, and the
+        # chase then sweeps between the goal and the path's own yaw at its speed limit -- the 90 deg/s reversals
+        # the user flags as a jittering arm (daylight's frame 920 window, elise's 50-53 s: seven of them).
+        v_idle = own.copy()
+        on = False
+        for i in range(len(own)):
+            gap = abs(float(goal[i]) - float(own[i]))
+            if not on and gap > gate:
+                on = True
+            elif on and gap < gate * .25:
+                on = False
+            if on:
+                v_idle[i] = goal[i]
+        v = np.where(playing | ~aiming, own, v_idle)
         # The idle stretch's target (smoothed); the playing frames' -- and the resting hand's -- target is the
         # path's own wrist itself. Both are reached by one bounded-speed chase from the wrist's real value, so the
         # switch between them is a walk, not a jump -- the old splice (own forced on the playing frames, the

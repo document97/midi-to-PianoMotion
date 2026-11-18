@@ -20,6 +20,14 @@ import numpy as np
 # and the Jacobians are chosen for it (pose.PoseSolver._levenberg_marquardt, fast_settle).
 FLOAT = np.float32
 CALIBRATION = Path(__file__).resolve().parents[1] / 'hand_calibration.json'
+
+# The approved resting points on the thighs, world space, measured on the standard seat. The opening pose
+# and the closing gesture's landing are judged against these. A rig file's own `hands[h].lap` is a ray-cast
+# estimate that shifts a couple of centimetres with the seat/mesh; every Rig uses these fixed points instead,
+# so no external seat-rig file is needed and a stale or re-exported rig cannot drift the resting pose.
+# Source of truth: rig_export.lap_measured() re-derives them from a mesh when the body/seat ever changes.
+LAP_POINT = {'L': (-.104, -.19, .672), 'R': (.104, -.19, .672)}
+
 DIGITS = (1, 2, 3, 4, 5)
 VALUE_NAMES = ('swing_lateral', 'swing_lift', 'mcp_delta', 'ip_delta')
 # Sideways swing (deg, +-) widened over the calibration's working bounds (+-24/25) so the hand spans an
@@ -230,6 +238,10 @@ class Finger:
 class Rig:
     def __init__(self, path):
         data = json.loads(Path(path).read_text(encoding='utf-8'))
+        # The resting hands always go to the approved standard-seat points (LAP_POINT), whatever lap estimate
+        # this rig file happens to carry. Kept in sync with rig_export, which writes the same constants out.
+        for h in 'LR':
+            data['hands'][h]['lap'] = list(LAP_POINT[h])
         self.data = data
         cal = json.loads(CALIBRATION.read_text(encoding='utf-8'))
         self.arm_world = np.array(data['arm_world'], dtype=FLOAT)

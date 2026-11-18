@@ -12,6 +12,26 @@ from .kinematics import FLOAT, basis, loc_rot_scale, mat3_q, q_axis, q_mat3, q_m
 # deg the playing palm is tilted up from the calibrated (bake) hand, about the axis across the hand: the back of the hand
 # rises from the wrist to the knuckles (pose.ARCHED bends the knuckles down past it, so they are its highest point)
 PALM_PITCH = 15.
+# On the lap the hand lies flat: the playing pitch would arch the knuckles 15 deg off the thigh. The pitch eases
+# from this to PALM_PITCH across the intro lift, so the hand turns onto the keys as it comes up.
+LAP_PITCH = -8.
+# The intro's droop stages, the user's spec (2026-11-17): the flat draw keeps the lap's plane (fingertips
+# still sliding on the thigh); the lifted hand hangs from the wrist; the poke's latter half flattens the
+# palm; a brief wrist tension tilts the palm axis 30 deg off vertical (TILT_PITCH, reduced from the first
+# 45-deg take -- the user trimmed the hover's amplitude); the wrist then lets go and the palm falls toward
+# flat (FALL_PITCH) while the hand creeps forward; the reach crosses the key fronts still slightly drooped
+# (EDGE_DROOP) and flattens onto the playing pitch above the keys.
+HANG_PITCH = -33.
+FLAT_PITCH = 0.
+TILT_PITCH = 30.
+FALL_PITCH = 4.
+TOP_DROOP = -22.
+EDGE_DROOP = -18.
+# Closing gesture (the user's 2026-11-18 spec): the wrist lifts 2-3 cm off the last chord, then lets go --
+# the palm hangs 20-25 deg while the curled fingers cross the white-key fronts, and flattens only onto the lap.
+# PALM_PITCH is +15 (the playing plane), so a 25 deg droop from the keys is -10, not 25 deg below flat: deeper
+# than this and the still-tucked fingertips pass through the key tops while the hand crosses the fronts.
+OUTRO_DROOP = -10.
 
 ELBOW_OUT = .035                # elbow rest: this far outside the shoulder (elbows a little wider than the shoulders)
 ELBOW_FOLLOW = .4               # share of the hand's sideways position the elbow follows
@@ -113,12 +133,15 @@ class Arm:
         self.twist_wrist_link = np.array(data['twist_wrist_link'], dtype=FLOAT)
         self.palm_forward = np.array(data['palm_forward'], dtype=FLOAT)
         across = np.cross(self.palm_forward, (0., 0., 1.))
-        self.palm = q_mul(q_axis(across / np.linalg.norm(across), PALM_PITCH), np.array(data['palm'], dtype=FLOAT)).astype(FLOAT)
+        self.palm_axis = across / np.linalg.norm(across)
+        self.palm_bake = np.array(data['palm'], dtype=FLOAT)
+        self.palm = q_mul(q_axis(self.palm_axis, PALM_PITCH), self.palm_bake).astype(FLOAT)
 
-    def palm_q(self, yaw, roll):
-        return q_mul(q_axis((0, 0, 1), yaw), q_mul(q_axis(self.palm_forward, roll), self.palm))
+    def palm_q(self, yaw, roll, pitch=None):
+        palm = self.palm if pitch is None else q_mul(q_axis(self.palm_axis, pitch), self.palm_bake)
+        return q_mul(q_axis((0, 0, 1), yaw), q_mul(q_axis(self.palm_forward, roll), palm))
 
-    def pose(self, wrist, yaw=0., roll=0., pre_upper_world=None, elbow_angle=None):
+    def pose(self, wrist, yaw=0., roll=0., pre_upper_world=None, elbow_angle=None, pitch=None):
         """World wrist matrix, armature-space wrist matrix and the bones' local quaternions; ``elbow_angle``
         (rad on elbow_circle): the elbow placed there (the swing curve's angle) instead of optimized."""
         pre_upper = self.pre_upper_world if pre_upper_world is None else pre_upper_world
@@ -134,7 +157,7 @@ class Arm:
         upper = loc_rot_scale(shoulder, upper_q, self.scale['upper'])
         forearm = loc_rot_scale(elbow, elbow_q, self.scale['elbow'])
         twist_q = q_axis((0, 1, 0), roll)
-        palm_q = self.palm_q(yaw, roll)
+        palm_q = self.palm_q(yaw, roll, pitch)
         palm = loc_rot_scale(wrist, palm_q, self.scale['wrist'])
         palm_axis = q_mat3(palm_q) @ np.array([0., 1., 0.], dtype=FLOAT)   # the palm bone's +Y: toward the fingers
         palm_deg = 180. - math.degrees(math.acos(np.clip(float(palm_axis @ forearm_dir), -1., 1.)))
