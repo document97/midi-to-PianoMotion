@@ -21,13 +21,8 @@ import numpy as np
 FLOAT = np.float32
 CALIBRATION = Path(__file__).resolve().parents[1] / 'hand_calibration.json'
 
-# The resting wrist is NOT the ray-cast point on the thigh: the palm has thickness and the thigh is a round
-# slope, so the hand was fitted a couple of centimetres inward, forward and down from the surface. What is
-# portable is that fitted correction, not the world coordinate it produced: it is kept here as fractions
-# of the model's OWN hip width, in a frame its hips and keyboard define. rig_export.lap_measured() finds
-# the surface on whatever mesh and seat are exported; lap_from_surface() applies this same relative
-# correction there, so another MMD model keeps the look instead of inheriting a frozen coordinate.
-LAP_FROM_SURFACE = dict(inward=.10574, forward=.05151, down=.13620)   # multiples of hip width
+# 针对当前模型与观感调的参数；换模型需微调（髋宽倍数）。
+LAP_FROM_SURFACE = dict(inward=.10574, forward=.05151, down=.13620)
 # The reference this correction was fitted on (development model, standard seat). Documentation and tests
 # only -- no hand is placed from this constant: lap_measured() -> + LAP_FROM_SURFACE -> STANDARD_LAP.
 STANDARD_LAP = {'L': (-.104, -.19, .672), 'R': (.104, -.19, .672)}

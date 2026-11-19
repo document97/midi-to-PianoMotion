@@ -356,9 +356,8 @@ def validation_poses(arm, skin, drivers, cal, hands, count, seed):
 
 
 LAP_ALONG = .35                 # the hands rest on the thighs this share of the way from hip to knee ...
-LAP_OUT = .18844                # ... and this share of the hip width OUTSIDE the thigh bone (m on the standard
-                                # seat: .03 m at .1592 m hip width), on the clothes covering the thigh. A
-                                # share, not metres, so a smaller MMD model does not push its hands too far out.
+# 针对当前模型与观感调的参数；换模型需微调（髋宽倍数）。
+LAP_OUT = .18844                # ... this far outside the thigh bone, as a share of hip width.
 
 # The resting point is fitted from this model's own thigh surface: lap_measured() ray-casts against the
 # mesh on this seat, and lap_from_surface() applies the portable correction (fractions of hip width) that
