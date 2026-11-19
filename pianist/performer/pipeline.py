@@ -71,6 +71,9 @@ ATT_STEP, ATT_GATE, ATT_ROUNDS, ATT_TURN = .3, 8., 2, 12.   # ATT_TURN: deg the 
 ATT_PULLS = (np.array([.08, .03, .015, 1., 1.], dtype=FLOAT),)
 APPLY_IDLE = os.environ.get('PIANOMOTION_IDLE_ATT', '1').lower() not in ('0', 'off', 'false', 'no')
 TAIL_SECONDS = 2.4                # after the source end: the hands lift off and come to rest (silent)
+# A held note keeps its lean row repeated this often (s): the lean's kernel reaches .8 s, so a note held for
+# seconds would otherwise let the shoulder travel back while the hand is still on its key (the arm absorbs it).
+TORSO_HOLD_STEP = .4
 REST_OFFSET = np.array([0., 0., 0.])      # the rig's lap point: the wrist sits at the mid-thigh with the fingertips
                                           # reaching the part of the thigh just under the front of the keyboard.
 REST_YAW = 0.                     # deg: the resting hand keeps its natural hang, fingers along the splayed thigh --
@@ -1253,7 +1256,13 @@ def run(args):
             wrist = np.asarray(paths[n.hand](n.onset)[:3], float)
             delta = wrist[0] - reference[n.hand][0, 3]
             weight = (n.velocity / 127) ** .6
-            torso_rows.append((n.onset, math.copysign(max(0., abs(delta) - LEAN_NEAR), delta), weight))
+            lean = math.copysign(max(0., abs(delta) - LEAN_NEAR), delta)
+            torso_rows.append((n.onset, lean, weight))
+            # Keep the body leaning while the key is still down: one row at the onset lets the shoulder start
+            # back after the lean's .8 s kernel, and on a long note the arm has to undo that travel frame by
+            # frame -- the hand stays put on the key and the whole arm shakes (the user's tail-clip jitter).
+            for t in np.arange(n.onset + TORSO_HOLD_STEP, n.release, TORSO_HOLD_STEP):
+                torso_rows.append((float(t), lean, weight))
             arm = rig.arms[n.hand]
             reach_rows[n.hand].append((n.onset, np.linalg.norm(wrist - reference[n.hand][:3, 3]) / (arm.l1 + arm.l2), weight))
     first = min(n.onset for n in notes.values())
