@@ -26,7 +26,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'lib'))
 
-from performer.kinematics import LAP_POINT            # noqa: E402  the standard seat's resting points
+from performer.kinematics import lap_from_surface, STANDARD_LAP  # noqa: E402  the fitted lap correction
 from arm_driver import ArmDriver                       # noqa: E402
 from body_driver import BodyDriver, apply_seating      # noqa: E402
 from key_geometry import measured_keyboard             # noqa: E402
@@ -356,15 +356,22 @@ def validation_poses(arm, skin, drivers, cal, hands, count, seed):
 
 
 LAP_ALONG = .35                 # the hands rest on the thighs this share of the way from hip to knee ...
-LAP_OUT = .03                   # ... this far outside the thigh bone (m), on the top surface (the clothes on the thigh)
+LAP_OUT = .18844                # ... and this share of the hip width OUTSIDE the thigh bone (m on the standard
+                                # seat: .03 m at .1592 m hip width), on the clothes covering the thigh. A
+                                # share, not metres, so a smaller MMD model does not push its hands too far out.
 
-# LAP_POINT, the approved standard-seat resting points, lives in kinematics (the single source of truth read by
-# every Rig too); import it here so an export writes exactly what the solver enforces.
+# The resting point is fitted from this model's own thigh surface: lap_measured() ray-casts against the
+# mesh on this seat, and lap_from_surface() applies the portable correction (fractions of hip width) that
+# reproduces the approved v9 look. Neither the surface nor the final wrist is a world-space constant.
 
 
 def lap(arm, skin):
-    """{hand: (x, y, z)}: the approved resting point on each thigh, in world space. See LAP_POINT."""
-    return {h: tuple(v) for h, v in LAP_POINT.items()}
+    """{hand: (x, y, z)}: the collision-measured top of each thigh on THIS model and seat.
+
+    Stored as `lap_surface` in the rig; `lap_from_surface()` turns it into the resting wrist, so a new MMD
+    model keeps the approved look without borrowing another model's coordinates.
+    """
+    return lap_measured(arm, skin)
 
 
 def lap_measured(arm, skin):
@@ -393,7 +400,8 @@ def lap_measured(arm, skin):
         hip, knee = world @ bone.head, world @ bone.tail
         other = world @ arm.pose.bones[SIDE['L' if h == 'R' else 'R'] + '足'].head
         point = hip + (knee - hip) * LAP_ALONG
-        point.x += LAP_OUT * (1 if hip.x > other.x else -1)      # outward: away from the other hip, wherever the seat is
+        width = (hip - other).length
+        point.x += LAP_OUT * width * (1 if hip.x > other.x else -1)   # outward: away from the other hip
         origin, down = inverse @ Vector((point.x, point.y, point.z + 1.)), inverse @ Vector((point.x, point.y, point.z))
         direction = (down - origin).normalized()
         while True:
@@ -501,8 +509,14 @@ def main():
     arm, skin, drivers, body, keyboard = neutral_scene(cal)
     coords, normals = mesh_world(skin)
     hands = {h: export_hand(arm, skin, drivers[h], cal['hands'][h], coords, normals) for h in 'LR'}
-    for h, point in lap(arm, skin).items():
-        hands[h]['lap'] = point
+    surface = lap(arm, skin)
+    hips = [vec(arm.matrix_world @ arm.pose.bones[s + '足'].head) for s in ('左', '右')]
+    for h in 'LR':
+        point = lap_from_surface(surface[h], h, hips, hands[h]['neutral_wrist'])
+        hands[h]['lap_surface'], hands[h]['lap'] = surface[h], point
+        print('[lap] %s surface %s -> wrist %s (reference %s)' % (
+            h, [round(v * 1000., 1) for v in surface[h]], [round(v * 1000., 1) for v in point],
+            [round(v * 1000., 1) for v in STANDARD_LAP[h]]), flush=True)
     out = Path(args.output)
     trunk = trunk_data(arm, skin)
     if args.trunk_only:

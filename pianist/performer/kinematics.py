@@ -21,12 +21,53 @@ import numpy as np
 FLOAT = np.float32
 CALIBRATION = Path(__file__).resolve().parents[1] / 'hand_calibration.json'
 
-# The approved resting points on the thighs, world space, measured on the standard seat. The opening pose
-# and the closing gesture's landing are judged against these. A rig file's own `hands[h].lap` is a ray-cast
-# estimate that shifts a couple of centimetres with the seat/mesh; every Rig uses these fixed points instead,
-# so no external seat-rig file is needed and a stale or re-exported rig cannot drift the resting pose.
-# Source of truth: rig_export.lap_measured() re-derives them from a mesh when the body/seat ever changes.
-LAP_POINT = {'L': (-.104, -.19, .672), 'R': (.104, -.19, .672)}
+# The resting wrist is NOT the ray-cast point on the thigh: the palm has thickness and the thigh is a round
+# slope, so the hand was fitted a couple of centimetres inward, forward and down from the surface. What is
+# portable is that fitted correction, not the world coordinate it produced: it is kept here as fractions
+# of the model's OWN hip width, in a frame its hips and keyboard define. rig_export.lap_measured() finds
+# the surface on whatever mesh and seat are exported; lap_from_surface() applies this same relative
+# correction there, so another MMD model keeps the look instead of inheriting a frozen coordinate.
+LAP_FROM_SURFACE = dict(inward=.10574, forward=.05151, down=.13620)   # multiples of hip width
+# The reference this correction was fitted on (development model, standard seat). Documentation and tests
+# only -- no hand is placed from this constant: lap_measured() -> + LAP_FROM_SURFACE -> STANDARD_LAP.
+STANDARD_LAP = {'L': (-.104, -.19, .672), 'R': (.104, -.19, .672)}
+LAP_POINT = STANDARD_LAP       # backwards-compatible name for the reference point
+
+
+def lap_from_surface(surface, hand, hips, neutral_wrist):
+    """World resting wrist for one hand, from this model's collision-measured thigh point.
+
+    ``surface`` is rig_export.lap_measured()'s ray-cast hit at export time, ``hips`` the two leg-bone heads
+    in world space (``torso.hips`` in a rig), and ``neutral_wrist`` this hand's playing wrist. The frame is
+    taken from the body itself -- hip width sets the scale, the hip-to-keyboard direction sets forward --
+    so the fitted offset follows a different model's size and facing instead of the development scene's.
+    """
+    p = np.asarray(surface, dtype=float)
+    flat = [float(v) for v in p]
+    hip_l, hip_r = (np.asarray(h, dtype=float) for h in hips)
+    width = float(np.linalg.norm(hip_r - hip_l))
+    if width < 1e-6:
+        return flat
+    mid = (hip_l + hip_r) * .5
+    lateral = (hip_r - hip_l) / width                        # the body's own left-to-right axis
+    forward = np.asarray(neutral_wrist, dtype=float) - mid
+    forward[2] = 0.
+    # The hand sits off to one side, so hip-to-keyboard is not perpendicular to the hip line. Take only
+    # its forward part: otherwise the sideways share tilts the frame and drags the resting point off.
+    forward -= lateral * float(np.dot(forward, lateral))
+    length = float(np.linalg.norm(forward))
+    if length < 1e-6:
+        return flat
+    forward /= length
+    # Read outward from the surface rather than from bone names, so a mirrored rig still moves inward.
+    outward = lateral if float(np.dot(p - mid, lateral)) > 0 else -lateral
+    c = LAP_FROM_SURFACE
+    result = p + width * (-outward * c['inward'] + forward * c['forward']
+                          - np.array([0., 0., c['down']]))
+    # A ray cast in float32 lands within a micron of the fitted point; the solver's plan is sensitive to
+    # much less than that (see seat_free_hands), so keep the point on a millimetre grid. This reproduces
+    # the approved pose exactly and stops mesh-evaluation noise from changing the whole hand plan.
+    return [round(float(v), 3) for v in result]
 
 DIGITS = (1, 2, 3, 4, 5)
 VALUE_NAMES = ('swing_lateral', 'swing_lift', 'mcp_delta', 'ip_delta')
@@ -238,10 +279,15 @@ class Finger:
 class Rig:
     def __init__(self, path):
         data = json.loads(Path(path).read_text(encoding='utf-8'))
-        # The resting hands always go to the approved standard-seat points (LAP_POINT), whatever lap estimate
-        # this rig file happens to carry. Kept in sync with rig_export, which writes the same constants out.
+        # Each hand rests on THIS model's thigh: rig_export writes the ray-cast surface in `lap_surface`,
+        # and the same fitted relative correction turns it into the resting wrist. Rigs exported before
+        # that field existed already carry the approved point in `lap`; keep it for backwards compatibility.
+        hips = (data.get('torso') or {}).get('hips')
         for h in 'LR':
-            data['hands'][h]['lap'] = list(LAP_POINT[h])
+            hand = data['hands'][h]
+            surface = hand.get('lap_surface')
+            if surface is not None and hips:
+                hand['lap'] = list(lap_from_surface(surface, h, hips, hand['neutral_wrist']))
         self.data = data
         cal = json.loads(CALIBRATION.read_text(encoding='utf-8'))
         self.arm_world = np.array(data['arm_world'], dtype=FLOAT)
