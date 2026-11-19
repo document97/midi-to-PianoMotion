@@ -1257,14 +1257,17 @@ def run(args):
             delta = wrist[0] - reference[n.hand][0, 3]
             weight = (n.velocity / 127) ** .6
             lean = math.copysign(max(0., abs(delta) - LEAN_NEAR), delta)
+            arm = rig.arms[n.hand]
+            reach = np.linalg.norm(wrist - reference[n.hand][:3, 3]) / (arm.l1 + arm.l2)
             torso_rows.append((n.onset, lean, weight))
-            # Keep the body leaning while the key is still down: one row at the onset lets the shoulder start
-            # back after the lean's .8 s kernel, and on a long note the arm has to undo that travel frame by
-            # frame -- the hand stays put on the key and the whole arm shakes (the user's tail-clip jitter).
+            reach_rows[n.hand].append((n.onset, reach, weight))
+            # Keep the body where it is while the key is still down. One row at the onset lets both the lean
+            # and the shoulder protraction start back after their .8 s kernel; on a long note the arm then has
+            # to undo that travel frame by frame -- the hand stays put on the key while the arm shakes, and
+            # the lean/protraction recovering at different moments reads as a shoulder twisting into place.
             for t in np.arange(n.onset + TORSO_HOLD_STEP, n.release, TORSO_HOLD_STEP):
                 torso_rows.append((float(t), lean, weight))
-            arm = rig.arms[n.hand]
-            reach_rows[n.hand].append((n.onset, np.linalg.norm(wrist - reference[n.hand][:3, 3]) / (arm.l1 + arm.l2), weight))
+                reach_rows[n.hand].append((float(t), reach, weight))
     first = min(n.onset for n in notes.values())
     last = max(n.release for n in notes.values())
     by_pitch = {}
