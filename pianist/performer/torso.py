@@ -32,6 +32,14 @@ SHOULDER_FORWARD, SHOULDER_UP = .10, .025
 SLIDE_DEADBAND, SLIDE_HYST, SLIDE_DWELL, SLIDE_TAU = .040, .012, 3., .5
 SLIDE_GRID = .01                # m: the place commits on a 10 mm grid, so a 26 mm ask and a 30 mm ask land alike
 SLIDE_STEP = .02
+# The elbows' seat ask (``_slide_yield``) is a hermite interp that answers the collision solve on its own exact
+# grid, so its raw curve can jump 60 mm in under a second (measured on canonpd at 166.3 s: 0.003 -> 0.063 m in
+# 0.87 s, 103 mm/s). The seat carries the whole upper body with it, so on screen that reads as the hips shuffling
+# and the shoulders snapping sideways -- repeated at every ask across the piece. The solve keeps the raw ask (it
+# needs the exact clearance), but the rendered pose reads a gaussian-smoothed, rate-limited copy: the seat still
+# arrives at exactly the same place, just over a human time scale instead of a jump.
+SEAT_YIELD_TAU, SEAT_YIELD_RATE = .40, .030     # s, m/s: 30 mm/s is a deliberate seated shift, not a fidget
+SEAT_YIELD_STEP = .02
 # The lean follows a hand from LEAN_NEAR out (m past the standard seat's wrist): inside that the hand is close
 # enough that neither the seat nor the chest has to move. It used to be .15 m, which left every small ask to the
 # seat alone -- the hips did the fidgeting the chest could have covered with two degrees of tilt.
@@ -169,6 +177,7 @@ class Torso:
         self.yield_slopes = None      # a hand whose natural hang the outline buries past the wrist's floor
         self.slide_yield_rows = None  # ... and its seat part: a slide, which raises the palm angle where the
         self.slide_yield_slopes = None
+        self.slide_yield_smooth = None  # rendered (gaussian + rate-limited) copy of the seat ask; see set_slide_yield
         self.sway_rows = None         # (times, deg +back/-forward): the intro's deliberate body sway
         self.sway_slopes = None  # lean's tilt lowers it (measured +2 deg/cm against the lean's -1.4)
         self.slide_return = None      # (s0, s1): the closing gesture eases the seat back to its opening place
@@ -254,10 +263,22 @@ class Torso:
         self.slide_yield_rows = (times, offsets)
         from .motion import pchip_slopes
         self.slide_yield_slopes = pchip_slopes(self.slide_yield_rows[0], self.slide_yield_rows[1][:, None])
+        # The pose's rendered copy: same end values, the jumps ironed out. Built once per ask, off the solve's path.
+        if len(times) >= 2:
+            g = np.arange(times[0], times[-1] + SEAT_YIELD_STEP, SEAT_YIELD_STEP)
+            raw = np.interp(g, times, offsets)
+            smooth = _gauss_time(raw, SEAT_YIELD_STEP, SEAT_YIELD_TAU)
+            for i in range(1, len(smooth)):
+                d = smooth[i] - smooth[i - 1]
+                smooth[i] = smooth[i - 1] + math.copysign(min(abs(d), SEAT_YIELD_RATE * SEAT_YIELD_STEP), d)
+            self.slide_yield_smooth = (g, smooth, pchip_slopes(g, smooth[:, None]))
+        else:
+            self.slide_yield_smooth = None
         self._invalidate_world_cache()
 
     def clear_slide_yield(self):
         self.slide_yield_rows = self.slide_yield_slopes = None
+        self.slide_yield_smooth = None
         self._invalidate_world_cache()
 
     def set_slide_return(self, s0, s1):
@@ -279,12 +300,16 @@ class Torso:
         from .motion import hermite_eval
         return float(hermite_eval(self.sway_rows[0], self.sway_rows[1][:, None], self.sway_slopes, t)[0])
 
-    def _slide_yield(self, t):
+    def _slide_yield(self, t, smooth=False):
         if self.slide_yield_rows is None:
             return 0.
         from .motion import hermite_eval
-        v = float(hermite_eval(self.slide_yield_rows[0], self.slide_yield_rows[1][:, None],
-                               self.slide_yield_slopes, t)[0])
+        if smooth and self.slide_yield_smooth is not None:
+            g, s, slopes = self.slide_yield_smooth
+            v = float(hermite_eval(g, s[:, None], slopes, t)[0])
+        else:
+            v = float(hermite_eval(self.slide_yield_rows[0], self.slide_yield_rows[1][:, None],
+                                   self.slide_yield_slopes, t)[0])
         env = self._smooth((t - self.first + .85) / .65) * (1 - self._smooth((t - self.last) / .7))
         return (float(np.clip(v, -self.slide_max, self.slide_max)) if self.slide_max else v) * env
 
@@ -320,11 +345,12 @@ class Torso:
         self._shift_cache = (key, times, values)
         return times, values
 
-    def _lean(self, t, cap=1.):
-        """(side lean shift, turn, seat offset) at ``t``; ``cap`` (0..1) scales the lean: the body yields."""
+    def _lean(self, t, cap=1., smooth=False):
+        """(side lean shift, turn, seat offset) at ``t``; ``cap`` (0..1) scales the lean: the body yields.
+        ``smooth``: read the rate-limited seat ask for the rendered pose; the solve keeps the raw ask."""
         st, sv = self._shift_curve()
         shift = float(np.interp(t, st, sv)) if len(st) else 0.
-        slide = self.slide(t) + self._slide_yield(t)
+        slide = self.slide(t) + self._slide_yield(t, smooth)
         if self.slide_max:              # the seat's travel: the plan's curve plus the ask's, clamped to it
             slide = float(np.clip(slide, -self.slide_max, self.slide_max))
         if shift * slide > 0:           # the slid seat takes its part of the reach; a seat still coming back adds no lean
@@ -451,7 +477,7 @@ class Torso:
         """({bone: local quaternion} of the spine and the neck, {hand: shoulder pre-matrix}, {hand: collarbone local
         quaternion}, the seat's slide along the bench as a world offset)."""
         cap = self._cap(t)
-        shift, turn, offset = self._lean(t, cap)
+        shift, turn, offset = self._lean(t, cap, smooth=True)
         if os.environ.get('PIANOMOTION_DEBUG_TORSO'):    # diagnosis only: the lean's components per frame
             import json as _json
             with open(os.environ['PIANOMOTION_DEBUG_TORSO'], 'a') as f:
