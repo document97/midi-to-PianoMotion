@@ -2397,6 +2397,33 @@ def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previ
         if not active:
             w = ease(min((t - t0.rest_back) / OUTRO_TUCK_SECONDS, 1.))
             room = {d: room[d] * (1. - w) + values[d] * w for d in DIGITS}
+    # B1: a finger coming off a key can snap from its deeply-curled ride pose to the free hand shape in ONE frame
+    # (measured on canonpd: L index at 135.87 s, knuckle -25 -> +20 deg in 16 ms, 45 deg/frame). The keypose
+    # rate limit cannot see it: it happens at the stroke/free boundary, where ``stroke(t)`` stops returning the
+    # stroke and the make-room spacing is switched on at once. Limit a FREE finger against the frame before,
+    # on the final values, as the last word. Fingers actually riding a key are left alone (IK owns them, and a
+    # limit here would keep the pad off its key). ``apply_room=False`` is the pre-pass that samples corrections;
+    # it must stay raw.
+    if apply_room and previous is not None:
+        prev_final = previous.get('_final')
+        pt = getattr(path, 'times', None)
+        dt = float(np.median(np.diff(pt))) if pt is not None and len(pt) > 1 else 1. / 60.
+        cap_deg = TRANSITION_SPEED * max(dt, 1e-4)
+        now = {}
+        for d in DIGITS:
+            s = riding[DIGITS.index(d)]
+            # Limit only the truly free stretch and the lift (after release). The strike/approach
+            # (hover .. touch) is a deliberate move onto a key: cap it and the pad lands late.
+            free = s is None or t > s.release
+            v = room[d]
+            if free and prev_final is not None and d in prev_final:
+                p = prev_final[d]
+                delta = v - p
+                # per-joint bound; knuckle/PIP are the ones that pop. Keep the shape, only clamp the step.
+                v = p + np.clip(delta, -cap_deg, cap_deg)
+                room[d] = v
+            now[d] = np.array(v, dtype=FLOAT, copy=True)
+        previous['_final'] = now
     return vector, room, error
 
 
