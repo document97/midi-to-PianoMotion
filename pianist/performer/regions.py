@@ -8,6 +8,7 @@ let it land further in, on the narrow part between the black keys.
 """
 import numpy as np
 
+from .arm import BODY_SHELL
 from .kinematics import FLOAT
 from .pose import X_MARGIN, hand_solvers
 
@@ -36,7 +37,11 @@ def deepen(regions):
 def performer_solvers(rig):
     """Pose solvers for the performer (the planner's pair table keeps pose.hand_solvers)."""
     solvers = hand_solvers(rig)
+    hips = (rig.data.get('torso') or {}).get('hips')
     for solver in solvers.values():
         deepen(solver.regions)
         solver.neutral = solver.neutral + PLAYING_WRIST_OFFSET
+        if hips:                            # the elbow rests against the ribs, never inside them
+            center = .5 * (float(hips[0][0]) + float(hips[1][0]))
+            solver.arm.set_body_wall(center, .5 * abs(float(hips[1][0]) - float(hips[0][0])) + BODY_SHELL)
     return solvers

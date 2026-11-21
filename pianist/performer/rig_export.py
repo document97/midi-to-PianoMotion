@@ -291,6 +291,17 @@ def export_hand(arm, skin, driver, row, coords, normals):
     return hand
 
 
+def piano_clearance():
+    """Measured keybed envelope, distinct from the fronts of the movable keys."""
+    obj = bpy.data.objects.get('piano_part_000')
+    if obj is None or obj.type != 'MESH':
+        return None
+    points = np.asarray([vec(obj.matrix_world @ v.co) for v in obj.data.vertices])
+    return dict(object=obj.name, front_y=float(points[:, 1].min()),
+                bottom_z=float(points[:, 2].min()), bounds_min=points.min(0).tolist(),
+                bounds_max=points.max(0).tolist())
+
+
 def key_meshes():
     rows = {}
     for obj in bpy.data.objects:
@@ -494,6 +505,7 @@ def write_trunk(out, trunk):
     print('TRUNK_EXPORTED', path, len(trunk['local']), 'verts', 'rig', trunk['rig_sha256'][:12], flush=True)
 
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True)
@@ -543,7 +555,7 @@ def main():
                calibration_sha256=hashlib.sha256(cal_path.read_bytes()).hexdigest(),
                fps=bpy.context.scene.render.fps / bpy.context.scene.render.fps_base,
                arm_world=mat(arm.matrix_world) if seat_free is None else free_world, hands=hands, torso=torso, keyboard=keyboard,
-               key_meshes=key_meshes(),
+               key_meshes=key_meshes(), piano_clearance=piano_clearance(),
                key_depth_gain={p: k['local_z_world_gain'] for p, k in keyboard.items()})
     rig['validation'] = validation_poses(arm, skin, drivers, cal, hands, args.samples, 7)
     out.parent.mkdir(parents=True, exist_ok=True)
