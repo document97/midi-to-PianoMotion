@@ -38,8 +38,10 @@ for _d in (3, 4, 5):
 # down, about the steepest the pad still allows). The flattened hand keeps a little knuckle bend instead of opening to
 # +12 -- except the INDEX, which the user reads as its own thing: its knuckle stays where it was, an index held flat
 # and long, and only the outer three keep the bend.
-ARCHED = {1: np.array([0., -4., 8., 16.], dtype=FLOAT), 2: np.array([0., -35., 30., 30.], dtype=FLOAT)}
-FLAT = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 12., 34., 28.], dtype=FLOAT)}
+# 2026-11-21: the index knuckle bend is halved toward 0 (user's eye: the first joint curled too much).
+# ARCHED -35 -> -17.5, FLAT +12 -> +6; the outer three fingers keep their values.
+ARCHED = {1: np.array([0., -4., 8., 16.], dtype=FLOAT), 2: np.array([0., -17.5, 30., 30.], dtype=FLOAT)}
+FLAT = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 6., 34., 28.], dtype=FLOAT)}
 for _d in (3, 4, 5):
     ARCHED[_d] = np.array([0., -35., 30., 30.], dtype=FLOAT)
     FLAT[_d] = np.array([0., 2., 34., 26.], dtype=FLOAT)
