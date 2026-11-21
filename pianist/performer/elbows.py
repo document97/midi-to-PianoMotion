@@ -1080,15 +1080,19 @@ def load(rig_path):
     clearing the wrong body is worse than not clearing at all (no outline, no swing, as before the export existed).
     Pairs are checked on the rig's sha256 stamp; outlines that predate it on the trunk bone's world matrix, which
     both files already carry."""
-    path = Path(rig_path).with_name('trunk.json')
-    if not path.exists():
-        return None
-    data = json.loads(path.read_text(encoding='utf-8'))
-    stale = _stale_reason(data, Path(rig_path))
-    if stale:
-        print(f'TRUNK_STALE {path}: {stale}', flush=True)
-        return None
-    return Trunk.from_dict(data)
+    rig_path = Path(rig_path)
+    # <rig stem>.trunk.json first (one outline per rig, so seats sharing a directory cannot shadow each other),
+    # then the bare trunk.json that exports before this naming and rig.json itself still use.
+    for path in (rig_path.with_name(rig_path.stem + '.trunk.json'), rig_path.with_name('trunk.json')):
+        if not path.exists():
+            continue
+        data = json.loads(path.read_text(encoding='utf-8'))
+        stale = _stale_reason(data, rig_path)
+        if stale:
+            print(f'TRUNK_STALE {path}: {stale}', flush=True)
+            continue
+        return Trunk.from_dict(data)
+    return None
 
 
 def _stale_reason(data, rig_path):

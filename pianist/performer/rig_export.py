@@ -500,8 +500,15 @@ def write_trunk(out, trunk):
     if not out.exists():
         raise SystemExit(f'trunk.json needs the rig it describes: {out} is missing (export the rig first)')
     trunk = dict(trunk, rig_sha256=hashlib.sha256(out.read_bytes()).hexdigest())
-    path = out.parent / 'trunk.json'
-    path.write_text(json.dumps(trunk), encoding='utf-8')
+    text = json.dumps(trunk)
+    # Named after its rig: several seats exported into one directory (output/clips/seat_rigs holds base/left10/
+    # left15) used to share a single trunk.json, so every rig but the one it was traced from read a stale outline
+    # and silently lost its swing. The unsuffixed name is still written for rig.json, which is the single-rig cache
+    # every existing run and every older loader looks for.
+    path = out.parent / (out.stem + '.trunk.json')
+    path.write_text(text, encoding='utf-8')
+    if out.stem == 'rig':
+        (out.parent / 'trunk.json').write_text(text, encoding='utf-8')
     print('TRUNK_EXPORTED', path, len(trunk['local']), 'verts', 'rig', trunk['rig_sha256'][:12], flush=True)
 
 
