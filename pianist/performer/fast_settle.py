@@ -940,6 +940,14 @@ def ride_residuals(H, R, v, vals, mats, work, loc, world, out, C):
         for j in range(4):
             out[m] = (v[j] - start[j]) / scales[2]
             m += 1
+    # Posture: a finger has four joints for a three-dimensional target, so one direction is free. Spent
+    # unguarded it drifts to a joint stop (the middle joint folded to its 8 deg limit and then held there by
+    # the steady term for the whole note). These are hinges on that free direction only: nothing inside the
+    # playing range, a growing cost outside it -- the pad's own position is untouched where it matters.
+    for j in range(1, 4):
+        lo, hi = scales[4 + 2 * (j - 1)], scales[5 + 2 * (j - 1)]
+        out[m] = max(lo - v[j], v[j] - hi, 0.) / scales[3]
+        m += 1
     return m
 
 

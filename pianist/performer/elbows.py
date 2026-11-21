@@ -26,6 +26,7 @@ import numpy as np
 
 from . import elbows_fast
 from .arm import closest_elbow_angle, elbow_circle
+from .torso import REACH_FULL
 
 SLICE = .01                      # m of outline per hull slice, along the trunk bone's y
 AXIS, OTHERS = 1, (0, 2)         # the slices run along the bone's y; each hull lies in its x-z
@@ -105,12 +106,25 @@ def _tick(key, dt=0.):
 def _profile_line():
     if not (PROFILE and _prof):
         return None
-    return 'ELBOW_PROFILE ' + json.dumps({k: dict(calls=v[0], seconds=round(v[1], 2)) for k, v in sorted(_prof.items())})
+    return 'ELBOW_PROFILE ' + json.dumps(profile_snapshot())
+
+
+def profile_snapshot():
+    """Diagnostics-only read of the per-substep call/seconds counters, or None if profiling was off.
+    Exposed so bench/dev tools can drop structured hotspot data into JSON instead of scraping stdout."""
+    if not (PROFILE and _prof):
+        return None
+    return {k: dict(calls=v[0], seconds=round(v[1], 2)) for k, v in sorted(_prof.items())}
 
 
 def _ask_log(**row):
     if ASK_LOG is not None:
         ASK_LOG.append(row)
+
+
+def _cross2(a, b):
+    """z of the 2 d cross product (numpy 2 dropped ``np.cross`` for 2 d vectors)."""
+    return float(a[0] * b[1] - a[1] * b[0])
 
 
 def hull2d(points):
@@ -121,7 +135,7 @@ def hull2d(points):
     def half(pts):
         h = []
         for q in pts:
-            while len(h) >= 2 and np.cross(h[-1] - h[-2], q - h[-2]) <= 0:
+            while len(h) >= 2 and _cross2(h[-1] - h[-2], q - h[-2]) <= 0:
                 h.pop()
             h.append(q)
         return h
@@ -254,15 +268,24 @@ def _near(angle, anchor):
 
 def _choose(runs, target, prev):
     """The run this sample is bounded to: the previous one while it lasts (the arcs move slowly, the curve does
-    not jump between them), else the one nearest the pull target; unwrapped around ``prev`` or the target."""
+    not jump between them), else the one nearest the pull target; unwrapped around ``prev`` or the target.
+    Where the previous interval reaches into MORE than one run the continuity argument says nothing -- and taking
+    the first one in angle order is arbitrary: canon 200.20-200.35 had the natural hang's own arc free (distance
+    0 deg) beside a 6-12 deg sliver 60-73 deg below it, and the curve dove into the sliver, swung 70 deg in .2 s
+    and sprang back (the user's 6145-6190). Nearest the hang wins there; the single-overlap case is unchanged."""
     anchor = (.5 * (prev[0] + prev[1])) if prev is not None else target
     if prev is not None:
+        cands = []
         for lo, hi in runs:
             a = prev[0] + ((lo - prev[0]) % (2 * math.pi))       # the run starts inside the previous interval ...
             b = lo + ((prev[0] - lo) % (2 * math.pi))            # ... or the previous interval starts in the run
             if a <= prev[1] + 1e-9 or b <= hi + 1e-9:
                 near = _near(lo, anchor)
-                return near, near + (hi - lo)
+                cands.append((near, near + (hi - lo)))
+        if cands:
+            if len(cands) == 1 or not np.isfinite(target):
+                return cands[0]
+            return min(cands, key=lambda c: max(c[0] - target, target - c[1], 0.))
     best, cost = None, None
     for lo, hi in runs:
         near = _near(lo, anchor)
@@ -326,6 +349,27 @@ def _trace(torso, path, grid, label, kin, moved):
         got['S'][i], got['W'][i], got['M'][i] = S_i, W_i, M_i
         got['have'][i] = True
     return got['S'], got['W'], got['M'], got['have']
+
+
+def _least_lean(torso, t, wrist, label, hand, arm, trunk, prev, levels=CAP_LEVELS):
+    """The least lean (share of the cap, 0..1) at which ``wrist`` is inside the arm's length AND some swing of the
+    elbow clears the trunk: (share, bound, depth, rise, target), or None when even the upright body cannot reach
+    it. The elbow solver's rule is that the body yields before the arm breaks (elbows.solve); a hand parked on the
+    lap through the other hand's far passage is the case that rule was missing -- there the body had leaned until
+    this arm was dead straight, and a straight arm's elbow is solved through the chest."""
+    for share in np.linspace(min(1., torso._cap(t)), 0., levels):
+        try:
+            s = torso.shoulder_world(label, t, cap=float(share))[:3, 3]
+            m = torso.trunk_world(t, cap=float(share))
+            ang, deep, rise = trunk.swing(s, wrist, arm.l1, arm.l2, arm.side, m, hand)
+        except ValueError:                  # still beyond the arm at this lean: lean less
+            continue
+        free = deep <= 0.
+        if not free.any():
+            continue
+        target = closest_elbow_angle(s, wrist, arm.l1, arm.l2, arm.side)
+        return float(share), _choose(_runs(free, ang), target, prev), deep, rise, target
+    return None
 
 
 def _scan(torso, path, grid, arm, label, hand, trunk, clearance, kin=None, moved=None):
@@ -395,12 +439,44 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance, kin=None, moved
             prev = None
             continue
         s, w = S[i], W[i]
+        # The lean may not carry a hand away from its own wrist past a comfortable reach. A hand parked on the
+        # lap while the other plays far out is the case: the lean takes its shoulder across the body, the arm
+        # goes dead straight, and its elbow has no freedom left -- it is solved into the chest. (The hand the
+        # lean is FOR is the other case: there the shoulder comes toward its wrist, nothing to cap.)
+        limit = REACH_FULL * (arm.l1 + arm.l2)
+        if np.linalg.norm(w - s) > limit:
+            still = torso.shoulder_world(label, t, cap=0.)[:3, 3]
+            if float(np.dot(s - still, w - s)) < 0.:
+                for share in np.linspace(torso._cap(t), 0., CAP_LEVELS):
+                    moved = torso.shoulder_world(label, t, cap=float(share))[:3, 3]
+                    if np.linalg.norm(w - moved) <= limit:
+                        required[i] = float(share)
+                        s, M[i] = moved, torso.trunk_world(t, cap=float(share))
+                        break
         if trunk._packed() is None:     # no numba: the one-sample swing, as the scan always did
             try:
                 _, deep_i, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, M[i], hand)
             except ValueError:
-                lo[i], hi[i] = anchor, anchor
-                prev = None
+                # The body leaned away from this hand until its wrist sits beyond the arm's length (the other
+                # hand's lean carried this shoulder off while the wrist stayed put -- a hand parked on the lap
+                # through the other hand's high passage). The frames stage would stretch the arm, and a
+                # stretched arm has no elbow freedom: the elbow is solved straight through the chest. The body
+                # yields instead -- the least lean at which this wrist is inside the arm AND a swing clears the
+                # trunk (a passage where the other hand is far out has the slack for it; where it has not, the
+                # stretch stands as before).
+                got = _least_lean(torso, t, w, label, hand, arm, trunk, prev)
+                if got is None:
+                    raw_lo[i], raw_hi[i] = anchor, anchor
+                    fine[i] = False
+                    prev = None
+                    continue
+                share, bound, deep_i, rise, raw_target[i] = got
+                required[i] = share
+                raw_lo[i], raw_hi[i] = bound
+                depths[i], rises[i] = deep_i, rise
+                ws[i] = w
+                prev = bound
+                fine[i] = True
                 continue
             depths[i], rises[i] = deep_i, rise
         else:
@@ -608,14 +684,25 @@ def _rendered(torso, curve, times, path, h, arm, solver):
     hand is beyond its arm."""
     from .kinematics import q_mat3
     from .arm import closest_elbow
-    from .motion import pchip_slopes, hermite_eval
-    sl = pchip_slopes(curve['times'], curve['angles'][:, None])
-    out = np.full(len(times), np.nan)
-    for k, t in enumerate(times):
+    from . import elbows_render_fast as RF
+    tq = np.atleast_1d(np.asarray(times, float))
+    # The curve's hermite is evaluated for every query frame. In the wrist ask this is called hundreds of
+    # times over the render-rate grid; the compiled batch does the pchip slopes and all frames in one kernel
+    # (identical formulas, ~0.8 ms instead of ~330 ms of Python loops). Blender has no numba: keep the
+    # original per-frame path there, byte-for-byte.
+    if RF.available():
+        phi_all = RF.eval_many(curve['times'], curve['angles'][:, None], tq)
+    else:
+        from .motion import pchip_slopes, hermite_eval
+        sl = pchip_slopes(curve['times'], curve['angles'][:, None])
+        phi_all = np.array([float(hermite_eval(curve['times'], curve['angles'][:, None], sl, float(x))[0])
+                            for x in tq])
+    out = np.full(len(tq), np.nan)
+    for k, t in enumerate(tq):
         try:
             v = np.asarray(path(float(t)), float)
             s = torso.shoulder_world(h, float(t))[:3, 3]
-            phi = float(hermite_eval(curve['times'], curve['angles'][:, None], sl, float(t))[0])
+            phi = float(phi_all[k])
             e = closest_elbow(s, v[:3], arm.l1, arm.l2, arm.side, angle=phi)
             f = v[:3] - e
             pq = q_mat3(arm.palm_q(v[3], v[4])) @ np.array([0., 1., 0.])
