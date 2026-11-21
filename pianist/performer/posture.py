@@ -116,6 +116,11 @@ def turn_to_keys(arm, wrist, yaw, roll, elbow, tol=KEY_TOL, floor=KEY_FLOOR,
     caller that would rather not move at all than move to somewhere it did not want."""
     forearm = np.asarray(wrist, FLOAT)[:3] - np.asarray(elbow, FLOAT)
     f = forearm / max(np.linalg.norm(forearm), 1e-9)
+    # A roll that arrives outside the bounds (the attitude curve can carry one past them: the canon's opening right
+    # wrist sits at -22.4 deg) used to fail the bounds test on every candidate below, so the search never ran and the
+    # hand kept its crooked yaw -- 14 deg off the keys for the first second, until the roll walked back in range on
+    # its own. Clamping it in makes an out-of-range input searchable instead of silently unalignable.
+    roll = float(np.clip(roll, ROLL_BOUNDS[0], ROLL_BOUNDS[1]))
     here = abs(finger_deg(arm, yaw, roll))
     if here <= tol:
         return (float(yaw), float(roll)), palm_vs(arm, yaw, roll, forearm)
