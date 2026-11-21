@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 
 import json
 import os
+import sys
 
 import numpy as np
 
@@ -60,11 +61,18 @@ ARC_MIN_DISTANCE = .02
 # it lifts and drops into the next chord when the same finger plays again, on a chord, on a position change
 # or after a rest. How high is set by the time the hand is free (release .. next touch), not the reason.
 LEGATO_MARGIN = .03              # a release this close before the next touch (or later) joins the notes
-STRIKE_REST = .3                 # a free hand this long before its next touch lifts even for a single note
+STRIKE_REST = float(os.environ.get('PIANOMOTION_STRIKE_REST', .24))   # a free hand this long before its next touch
+                                 # lifts even for a single note (the gate of the strike/crawl ladder)
 STRIKE_SHIFT = .025              # wrist travel (m) that counts as a position change
-LIFT_WINDOWS = (.12, .25, .4, .7, 1.)          # free time (s) ...
-LIFT_HEIGHTS = (0., .003, .01, .04, .065)      # ... and the wrist's rise (m) at a middle loudness: about a third above the
-                                               # reference's knuckle lift, which read as too timid on the character
+LIFT_WINDOWS = (.12, .25, .40, .7, 1.)         # free time (s) ...
+# P3 ("多敲", chosen 2026-11-20): the short end rises enough to read as a strike at 8 mm, and the gate lets a
+# 0.24 s free window lift at all, so fast passages get some. P0 was (0., .0062, .0135, .04, .065) with a 0.30 s
+# gate; the ladder lives in output/strike_presets.py.
+LIFT_HEIGHTS = (.0045, .011, .022, .048, .068)   # ... and the wrist's rise (m) at a middle loudness
+# The ladder (output/strike_presets.py) is runnable without editing: PIANOMOTION_LIFT="h0,h1,h2,h3,h4" and
+# PIANOMOTION_STRIKE_REST=0.24 override the two knobs that decide how much of the playing is struck.
+if os.environ.get('PIANOMOTION_LIFT'):
+    LIFT_HEIGHTS = tuple(float(x) for x in os.environ['PIANOMOTION_LIFT'].split(','))
 LIFT_LOUDNESS = ((40., 110.), (.75, 1.35))     # velocity of the chord struck -> share of that rise (a loud chord from higher)
 LIFT_SCALE = 1.                  # the piece's own share (inputs/<piece>/motion.json "lift"): its character, lyrical to spirited
 LEAD_IN_SECONDS = 1.2            # from the rest pose to the first anchor
@@ -148,6 +156,36 @@ STROKE_CLEAR_TOLERANCE = .0005   # skin this far into another key is left alone 
 STROKE_CLEAR_SMOOTH = .025       # gaussian width spreading a correction over neighbouring grid points (s)
 FLOOR_SCALE = .0005              # skin below the key surface, metres per residual unit
 FREE_VALUE_SCALE = 20.           # a free finger leaves its keyposed values by as little as possible (deg per unit)
+# The playing range each joint is pushed back into (lo, hi; the first value is unused -- the sideways swing):
+# the middle joint keeps its playing range, the last joint curls at least 22-24 (a distal phalanx ~45-48 deg
+# down, 10 deg more than the fingers were sitting at), and the outer three keep a little knuckle bend instead
+# of opening flat. The THUMB is left alone (its 8 deg knuckle is its own natural shape) and the INDEX's knuckle
+# is left alone too: the user reads the index as a different finger, held flat and long over the key.
+POSTURE_BANDS = {}
+for _d in DIGITS:
+    POSTURE_BANDS[_d] = ((0., 0.), (None, 2.), (18., 62.), (22., 45.))
+POSTURE_BANDS[1] = ((0., 0.), (None, None), (None, None), (None, None))
+POSTURE_BANDS[2] = ((0., 0.), (None, None), (18., 62.), (24., 45.))
+PIP_POSTURE_SCALE = float(os.environ.get('PIANOMOTION_PIP_POSTURE', 2.5))  # deg outside that range per residual unit
+
+
+def posture_flat(digit):
+    """The bands as one flat array for the compiled ride (lo, hi per joint); None becomes an unreachable bound."""
+    return tuple(x for lo, hi in POSTURE_BANDS[digit]
+                 for x in (-1e4 if lo is None else lo, 1e4 if hi is None else hi))
+
+
+def posture_residual(v, digit):
+    """The joint hinges at ``v`` (one residual per joint, the sideways swing free)."""
+    out = np.empty(3, dtype=FLOAT)
+    for k, j in enumerate((1, 2, 3)):
+        lo, hi = POSTURE_BANDS[digit][j]
+        out[k] = max((-1e4 if lo is None else lo) - v[j], v[j] - (1e4 if hi is None else hi), 0.) / PIP_POSTURE_SCALE
+    return out
+PIP_BAND = None                  # diagnosis only: PIANOMOTION_PIP_BAND=lo,hi narrows every finger's middle joint
+if os.environ.get('PIANOMOTION_PIP_BAND'):
+    _lo, _hi = (float(x) for x in os.environ['PIANOMOTION_PIP_BAND'].split(','))
+    PIP_BAND = (_lo, _hi)
 IK_VALUE_SCALE = 15.             # prior toward the seed: fixes the finger's free direction (3 targets, 4 values)
 # How each finger rises off its key by itself (anatomy, and the reference mocap's free fingers): the index lifts high
 # from its knuckle keeping its curve; the middle and little fingers lift less and open the knuckle and middle joint
@@ -336,6 +374,7 @@ class WristPath:
         self.resting = np.all(np.abs(self.slopes) < 1e-12, axis=1)
         self.att_times, self.att_values = _attitude_table(self.times, self.values, self.slopes)
         self.accents = np.zeros((0, 3))          # (start, onset, depth): the wrist sinks into loud chords
+        self.pitch_rise = None                  # (times, 0..1): the palm's pendulum through each free window
 
     def set_attitude(self, times, yaw, roll):
         """Yaw and roll from their own table (attitude.settle: the palm turned onto the forearm the elbows solve
@@ -412,28 +451,45 @@ def _arc(va, vb, free):
 OUTRO_LIFT = .026              # wrist rises this far back-up off the last chord before travelling back (m)
 OUTRO_CLEAR = .026             # ... and comes this far behind its lap rest while still high (m)
 OUTRO_APEX = .036              # the crest of the return, above the last chord (m, over the end pose)
-OUTRO_T = 1.35                 # the closing gesture itself, from lift-off to the hand at rest on the lap
-OUTRO_HOLD = .22               # a still beat at the very end (the piece is over; the hands have arrived)
+OUTRO_T = 3.80                 # the closing gesture itself, from lift-off to the hand at rest on the lap.
+                               # 3.80 s = the intro's leave->land (measured from the same wrist path): the return
+                               # is the intro played backwards, so it must take the same time. 2.20 s read as a
+                               # hurried snap (the user's "too fast"). Only the outro knots use this constant.
+                               # Longer than the old 1.35 s on purpose: the return covers 30-55 cm (the right
+                               # hand comes back from the far end of the keyboard), and at 1.35 s it had to
+                               # peak near 0.9 m/s and then brake hard -- read as a whip next to the opener.
+OUTRO_HOLD = .26               # a still beat at the very end (the piece is over; the hands have arrived)
 OUTRO_WAIT = 1.5               # last notes closer than this: the earlier hand waits, then both close
 OUTRO_WAIT_LIFT = .016         # the waiting hand's wrist creeps up this far (m) instead of freezing on the keys
 OUTRO_START_GAP = .06          # the two hands' starts differ this much (s) even when they close together
 OUTRO_LAND_SLIDE = .012        # after the first touch the wrist slides this far along the thigh (m)
-OUTRO_TUCK_SECONDS = .22       # the fingers' group curl into the lap shape's tuck this quickly
-OUTRO_UNFOLD_SECONDS = .38     # ... and open again over the last stretch onto the thigh
+OUTRO_TUCK_SECONDS = .40       # fingers curl into the gathered shape over the first beat of the (3.8 s) return;
+                               # scaled with OUTRO_T from .22 s so the gather does not read as a snap
+OUTRO_UNFOLD_SECONDS = .80     # ... and open again over the last stretch onto the thigh (likewise scaled)
+OUTRO_UNFOLD_CLEAR = .025      # the fingers are fully open by the time the wrist is this far above the lap (m)
 
 
-def outro_path(v_from, rest, t0, side=1., lift=OUTRO_LIFT, apex=OUTRO_APEX, land=None):
+def outro_path(v_from, rest, t0, side=1., lift=OUTRO_LIFT, apex=OUTRO_APEX, land=None, crest=None):
     """One continuous wrist track from the last playing hold ``v_from`` back to the lap ``rest``.
 
     Space: a C2 spline through lifted / pulled-back / descending / brush waypoints, sampled by arc length.
-    Time: one monotone pchip speed field over [t0, t0+OUTRO_T] with a strong ease-out over the final
-    approach, so the hand decelerates before the thigh, touches, slides a centimetre and stops -- without
-    ever coming to rest in the middle of the return.
+    Time: one monotone speed field over [t0, t0+OUTRO_T] shaped like the opener's -- a short gather, one
+    broad crest, then a long decay -- so the hand is already slow 3-5 cm above the thigh, touches, slides
+    a centimetre and stops, without ever coming to rest in the middle of the return.
+
+    ``crest`` (0..1, the fraction of the time the speed peaks at) defaults to a fraction of where the apex
+    falls along the path: a hand already over the lap reaches it a quarter of the way in, and a crest fixed
+    at the usual .27 of the time lands in the descent, so the hand accelerates into the drop.
     """
     from scipy.interpolate import CubicSpline
     a = np.asarray(v_from, dtype=FLOAT).copy()
     r = np.asarray(rest, dtype=FLOAT).copy()
     land = r if land is None else np.asarray(land, dtype=FLOAT).copy()
+    # A hand that is already over the lap needs no long clear corridor: pulling it forward only to bring it
+    # back reads as a detour (the left hand's last chord sits 3 cm from its lap rest, the right's 37 cm
+    # away). Scale the corridor by how far the hand actually has to travel.
+    reach = float(np.linalg.norm(land - a))
+    clear = OUTRO_CLEAR * float(np.clip(reach / .30, .45, 1.))
     # 1. Straight up-and-back off the keys first: the palm is about to droop, the fingertips must clear
     #    the key fronts before the hand travels (the same high corridor the intro uses in reverse).
     p_up = a.copy()
@@ -442,13 +498,13 @@ def outro_path(v_from, rest, t0, side=1., lift=OUTRO_LIFT, apex=OUTRO_APEX, land
     p_up[2] += lift
     # 2. Pull behind the lap rest while still HIGH, so the descent happens behind the key fronts' overhang.
     p_back = land.copy()
-    p_back[0] += side * OUTRO_CLEAR * .5
-    p_back[1] -= OUTRO_CLEAR
+    p_back[0] += side * clear * .5
+    p_back[1] -= clear
     p_back[2] = max(a[2], land[2]) + apex
     # 3. Descend in that clear corridor to just above the lap ...
     p_down = land.copy()
-    p_down[0] += side * OUTRO_CLEAR * .35
-    p_down[1] -= OUTRO_CLEAR * .8
+    p_down[0] += side * clear * .35
+    p_down[1] -= clear * .8
     p_down[2] = land[2] + .012
     # 4. ... touch a centimetre or so toward the knee, then slide back along the thigh onto the settled
     #    place. The brush is the first contact; the last leg is a slow slide, not another descent.
@@ -480,14 +536,28 @@ def outro_path(v_from, rest, t0, side=1., lift=OUTRO_LIFT, apex=OUTRO_APEX, land
     dense = spatial(u)
     arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(dense[:, :3], axis=0), axis=1))]
     arc /= arc[-1]
-    # ONE speed field. Peak speed sits just after the lift; the last ~15% of the path is stretched over
-    # enough time that the wrist visibly decelerates 3-5 cm above the thigh, touches, and only slides the
-    # final centimetre. The hold rows keep the very end still without a zero-speed knot mid-return.
+    # ONE speed field, shaped like the opener's: a short gather off the keys, one broad crest, then a
+    # long decay -- the last 15% of the path takes the last third of the time, so the hand arrives at
+    # the thigh slowly instead of braking out of a whip. A beta speed law gives that in one piece; the
+    # old five rows accelerated, eased, then accelerated AGAIN into the descent (a visible hump before
+    # the brake), which is what read worse than the intro's curve.
+    #
+    # The crest's PLACE matters as much as its height: it must sit before the apex, while the hand is
+    # still travelling. A hand already over the lap (the left's last chord is 3 cm from its lap rest)
+    # reaches the apex a quarter of the way along the path, so a crest fixed at .27 of the time lands in
+    # the descent and the hand accelerates into the drop -- it read as a slap, while the right's, whose
+    # apex is .64 of the path, never did. Put the crest at a fraction of the apex's own place instead.
+    if crest is None:
+        crest = float(np.clip(.55 * float(arc[int(np.argmax(dense[:, 2]))]), .12, .30))
+    b = 1.6
+    a_exp = b * crest / max(1e-6, 1. - crest)
     t1 = t0 + OUTRO_T
     t_hold = t1 - OUTRO_HOLD
-    t_slow = t_hold - .40
-    clock_t = np.asarray([t0, t0 + OUTRO_T * .16, t0 + OUTRO_T * .40, t_slow, t_hold, t1], float)
-    clock_s = np.asarray([[0.], [.22], [.60], [.86], [1.], [1.]], float)
+    f = np.linspace(0., 1., 41)
+    speed = np.maximum(f, 1e-9) ** a_exp * np.maximum(1. - f, 1e-9) ** b
+    clock_s = np.r_[0., np.cumsum((speed[1:] + speed[:-1]) * .5)]
+    clock_s = (clock_s / clock_s[-1])[:, None]
+    clock_t = t0 + f * (t_hold - t0)
     clock_m = pchip_slopes(clock_t, clock_s)
 
     def progress(t):
@@ -497,6 +567,26 @@ def outro_path(v_from, rest, t0, side=1., lift=OUTRO_LIFT, apex=OUTRO_APEX, land
     sample_t = np.linspace(t0, t1, count + 1)
     sample_s = np.maximum.accumulate([progress(t) for t in sample_t])
     return [(float(t), spatial(float(np.interp(s, arc, u))), 0.) for t, s in zip(sample_t[1:], sample_s[1:])]
+
+
+def lap_arrival(path, rest, clear=OUTRO_UNFOLD_CLEAR):
+    """When the closing wrist first comes within ``clear`` of the lap's height (``rest`` is its landing vector).
+
+    The return curve touches the thigh a centimetre or two above the settled place -- the last stretch is a
+    slow slide along the leg, not another descent -- so the gesture's nominal end (``trip_outro_land``) is
+    well after the hand is already on the leg. The fingers must be open by the CONTACT, not by the end:
+    arriving still tucked drove the curled fingertips into the thigh (the lap pose is fitted with the
+    relaxed curl, so the tuck's extra 40 deg of middle joint points straight down into it).
+    """
+    t0 = getattr(path, 'trip_outro', None)
+    t1 = getattr(path, 'trip_outro_land', None)
+    if t0 is None or t1 is None or t1 <= t0:
+        return None
+    rest = np.asarray(rest, dtype=float)
+    ts = np.linspace(t0, t1, 241)
+    z = np.array([path(t)[2] for t in ts], dtype=float)
+    below = np.nonzero(z <= rest[2] + clear)[0]
+    return float(ts[below[0]]) if len(below) else None
 
 
 def strike_lift(a, b, notes, free, keep, travel):
@@ -713,7 +803,13 @@ def solve_path(anchors, notes, strokes, t0, t1):
         # press, where the fingers cannot follow (the dragged thumb of the daylight piece's frame 2395)
         down_ids = [q for q in keys if notes[q].touch <= t + 1e-9 and t <= notes[q].release + 1e-9]
         carried = i + 1 < len(rows) and all(q in rows[i + 1][3] for q in down_ids)
-        if not carried:
+        # A hand holding an octave or more is at the edge of its span: it has no reach to spare, so the few
+        # millimetres the path saves by sinking while the keys are down cost it the keys. Canon's left hand
+        # holding C2+C3 sinks 6 mm during the hold and the pads come back 16-33 mm off their keys, while the
+        # same 6 mm on a narrower hold is harmless -- the anchor's own pose is fine, the fingers simply have
+        # nothing left to absorb it. Such a hold keeps the full pin even when the next chord carries its keys.
+        wide = max(notes[q].pitch for q in keys) - min(notes[q].pitch for q in keys) >= 12
+        if not carried or wide:
             # the family box would let the wrist slide off its place while its keys are still down and the
             # pads cannot follow (a stretched chord's box is 27+ mm wide: the dragged thumb of the daylight
             # piece's frame 4783). Pinning the whole palm can cost the fingers' IK some reach on a short
@@ -737,6 +833,7 @@ def solve_path(anchors, notes, strokes, t0, t1):
             target[k] = v                # held where it is: pulled to its place; on the way on: free between the two
         lb[k], ub[k] = places.min(axis=0), places.max(axis=0)
     # free windows: between an anchor's last release and the next anchor's first touch
+    rise = np.zeros(len(times))       # 0 at the release, 1 at the top of the lift, 0 at the next touch
     turns = [back for _, back in sweeps([r[0] for r in rows], notes)]
     for ((a, va, _, ka), (b, vb, sb, kb)), turn in zip(zip(rows, rows[1:]), turns):
         if not b.incoming:
@@ -756,6 +853,10 @@ def solve_path(anchors, notes, strokes, t0, t1):
             mid = (free + touch) / 2
             core = sel & (np.abs(times - mid) <= LIFT_SPAN * window / 2 + PATH_STEP / 2)
             lb[core, 2] = np.maximum(lb[core, 2], (va[2] + vb[2]) / 2 + lift)
+            if window > 1e-3:
+                # The palm's own pendulum: it turns up through the rise and gives the degrees back on the
+                # descent, one unhurried up-and-back per free window -- not a vibration.
+                rise[sel] = np.maximum(rise[sel], np.sin(np.pi * (times[sel] - free) / window))
     if os.environ.get('PIANOMOTION_DEBUG_SEGMENTS'):       # diagnosis only: the anchors' places and pair windows
         win = float(os.environ.get('PIANOMOTION_DEBUG_AT') or 0.)
         sel_dbg = (times > win - .4) & (times < win + .4)
@@ -808,7 +909,7 @@ def solve_path(anchors, notes, strokes, t0, t1):
         lo[0] = hi[0] = first[d]; lo[-1] = hi[-1] = last[d]
         hi = np.maximum(hi, lo + 1e-9)
         out[:, d] = chunked(A, b, lo, hi)
-    return times, out
+    return times, out, rise
 
 
 CHUNK_SECONDS, CHUNK_KEEP = 6., 4.    # solved exactly in overlapping windows, each fixed to the last at its start
@@ -954,7 +1055,7 @@ def wrist_path(anchors, notes, strokes, rest, duration, t_start=0., leave_overri
     playing = [a for a in anchors if a.incoming or a.held]
     last = playing[-1] if playing else anchors[-1]
     end = max([last.time] + [n.release for n in notes.values()]) + KEY_RETURN_SECONDS
-    times, values = solve_path(anchors, notes, strokes, settle, end)
+    times, values, rise = solve_path(anchors, notes, strokes, settle, end)
     if os.environ.get('PIANOMOTION_DEBUG_SEGMENTS'):       # diagnosis only: the solved grid around the window
         win = float(os.environ.get('PIANOMOTION_DEBUG_AT') or 0.)
         with open(os.environ['PIANOMOTION_DEBUG_SEGMENTS'], 'a') as f:
@@ -1172,8 +1273,10 @@ def wrist_path(anchors, notes, strokes, rest, duration, t_start=0., leave_overri
         knots.append((close_start, hold, 0.))       # a short beat after the release, then the return
     lift = (OUTRO_LIFT - OUTRO_WAIT_LIFT if waiting else OUTRO_LIFT) * (1. + .04 * outro_variant)
     apex = OUTRO_APEX * (1. + .05 * outro_variant)
+    # The two hands' arcs differ (lift / apex above), but they must LAND on the intro's own lap pose:
+    # a millimetre of landing offset used to be spread over the idle tail after the gesture; with the
+    # longer return that tail is short, and the leftover slid the settled hand 4 mm at the very end.
     land_pos = np.asarray(rest, dtype=FLOAT).copy()
-    land_pos[1] += .004 * outro_variant
     knots += outro_path(close_from, rest, close_start, side, lift=lift, apex=apex, land=land_pos)
     arrived = close_start + OUTRO_T
     if arrived < duration:
@@ -1183,6 +1286,7 @@ def wrist_path(anchors, notes, strokes, rest, duration, t_start=0., leave_overri
               anchors[0].hand, settle, first.time, len(anchors),
               ' | '.join('(%.2f: %.3f,%.3f,%.3f)' % (t, v[0], v[1], v[2]) for t, v, a in knots[:8])), flush=True)
     path = WristPath(knots)
+    path.pitch_rise = (times, rise)
     path.trip_end = reach_end                 # the high-speed travel ends: the near-poise begins
     path.trip_draw_end = draw_end             # actual passage through the draw's waypoint on the whole curve
     path.trip_lift_end = lift_end             # actual passage through the poke / quiet apex
@@ -1348,6 +1452,10 @@ class FingerTrack:
         self.tuck = None                # LAP_TUCK: the extra curl while transiting under the keybed
         self.rest_tuck = None           # the leave time: the tuck curls in from here until ``rest_start``
         self.outro_end = None           # closing gesture: the fingers are back on the lap by this time
+        self.outro_touch = None         # ... and the wrist first touches the thigh this much earlier (lap_arrival)
+        self.outro_gathered = None      # closing-only compact curl; never changes the opener's LAP_TUCK
+        self.outro_from = None          # frozen lift-off shape: do not chase moving playing keyposes
+        self.outro_unfold = None        # measured departure from the key-front envelope
 
     def set_correction(self, times, deltas):
         times, deltas = np.asarray(times, float), held(deltas)
@@ -1433,14 +1541,25 @@ class FingerTrack:
             # from under the piano" shape.
             if self.outro_end is not None:
                 tuck_end = self.rest_back + OUTRO_TUCK_SECONDS
-                unfold = max(tuck_end, self.outro_end - OUTRO_UNFOLD_SECONDS)
-                gathered = self.rest + self.tuck
+                # open onto the thigh by the CONTACT, not by the gesture's nominal end: the last stretch of
+                # the return is a slide along the leg, so the hand is already on it a few tenths of a
+                # second before ``outro_end``, and a tucked hand arriving there sinks its fingertips in.
+                open_by = self.outro_end if self.outro_touch is None else self.outro_touch
+                open_by = max(open_by, tuck_end + 1e-3)
+                unfold = max(tuck_end, open_by - OUTRO_UNFOLD_SECONDS)
+                measured_unfold = getattr(self, 'outro_unfold', None)
+                if measured_unfold is not None:
+                    unfold = float(np.clip(measured_unfold, tuck_end, open_by - 1e-3))
+                gathered = getattr(self, 'outro_gathered', None)
+                if gathered is None:
+                    gathered = self.rest + self.tuck
                 if t < tuck_end:
                     w = ease((t - self.rest_back) / max(tuck_end - self.rest_back, 1e-6))
-                    return values * (1. - w) + gathered * w
+                    initial = getattr(self, 'outro_from', None)
+                    return (values if initial is None else initial) * (1. - w) + gathered * w
                 if t < unfold:
                     return gathered
-                w = ease(min((t - unfold) / max(self.outro_end - unfold, 1e-6), 1.))
+                w = ease(min((t - unfold) / max(open_by - unfold, 1e-6), 1.))
                 return gathered * (1. - w) + self.rest * w
             w = ease(min((t - self.rest_back) / LAP_RETURN_SECONDS, 1.))
             return values * (1. - w) + self.rest * w
@@ -1772,6 +1891,20 @@ class FingerIK:
         self.surface = KeySurface(solver.heightfield) if solver.heightfield is not None else None
         self.spacing = Spacing(solver)
 
+    def bounds(self, digit):
+        """The rig's joint limits, optionally narrowed to a PIP band. Diagnosis only
+        (PIANOMOTION_PIP_BAND=lo,hi): it answers whether a press really needs the curl it takes, or whether
+        the finger is only driven to its stop by an unreachable target."""
+        finger = self.solver.rig.fingers[self.solver.hand][digit]
+        lower, upper = finger.lower, finger.upper
+        band = PIP_BAND
+        if band is None:
+            return lower, upper
+        lower, upper = lower.copy(), upper.copy()
+        lower[2] = max(lower[2], band[0])
+        upper[2] = min(upper[2], band[1])
+        return lower, upper
+
     def ride(self, digit, palm, target, seed, depths, own_pitch, start=None, brush=False):
         """Pad on its (moving) key point, the finger's sides kept out of the neighbouring keys: where they would
         sink, the pad slips along its key toward the front (``RIDE_SLIP``) instead. ``start`` (the previous
@@ -1792,21 +1925,23 @@ class FingerIK:
             off = point - target
             slip = off[1] < 0.             # toward the key's front: the pad holds the key all along its length
             along = off[1] / (RIDE_SLIP if slip else .0002)
+            posture = posture_residual(v, digit)
             return np.r_[off[0] / .0002, along, off[2] / .0002, max(0., front - point[1]) / .0002,
-                         (v - seed) / IK_VALUE_SCALE, below, pad_residual(self.solver, digit, v, palm), steady]
+                         (v - seed) / IK_VALUE_SCALE, below, pad_residual(self.solver, digit, v, palm), steady, posture]
 
         from . import fast_settle       # (late: it reads this module's tables)
         fast = fast_settle.require()
+        lower, upper = self.bounds(digit)
 
         def run(x0):
             if fast:
                 x, _ = fast_settle.ride(fast_settle.pack(self.solver), digit, palm, target, seed, depths, own_pitch,
-                                        x0, start, brush, front, finger.lower, finger.upper,
-                                        IK_ITERATIONS, (IK_VALUE_SCALE, RIDE_SLIP, RIDE_STEADY))
+                                        x0, start, brush, front, lower, upper,
+                                        IK_ITERATIONS, (IK_VALUE_SCALE, RIDE_SLIP, RIDE_STEADY, PIP_POSTURE_SCALE) + posture_flat(digit))
                 x = np.asarray(x, FLOAT)
             else:
-                x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, finger.lower, finger.upper),
-                                                       finger.lower, finger.upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
+                x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, lower, upper),
+                                                       lower, upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
             values[digit] = x
             point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
             off = point - target
@@ -1868,9 +2003,14 @@ class FingerIK:
                 x = y
         return x
 
-    def solve(self, digit, palm, target, seed, lowered=None):
+    def solve(self, digit, palm, target, seed, lowered=None, start=None):
         """Values putting the pad's contact point on ``target`` (world); weak prior toward ``seed``.
-        With ``lowered`` (own key depth) the skin also stays above the key floor."""
+        With ``lowered`` (own key depth) the skin also stays above the key floor. ``start`` is only the
+        numerical starting point: the prior says where the finger WANTS to be, the start where it WAS. Along
+        the finger's null space (a 3-D target, 4 joints) the target has no gradient, so even this weak prior
+        decides the pose there -- which is exactly what we want it to do, and what it could not do while the
+        start and the prior were the same chained pose (the finger then stayed wherever it had wandered,
+        including pinned against a joint stop)."""
         finger = self.solver.rig.fingers[self.solver.hand][digit]
         values = {d: RELAXED[d] for d in DIGITS}
         seed = np.asarray(seed, FLOAT)
@@ -1879,13 +2019,16 @@ class FingerIK:
             values[digit] = v
             point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
             out = np.r_[(point - target) / .0002, (v - seed) / (IK_VALUE_SCALE * FINGER_JOINTS[digit]),
-                        pad_residual(self.solver, digit, v, palm)]
+                        pad_residual(self.solver, digit, v, palm),
+                        *posture_residual(v, digit)]
             if lowered is not None:
                 out = np.r_[out, self.below_floor(digit, values, palm, lowered)]
             return out
 
-        x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(seed, finger.lower, finger.upper),
-                                               finger.lower, finger.upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
+        lower, upper = self.bounds(digit)
+        x0 = seed if start is None else np.asarray(start, FLOAT)
+        x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, lower, upper),
+                                               lower, upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
         values[digit] = x
         point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
         return x, float(np.linalg.norm(point - target))
@@ -1893,22 +2036,79 @@ class FingerIK:
 
 def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, ik):
     """Keyposes at each stroke's start (hover) and end (lifted), relaxed hand in long gaps."""
+    fired = {'reconcile': 0, 'reconcile_deg': 0., 'let_go': 0, 'aim_early': 0, 'seed_chain': 0, 'pose_pair': 0}
     mine = sorted((replace(strokes_by_note[n.id]) for n in notes.values()
                    if n.hand == hand and n.digit == digit and n.id in waypoints), key=lambda s: s.hover)
     # free fingers wait in the playing hand's shape (pose.hand_shape), arched or flattened by the span of the keys the
     # hand is on around then (held, or about to be struck)
     mine_hand = [n for n in notes.values() if n.hand == hand and n.id in waypoints]
 
+    # The stroke shapes are solved before the free-time keyposes, because a free pose is only meaningful once
+    # the poses it waits between exist. (What they are used for: see shape_at below -- it is the hand's shape,
+    # not the stroke's; deriving it from the strokes made a resting finger drift from one solved pose to the
+    # next across the whole gap, which is a slow aimless turn, not a rest.)
+    seed_previous = None
+    for s in mine:
+        note = notes[s.note]
+        poses = []        # A finger that has just played keeps the configuration it lifted with into its next note: the whole
+        # stroke is seeded from the previous stroke's lift pose, so the IK stays on one branch across the
+        # notes instead of picking a fresh null-space solution for each one. After a real rest the waypoint's
+        # own shape takes over again (the finger has had time to re-form).
+        seed = None
+        if seed_previous is not None and s.hover - seed_previous.lift_end <= RELAX_GAP_SECONDS:
+            seed = seed_previous.poses[3].copy()
+            fired['seed_chain'] += 1
+        for t, hand_at in ((s.hover, s.touch), (s.touch, s.touch), (s.release, s.release), (s.lift_end, s.release)):
+            target, wp_seed = stroke_target(s, note, waypoints[s.note], t, path)
+            palm = solver.palm(*_split(path(hand_at)))
+            # The four poses are one movement -- approach, press, hold, lift -- so each is seeded by the one
+            # before it. Solving all four from the same waypoint seed let the weak seed prior (IK_VALUE_SCALE:
+            # 15 deg of deviation buys a 1 mm better target) pick a different null-space branch per pose: the
+            # lift, five millimetres above the touch, came back tens of degrees away from the pose it lifted
+            # from. On a repeated note -- its next stroke 0.08-0.15 s away -- that is a full curl-and-uncurl
+            # between two notes of the same finger, and it reads as the finger trembling. The approach keeps
+            # the waypoint's own shape; only the pose chain inside the stroke is new.
+            seed = wp_seed if seed is None else seed
+            values, _ = ik.solve(digit, palm, target, seed, stroke_floor(s, note, t), start=seed)
+            poses.append(values)
+            seed = values
+        s.poses = tuple(poses)
+        seed_previous = s
+
     def shape_at(t):
         pitches = [n.pitch for n in mine_hand if n.touch - PREPARE_SECONDS <= t <= n.release]
         if pitches:
-            return hand_shape(solver.span(pitches))[digit]
-        if not mine_hand:
-            return ARCHED[digit]
-        # Nothing on the keys: the shape of the keys nearest in time, not the empty hand's arch. A free finger that
-        # straightened out and curled back between two chords read as the hand fidgeting while it held nothing.
-        near = min(mine_hand, key=lambda n: min(abs(t - (n.touch - PREPARE_SECONDS)), abs(t - n.release)))
-        return hand_shape(solver.span([near.pitch]))[digit]
+            base = hand_shape(solver.span(pitches))[digit]
+        elif not mine_hand:
+            base = ARCHED[digit]
+        else:
+            # Nothing on the keys: the shape of the keys nearest in time, not the empty hand's arch. A free finger
+            # that straightened out and curled back between two chords read as the hand fidgeting while it held
+            # nothing.
+            near = min(mine_hand, key=lambda n: min(abs(t - (n.touch - PREPARE_SECONDS)), abs(t - n.release)))
+            base = hand_shape(solver.span([near.pitch]))[digit]
+        # The free finger HOLDS the hand's shape; it leaves and re-enters it through its own stroke's pose --
+        # it is still its lift pose within RETURN_SECONDS of the lift, and already its hover pose within
+        # PREPARE_SECONDS of the approach. Without the first, a finger uncurled out of the key it had just
+        # played and curled back for the next one: a full curl-and-uncurl between two of its own notes, which
+        # reads as trembling. Without the second the approach was a snap. Between them it holds one shape,
+        # rather than drifting from one stroke's solved pose to the next across the whole gap (which is a
+        # slow aimless turn, the "finger rotating for no reason").
+        out = base
+        if mine:
+            before = max((s for s in mine if s.lift_end <= t), key=lambda s: s.lift_end, default=None)
+            after = min((s for s in mine if s.hover >= t), key=lambda s: s.hover, default=None)
+            if before is not None:
+                w = float(np.clip((t - before.lift_end) / RETURN_SECONDS, 0., 1.))
+                out = before.poses[3] * (1. - w) + out * w
+            if after is not None:
+                w = float(np.clip((after.hover - t) / PREPARE_SECONDS, 0., 1.))
+                out = after.poses[0] * (1. - w) + out * w
+        return out
+
+    if os.environ.get('PIANOMOTION_FREEZE_FREE'):      # diagnosis only: is the free-time motion the keyposes at all?
+        _frozen = hand_shape(solver.span([n.pitch for n in mine_hand]))[digit] if mine_hand else ARCHED[digit]
+        shape_at = lambda t: _frozen
 
     # before the hand's first stroke and after its last the hand is at rest, its fingers loose (RELAXED): they
     # take the playing shape as the arm brings the hand onto the keys and let it go as it leaves
@@ -1928,18 +2128,15 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
             gap = s.hover - previous.lift_end
             if gap > RELAX_GAP_SECONDS:
                 t1, t2 = previous.lift_end + min(.3 * gap, RETURN_SECONDS), s.hover - min(.3 * gap, PREPARE_SECONDS)
-                keyposes += [Keypose(t1, shape_at(t1)), Keypose(t2, shape_at(t2))]
-        poses = []
-        # The finger takes its shape on the hand, and the hand carries it: the hover shape is solved
-        # with the wrist where it will be at the touch, the lifted shape with the wrist of the release.
-        for t, hand_at in ((s.hover, s.touch), (s.touch, s.touch), (s.release, s.release), (s.lift_end, s.release)):
-            target, seed = stroke_target(s, note, waypoints[s.note], t, path)
-            palm = solver.palm(*_split(path(hand_at)))
-            target = target + (palm[:3, 3] - solver.palm(*_split(path(t)))[:3, 3]) * 0.   # key-fixed target
-            values, _ = ik.solve(digit, palm, target, seed, stroke_floor(s, note, t))
-            poses.append(values)
-        s.poses = tuple(poses)
-        keyposes += [Keypose(s.hover, poses[0]), Keypose(s.lift_end, poses[3])]
+                # ONE shape for the whole gap. shape_at() reads the keys the hand is holding, and those change
+                # as the other fingers play: re-evaluating it at both ends of the gap made the resting finger
+                # re-form under the hand between two of its own notes -- a slow turn with no cause of its own,
+                # and the bulk of the free-time rotation (the short stroke-to-stroke flicks were only ~8% of
+                # it). It is fixed where the gap is, and the eases into the lift and into the next approach
+                # are the only movement left.
+                hold = shape_at(.5 * (t1 + t2))
+                keyposes += [Keypose(t1, hold), Keypose(t2, hold.copy())]
+        keyposes += [Keypose(s.hover, s.poses[0]), Keypose(s.lift_end, s.poses[3])]
         # A finger swings sideways toward its next key only as far as the hand has come to it: one pointing at its
         # key while the hand is still on its way swings across its neighbours (crossings). Before its stroke its
         # sideways swing is the hover swing times the share of the way the wrist has covered.
@@ -1950,15 +2147,17 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
             way = float(np.linalg.norm(path(since)[:2] - to))
             if way > APPROACH_MIN_TRAVEL:
                 covered = float(np.clip(1. - np.linalg.norm(path(aim)[:2] - to) / way, 0., 1.))
-                early = poses[0].copy()
+                early = s.poses[0].copy()
                 early[0] *= covered
                 keyposes.append(Keypose(aim, early))
+                fired['aim_early'] += 1
         lo, hi = LIFT_LATERAL_SOON
         let_go = (1. - LIFT_LATERAL_KEEP) * float(np.clip((next_hover - s.lift_end - lo) / (hi - lo), 0., 1.))
         if digit != 1 and let_go > 0 and next_hover - s.lift_end <= RELAX_GAP_SECONDS:   # longer: relaxed keyposes
-            eased = poses[3].copy()
+            eased = s.poses[3].copy()
             eased[0] *= 1. - let_go
             keyposes.append(Keypose(s.lift_end + min(LIFT_LATERAL_SECONDS, .4 * (next_hover - s.lift_end)), eased))
+            fired['let_go'] += 1
         previous = s
     for p, n in zip(mine, mine[1:]):
         # lift end and next hover can coincide (a finger's quick notes share the time between them): the two
@@ -1970,6 +2169,8 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
             share = (1. - allowed / apart) / 2.
             p.poses[3][:] += diff * share
             n.poses[0][:] -= diff * share
+            fired['reconcile'] += 1
+            fired['reconcile_deg'] += float(np.abs(diff).max()) * share * 2.
     if previous is not None:
         keyposes.append(Keypose(previous.lift_end + RETURN_SECONDS, shape_at(previous.lift_end + RETURN_SECONDS)))
     if last is not None:
@@ -1979,6 +2180,22 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
     else:
         keyposes = [Keypose(0., RELAXED[digit])]
     keyposes.sort(key=lambda k: k.time)
+    # No two neighbouring poses may ask for more than TRANSITION_SPEED. The stroke pairs were already held to
+    # this (the pass above); the free poses between them were not, and a free finger parked in one shape for a
+    # tenth of a second and then taking the next one 0.08 s later swings its knuckle 37 deg in three frames
+    # (Canon's R ring finger, blend frame 1904: -12.9 -> +24, its limit, in 50 ms) -- a pop with no note behind
+    # it. Free poses are copies, so moving them cannot disturb a stroke's own solved shape.
+    for a, b in zip(keyposes, keyposes[1:]):
+        gap, diff = b.time - a.time, b.values - a.values
+        if gap <= 1e-6 or a.values is b.values:
+            continue
+        apart = float(np.abs(diff).max())
+        allowed = TRANSITION_SPEED * gap
+        if apart > allowed:
+            share = (1. - allowed / apart) / 2.
+            a.values += diff * share
+            b.values -= diff * share
+            fired['pose_pair'] += 1
     if os.environ.get('PIANOMOTION_DEBUG_FINGERS'):      # diagnosis only: the track's knots around a window
         wins = [float(x) for x in (os.environ.get('PIANOMOTION_DEBUG_AT') or '').split(',') if x.strip()]
         if wins:
@@ -1986,6 +2203,11 @@ def finger_track(hand, digit, notes, strokes_by_note, waypoints, path, solver, i
                 json.dump({f'{hand}{digit}': [[float(k.time), *[float(v) for v in k.values]]
                                               for k in keyposes
                                               if any(w - .8 < k.time < w + .8 for w in wins)]}, f)
+    if os.environ.get('PIANOMOTION_PATCH_REPORT'):      # diagnosis only: which patch layers still fire
+        print('PATCH %s%d notes=%d strokes=%d reconcile=%d (%.1f deg) let_go=%d aim_early=%d seed_chain=%d'
+              % (hand, digit, len(mine_hand), len(mine), fired['reconcile'], fired['reconcile_deg'],
+                 fired['let_go'], fired['aim_early'], fired['seed_chain']),
+              file=sys.stderr, flush=True)
     track = FingerTrack(mine, keyposes)
     if ik.surface is not None:
         for s in mine:
@@ -2090,12 +2312,19 @@ def stroke_clearance(s, pitch, digit, path, solver, ik, notes):
 
 
 # ---------- per frame ----------
-def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previous=None, apply_room=True):
+def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previous=None, apply_room=True,
+               rest_slide=None, pitch=None):
     """Wrist vector, finger values {digit: 4} and the worst pad error on a pressed key at ``t``.
     ``depths`` (pitch: key depth now) keeps riding fingers out of the neighbouring keys. ``previous``
-    ({digit: (note, values)}, updated) warm-starts a riding finger from the frame before."""
+    ({digit: (note, values)}, updated) warm-starts a riding finger from the frame before. ``rest_slide``
+    (world offset) shifts a hand that is resting on the lap so it follows the seat/leg as the body leans:
+    IK then solves the arm to the moved wrist instead of pinning it in world space (the leg slides under
+    a stationary hand otherwise, and the pads sink into it). Zero / None keeps the old fixed rest."""
     vector = path(t)
-    palm = solver.palm(*_split(vector))
+    if rest_slide is not None:
+        vector = vector.copy()
+        vector[:3] = vector[:3] + rest_slide
+    palm = solver.palm(*_split(vector), pitch)
     values, error = {}, 0.
     riding = [tracks[d].stroke(t) for d in DIGITS]
     stretch = stretched(notes[s.note].pitch for s in riding if s is not None and s.touch <= t <= s.release)
@@ -2105,6 +2334,12 @@ def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previ
             values[d] = tracks[d].free_values(t)
             continue
         if not s.touch <= t <= s.release:
+            track = tracks[d]
+            if (getattr(track, 'outro_gathered', None) is not None and track.rest_back is not None
+                    and t > track.rest_back):
+                # The piece has ended: its old lift stroke must not override the closing curl.
+                values[d] = track.free_values(t)
+                continue
             values[d] = s.values(t)
             if t > s.release and previous is not None and previous.get(d, (None,))[0] == s.note:
                 # the lift leaves from where the ride ended (its own solution), not the solved release shape
@@ -2154,6 +2389,14 @@ def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previ
         if any(w - 1. < t < w + 1. for w in wins):
             with open(os.environ['PIANOMOTION_DEBUG_FINGER_CURVES'], 'a') as f:
                 json.dump({'t': float(t), solver.hand: {d: [float(x) for x in room[d]] for d in DIGITS}}, f)
+    if (getattr(t0, 'outro_gathered', None) is not None and t0.rest_back is not None
+            and t > t0.rest_back):
+        # Playing spacing is not the shape of a folded hand. Fade it out continuously during the curl,
+        # then preserve the closing articulation exactly, as we do for the resting opener.
+        active = any(s is not None and s.touch <= t <= s.release for s in riding)
+        if not active:
+            w = ease(min((t - t0.rest_back) / OUTRO_TUCK_SECONDS, 1.))
+            room = {d: room[d] * (1. - w) + values[d] * w for d in DIGITS}
     return vector, room, error
 
 
@@ -2255,15 +2498,24 @@ class YieldingPath:
         return out
 
 
-def yield_offsets(paths, notes, duration, apart, speed, busy_margin, rate=60.):
+def yield_offsets(paths, notes, duration, apart, speed, busy_margin, rate=60., closing=None):
     """Sideways offsets per hand: where the wrists come closer than ``apart`` and only one hand is playing, the idle
     one moves out (left hand to the left, right to the right) by the shortfall, ramping at ``speed`` and held at
-    zero while it plays (``busy_margin``: seconds before an onset / after a release). Both playing: unchanged."""
+    zero while it plays (``busy_margin``: seconds before an onset / after a release). Both playing: unchanged.
+
+    ``closing`` ({hand: trip_outro}): a hand that has started back to the lap is out of the way by definition --
+    it descends BEHIND the keybed, not beside the playing hand. Letting the rule push it there shoved the left
+    hand 3 cm sideways while it descended and then slid it across the thigh after it landed (the user: the hand
+    "哆哆嗦嗦" on the way down and "不跟着腿面走" once down); its return must follow its own path."""
     times = np.arange(0., duration + 1. / rate, 1. / rate)
     x = {h: np.array([paths[h](t)[0] for t in times], dtype=FLOAT) for h in 'LR'}
     busy = {h: np.zeros(len(times), bool) for h in 'LR'}
     for n in notes.values():
         busy[n.hand] |= (times >= n.onset - busy_margin[0]) & (times <= n.release + busy_margin[1])
+    for h in 'LR':
+        start = (closing or {}).get(h)
+        if start is not None:                   # reach zero before lift-off, at the yield's own speed
+            busy[h] |= times >= start - .25
     short = np.maximum(0., apart - (x['R'] - x['L']))
     out = {}
     for h, sign in (('L', -1.), ('R', 1.)):
