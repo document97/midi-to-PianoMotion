@@ -7,13 +7,15 @@ import numpy as np
 
 from .kinematics import FLOAT, axis_matrix, mat3_q
 
+FAST_TORSO = os.environ.get('PIANOMOTION_FAST_TORSO', '1') != '0'   # set 0 to A/B the cached shoulder path
+
 FORWARD_LEAN_DEGREES = 3.       # the straight back (rig_export.straight_back) leans in a little from the hips: sitting nearly upright
 # The shoulder comes forward only for a far reach: from REACH_EASY of the arm's length (shoulder to wrist over upper arm
 # plus forearm) it grows with the square of the excess, to its full SHOULDER_FORWARD / SHOULDER_UP (in arm lengths) at
 # REACH_FULL; beyond that a note is not played (planner). Smoothed over time like the lean: a stretch of far notes, not
 # one note, brings it forward.
 REACH_EASY, REACH_FULL = .80, .95
-LEAN_SHIFT, LEAN_LIMIT_DEGREES = .2, 25.    # m the lean follows a far hand at most; its angle's soft limit
+LEAN_SHIFT, LEAN_LIMIT_DEGREES = .2, 30.    # m the lean follows a far hand at most; its angle's soft limit
 # The seat slides along the bench when the music stays at one end: up to SLIDE_SHARE of the hip joints' spacing; the
 # lean covers the rest. Lean and slide together reach about 90 % of the keys (reach_window). What the music asks is
 # the far-out excess of the notes averaged over SLIDE_SECONDS (Gaussian sigma): one far note asks little, a passage
@@ -27,20 +29,27 @@ SHOULDER_FORWARD, SHOULDER_UP = .10, .025
 # eye reads as fidgeting. The committed place moves only when the ask leaves a DEADBAND around it (HYST keeps a value
 # sitting on the edge from re-committing) and the place has been held DWELL s: a small ask is the LEAN's to cover.
 # The quantized curve is then smoothed (TAU) so a commit is a slow shift, not a step.
-SLIDE_DEADBAND, SLIDE_HYST, SLIDE_DWELL, SLIDE_TAU = .025, .010, 2., .5
+SLIDE_DEADBAND, SLIDE_HYST, SLIDE_DWELL, SLIDE_TAU = .040, .012, 3., .5
 SLIDE_GRID = .01                # m: the place commits on a 10 mm grid, so a 26 mm ask and a 30 mm ask land alike
 SLIDE_STEP = .02
 # The lean follows a hand from LEAN_NEAR out (m past the standard seat's wrist): inside that the hand is close
 # enough that neither the seat nor the chest has to move. It used to be .15 m, which left every small ask to the
 # seat alone -- the hips did the fidgeting the chest could have covered with two degrees of tilt.
-LEAN_NEAR = .05
+# A hand this far off the standard seat's wrist asks NOTHING of the body: a passage in the middle of the keyboard
+# is played with the arm alone. It was .05, then .035 for a day -- both let an ordinary 7 cm offset (the Canon's
+# left hand on F#3/B3) push the chest 3.6 cm and the seat 2.4 cm, which the user read as the shoulder moving for
+# no reason. The gain below buys back the far passages: past the dead zone the lean answers faster than 1:1.
+LEAN_NEAR = .09
+LEAN_GAIN = 1.8
 # The lean's own commitment, in the seat's spirit: the rows' windowed average is smoothed (LEAN_TAU) and
 # rate-limited (LEAN_RATE), so a figure that glances a side for a second glances -- the chest does not dart
 # 7 cm toward it in .3 s and back (measured at the user's 860). A passage that holds a side still leans in,
 # arriving over ~1 s: the hands travel further than that to get there, so the lean is not late.
 LEAN_TAU, LEAN_RATE, LEAN_STEP = .35, .09, .05
-# The side lean and the turn are shared up the spine, the upper bones more (shares 1 : 2 : 3 ... from the lowest): the
-# chest leans and turns further than the belly. The forward lean stays a hinge at the hips (the back straight).
+# The side lean and the turn are shared up the spine, the LOWER bones more (shares n : n-1 : ... : 1 from the lowest):
+# the lean comes from the waist and carries the whole upper body over as one -- the chest does not roll on top of the
+# belly, so the shoulder line stays close to level while the head translates with it (the user's read: "腰发力，肩膀也
+# 大概平"). The forward lean stays a hinge at the hips (the back straight).
 # The chest turns toward the hand the lean is for (the lean's own shift, not the seat's: the seat's small travel
 # used to swing the shoulders and the head with it, which magnified the fidgeting); the neck takes back
 # HEAD_STEADY of the spine's side lean and turn, so the head moves less than the chest.
@@ -77,7 +86,7 @@ def spine_transforms(shift, turn, heads, top, height, offset=(0., 0., 0.), sway=
     heads = np.asarray(heads, float)
     limit = math.radians(LEAN_LIMIT_DEGREES)
     angle = limit * math.tanh(math.asin(float(np.clip(shift / max(.05, height), -1, 1))) / limit)
-    shares = np.arange(1., len(heads) + 1.)
+    shares = np.arange(len(heads), 0., -1.)
     shares /= shares.sum()
     rise = top[2] - heads[:, 2]
     gain = rise[0] / max(float(np.sum(shares * rise)), 1e-9)
@@ -165,6 +174,7 @@ class Torso:
         self.slide_return = None      # (s0, s1): the closing gesture eases the seat back to its opening place
         self.slide_max = slide_max(data)
         self.first = self.last = 0.
+        self._world_cache = {}      # (h, t) -> shoulder pre-matrix; cleared whenever cap/yield changes
         self.spine = [dict(bone=b['bone'], head=np.array(b['head'], float), pre_inverse=np.linalg.inv(np.array(b['pre'], float)),
                            world=np.array(b['world'], float)) for b in data['spine']]
         n = data['neck']
@@ -188,9 +198,23 @@ class Torso:
     def set_cap(self, times, shares):
         """How much of its lean the body keeps over time (elbows.py: the elbows out of the body, the body yields
         before an elbow is raised): interpolated at ``pose``; None keeps the full lean."""
-        self.cap = (np.asarray(times, float), np.asarray(shares, float))
+        times = np.asarray(times, float)
+        shares = np.asarray(shares, float)
+        old = self.cap
+        if (FAST_TORSO and old is not None and old[0].shape == times.shape
+                and np.array_equal(old[0], times) and np.array_equal(old[1], shares)):
+            return                      # unchanged cap: keep the cached shoulder/trunk matrices
+        self.cap = (times, shares)
         from .motion import pchip_slopes
         self.cap_slopes = pchip_slopes(self.cap[0], self.cap[1][:, None])
+        self._invalidate_world_cache()
+
+    def _invalidate_world_cache(self):
+        """Drop the per-time shoulder/trunk cache when any pose input changes (cap, the ask's lean or seat).
+        The elbow solve asks the same thousands of grid times again on every scan/rescan; between two body
+        changes the answer is fixed, so caching turns ~5000 spine-chain rebuilds per scan into one per time."""
+        if getattr(self, '_world_cache', None) is not None:
+            self._world_cache.clear()
 
     def _cap(self, t):
         if self.cap is None:
@@ -202,23 +226,39 @@ class Torso:
         """The elbows solve's wrist-deviation ask: a lean toward a hand (m, + right) over time, where the swing
         keeping its elbow out of the outline would bend the rendered wrist past the comfort floor -- the body
         moves instead of the wrist. Interpolated at ``pose`` like the cap; None is no ask."""
-        self.yield_rows = (np.asarray(times, float), np.asarray(shifts, float))
+        times = np.asarray(times, float)
+        shifts = np.asarray(shifts, float)
+        old = self.yield_rows
+        if (FAST_TORSO and old is not None and old[0].shape == times.shape
+                and np.array_equal(old[0], times) and np.array_equal(old[1], shifts)):
+            return
+        self.yield_rows = (times, shifts)
         from .motion import pchip_slopes
         self.yield_slopes = pchip_slopes(self.yield_rows[0], self.yield_rows[1][:, None])
+        self._invalidate_world_cache()
 
     def clear_yield(self):
         self.yield_rows = self.yield_slopes = None
+        self._invalidate_world_cache()
 
     def set_slide_yield(self, times, offsets):
         """The ask's seat part: a slide (m, + the seat's own slide direction) over time -- the slide raises the
         palm-vs-forearm angle where the lean's tilt lowers it (measured +2 deg/cm against the lean's -1.4), so
         the two are searched jointly. Interpolated like the lean yield; None is no ask."""
-        self.slide_yield_rows = (np.asarray(times, float), np.asarray(offsets, float))
+        times = np.asarray(times, float)
+        offsets = np.asarray(offsets, float)
+        old = self.slide_yield_rows
+        if (FAST_TORSO and old is not None and old[0].shape == times.shape
+                and np.array_equal(old[0], times) and np.array_equal(old[1], offsets)):
+            return
+        self.slide_yield_rows = (times, offsets)
         from .motion import pchip_slopes
         self.slide_yield_slopes = pchip_slopes(self.slide_yield_rows[0], self.slide_yield_rows[1][:, None])
+        self._invalidate_world_cache()
 
     def clear_slide_yield(self):
         self.slide_yield_rows = self.slide_yield_slopes = None
+        self._invalidate_world_cache()
 
     def set_slide_return(self, s0, s1):
         """The closing gesture: the seat, slid toward the last notes, eases back to where it opened so the
@@ -297,10 +337,14 @@ class Torso:
         turn = -math.radians(TURN_DEGREES) * float(np.clip(shift / max(LEAN_SHIFT, 1e-9), -1., 1.))
         return shift, turn, offset
 
-    def _shoulders(self, t, chain):
-        """({hand: shoulder pre-matrix}, {hand: collarbone local quaternion}) under the spine's ``chain``."""
+    def _shoulders(self, t, chain, only=None, pre_only=False):
+        """({hand: shoulder pre-matrix}, {hand: collarbone local quaternion}) under the spine's ``chain``.
+        ``only`` computes one hand (the elbow search uses just one); ``pre_only`` skips the collarbone
+        quaternion (mat3_q) that only ``pose`` needs -- the shoulder's world matrix does not depend on it."""
         pre, collar = {}, {}
         for h, m in self.reference.items():
+            if only is not None and h != only:
+                continue
             turn = np.eye(4, dtype=FLOAT)
             s = self.shoulders.get(h)
             if s is not None:       # the collarbone turns about its head so the shoulder joint moves by the offset
@@ -310,7 +354,8 @@ class Torso:
                 if np.linalg.norm(axis) > 1e-12:
                     turn[:3, :3] = axis_matrix(axis / np.linalg.norm(axis), math.atan2(np.linalg.norm(axis), arm @ moved))
                     turn[:3, 3] = s['head'] - turn[:3, :3] @ s['head']
-                collar[h] = mat3_q(s['pre_inverse'] @ turn @ s['world'])
+                if not pre_only:
+                    collar[h] = mat3_q(s['pre_inverse'] @ turn @ s['world'])
             pre[h] = (chain @ turn @ m).astype(FLOAT)
         return pre, collar
 
@@ -433,16 +478,38 @@ class Torso:
 
     def shoulder_world(self, h, t, cap=None):
         """The hand's shoulder pre-matrix at ``t`` (pose's pre[h]) for a lean ``cap``: the elbow-swing search."""
+        if not FAST_TORSO:
+            shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
+            chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
+                                     offset, self._sway(t))
+            return self._shoulders(t, chain[-1])[0][h]
+        key = (0, h, float(t), None if cap is None else float(cap))
+        hit = self._world_cache.get(key)
+        if hit is not None:
+            return hit
         shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
         chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
                                  offset, self._sway(t))
-        return self._shoulders(t, chain[-1])[0][h]
+        out = self._shoulders(t, chain[-1], only=h, pre_only=True)[0][h]
+        self._world_cache[key] = out
+        return out
 
     def trunk_world(self, t, cap=None):
         """The trunk bone's world matrix at ``t`` for a lean ``cap``: the trunk outline hangs on it (elbows.py).
         The lowest spine bone takes its share of the lean about the neutral pose (spine_transforms) on top of its
         exported world matrix."""
+        if not FAST_TORSO:
+            shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
+            chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
+                                     offset, self._sway(t))
+            return (chain[0] @ self.spine[0]['world']).astype(FLOAT)
+        key = (1, float(t), None if cap is None else float(cap))
+        hit = self._world_cache.get(key)
+        if hit is not None:
+            return hit
         shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
         chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
                                  offset, self._sway(t))
-        return (chain[0] @ self.spine[0]['world']).astype(FLOAT)
+        out = (chain[0] @ self.spine[0]['world']).astype(FLOAT)
+        self._world_cache[key] = out
+        return out
