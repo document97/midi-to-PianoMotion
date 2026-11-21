@@ -16,6 +16,15 @@ FORWARD_LEAN_DEGREES = 3.       # the straight back (rig_export.straight_back) l
 # one note, brings it forward.
 REACH_EASY, REACH_FULL = .80, .95
 LEAN_SHIFT, LEAN_LIMIT_DEGREES = .2, 30.    # m the lean follows a far hand at most; its angle's soft limit
+# The shoulders stay put. The arm alone reaches every note on this rig: measured on canonpd, the farthest
+# wrist-to-fixed-shoulder distance is 380 mm against a 411 mm arm (31 mm to spare), so leaning/turning/sliding
+# the whole upper body to chase a note is unnecessary -- on screen it reads as the shoulders wandering for no
+# reason. PIANOMOTION_BODY_STILL scales all three (lean shift, seat slide, chest turn) at once, for BOTH the
+# solve and the render, so the IK solves against the same nearly-still body it draws. 0 restores the old full
+# body travel; 1 (default) leaves only a small natural follow. The constants below are untouched so the
+# planner's reach_window (which still assumes the full travel) keeps its headroom.
+BODY_STILL = float(os.environ.get('PIANOMOTION_BODY_STILL', '1'))
+BODY_STILL_SCALE = 1. - .85 * max(0., min(1., BODY_STILL))   # 1 -> 0.15, 0 -> 1.0
 # The seat slides along the bench when the music stays at one end: up to SLIDE_SHARE of the hip joints' spacing; the
 # lean covers the rest. Lean and slide together reach about 90 % of the keys (reach_window). What the music asks is
 # the far-out excess of the notes averaged over SLIDE_SECONDS (Gaussian sigma): one far note asks little, a passage
@@ -361,7 +370,10 @@ class Torso:
         offset = np.array([slide, 0., 0.], dtype=FLOAT)
         # the chest turns toward the hand the body is leaning for; the seat's own travel does not turn it
         turn = -math.radians(TURN_DEGREES) * float(np.clip(shift / max(LEAN_SHIFT, 1e-9), -1., 1.))
-        return shift, turn, offset
+        # The body stays nearly still; the arm covers the distance (see BODY_STILL above). Scale all three at
+        # the one exit so shoulder_world/trunk_world (the solve) and pose (the render) agree on the body pose.
+        k = BODY_STILL_SCALE
+        return shift * k, turn * k, offset * k
 
     def _shoulders(self, t, chain, only=None, pre_only=False):
         """({hand: shoulder pre-matrix}, {hand: collarbone local quaternion}) under the spine's ``chain``.
