@@ -35,6 +35,11 @@ OUTRO_DROOP = -10.
 
 ELBOW_OUT = .035                # elbow rest: this far outside the shoulder (elbows a little wider than the shoulders)
 ELBOW_FOLLOW = .4               # share of the hand's sideways position the elbow follows
+# The elbow rests AGAINST the ribs, never inside them: the torso's side surface (hip joints + this shell) is a
+# wall the elbow may not cross. Without it a chest that leans far toward the playing hand (LEAN_SHIFT is 20 cm)
+# drags the other shoulder over the lap hand and the upper arm is solved straight through the ribcage.
+BODY_SHELL = .030               # m the body's surface lies outside the hip joints (measured on the mesh: 30-40 mm)
+ELBOW_BODY = 20000.             # weight of the wall in the elbow's cost (its other terms are ~1-8 per m^2)
 
 
 def elbow_circle(shoulder, wrist, l1, l2, side):
@@ -58,9 +63,10 @@ def elbow_circle(shoulder, wrist, l1, l2, side):
     return center, radius, t, np.cross(u, t)
 
 
-def closest_elbow(shoulder, wrist, l1, l2, side, reference=None, angle=None):
+def closest_elbow(shoulder, wrist, l1, l2, side, reference=None, angle=None, wall=None):
     """arm_driver.closest_elbow; ``angle`` (rad on elbow_circle, the swing curve's convention): the elbow placed
-    there instead of optimized to the preferred rest."""
+    there instead of optimized to the preferred rest. ``wall``: x the elbow may not cross (the torso's side
+    surface; the hand's own side, so the left elbow stays left of it and the right elbow right of it)."""
     center, radius, t, q = elbow_circle(shoulder, wrist, l1, l2, side)
     s, w = np.asarray(shoulder, FLOAT), np.asarray(wrist, FLOAT)
     if angle is not None:
@@ -75,6 +81,8 @@ def closest_elbow(shoulder, wrist, l1, l2, side, reference=None, angle=None):
         error = point - preferred
         value = 8 * error[0] ** 2 + error[1] ** 2 + 2 * error[2] ** 2
         value += 20 * max(0, point[2] - w[2] - .025) ** 2
+        if wall is not None:
+            value += ELBOW_BODY * max(0., side * (wall - point[0])) ** 2
         if reference is not None:
             value += .4 * float(np.sum((point - np.asarray(reference)) ** 2))
         return value, point
@@ -82,6 +90,8 @@ def closest_elbow(shoulder, wrist, l1, l2, side, reference=None, angle=None):
     candidates = center + radius * (np.cos(grid)[:, None] * t + np.sin(grid)[:, None] * q)
     errors = candidates - preferred
     costs = (errors * errors) @ np.array([8., 1., 2.], dtype=FLOAT) + 20 * np.maximum(0, candidates[:, 2] - w[2] - .025) ** 2
+    if wall is not None:
+        costs += ELBOW_BODY * np.maximum(0., side * (wall - candidates[:, 0])) ** 2
     if reference is not None:
         costs += .4 * np.sum((candidates - np.asarray(reference)) ** 2, axis=1)
     angle = grid[int(np.argmin(costs))]
@@ -136,6 +146,12 @@ class Arm:
         self.palm_axis = across / np.linalg.norm(across)
         self.palm_bake = np.array(data['palm'], dtype=FLOAT)
         self.palm = q_mul(q_axis(self.palm_axis, PALM_PITCH), self.palm_bake).astype(FLOAT)
+        self.wall = None                    # x the elbow may not cross (set from the rig's hips)
+
+    def set_body_wall(self, center_x, half):
+        """Keep the elbow outside the torso: ``center_x`` is the body's midline at the elbow's height and
+        ``half`` its side surface's distance from it (see BODY_SHELL)."""
+        self.wall = float(center_x + self.side * half)
 
     def palm_q(self, yaw, roll, pitch=None):
         palm = self.palm if pitch is None else q_mul(q_axis(self.palm_axis, pitch), self.palm_bake)
@@ -147,7 +163,7 @@ class Arm:
         pre_upper = self.pre_upper_world if pre_upper_world is None else pre_upper_world
         shoulder = pre_upper[:3, 3]
         wrist = np.asarray(wrist, FLOAT)
-        elbow = closest_elbow(shoulder, wrist, self.l1, self.l2, self.side, angle=elbow_angle)
+        elbow = closest_elbow(shoulder, wrist, self.l1, self.l2, self.side, angle=elbow_angle, wall=self.wall)
         upper_dir = (elbow - shoulder) / np.linalg.norm(elbow - shoulder)
         forearm_dir = (wrist - elbow) / np.linalg.norm(wrist - elbow)
         hinge = np.cross(upper_dir, forearm_dir)

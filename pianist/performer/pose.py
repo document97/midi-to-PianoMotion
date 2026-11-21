@@ -25,19 +25,24 @@ CONTACT_TOLERANCE = .0002        # accepted pad-to-surface error (m)
 CLEARANCE_SCALE = .0005          # skin penetration into other keys, metres per residual unit
 
 # Relaxed hand (contact_solver.HandModel.idle): thumb and the long fingers.
-RELAXED = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 9., 34., 18.], dtype=FLOAT)}
+RELAXED = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 9., 34., 28.], dtype=FLOAT)}
 for _d in (3, 4, 5):
-    RELAXED[_d] = RELAXED[2]
+    RELAXED[_d] = RELAXED[2].copy()
 # The playing hand (values: sideways swing, knuckle lift, middle joint, last joint; a negative lift bends the knuckle
 # down), the shape the contact fingers prefer and free fingers wait in. Its palm is tilted up from the wrist
 # (arm.PALM_PITCH), so with the knuckles bent down past it the knuckles are the hand's highest point and the fingers
 # curve in all three joints, the last phalanx ~60 deg down: keys are met with the pad. A hand spanning wide (an
 # octave) flattens: the knuckles open until they are about as high as the middle joints and the fingers lengthen.
 # The shape follows the span of the keys the hand holds, the same for planner and performer.
-ARCHED = {1: np.array([0., -4., 8., 16.], dtype=FLOAT), 2: np.array([0., -35., 30., 20.], dtype=FLOAT)}
-FLAT = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 12., 34., 18.], dtype=FLOAT)}
+# 2026-11-20 (the user's eye): the last joint curls more than it used to (18/20 -> 26/30, a distal phalanx ~45-50 deg
+# down, about the steepest the pad still allows). The flattened hand keeps a little knuckle bend instead of opening to
+# +12 -- except the INDEX, which the user reads as its own thing: its knuckle stays where it was, an index held flat
+# and long, and only the outer three keep the bend.
+ARCHED = {1: np.array([0., -4., 8., 16.], dtype=FLOAT), 2: np.array([0., -35., 30., 30.], dtype=FLOAT)}
+FLAT = {1: np.array([0., 8., 8., 16.], dtype=FLOAT), 2: np.array([0., 12., 34., 28.], dtype=FLOAT)}
 for _d in (3, 4, 5):
-    ARCHED[_d], FLAT[_d] = ARCHED[2], FLAT[2]
+    ARCHED[_d] = np.array([0., -35., 30., 30.], dtype=FLOAT)
+    FLAT[_d] = np.array([0., 2., 34., 26.], dtype=FLOAT)
 SPAN_ARCHED = .10                # m between the outermost keys' centres up to which the hand stays arched ...
 SPAN_FLAT = .155                 # ... and from which it is flat (an octave's outer keys are ~.165 apart)
 
