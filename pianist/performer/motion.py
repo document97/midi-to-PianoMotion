@@ -230,6 +230,10 @@ LAP_TUCK = {1: np.array([0., 0., 12., 24.], dtype=FLOAT),
             4: np.array([0., 0., 16., 40.], dtype=FLOAT),
             5: np.array([0., 0., 16., 40.], dtype=FLOAT)}
 LAP_TUCK_SECONDS = .30           # the group curl is in during the crisp lift (it starts at the draw's end)
+LAP_TUCK_MIN_LIFT = .028         # m: the curl waits until the wrist has risen this far off the lap. Curling while
+                                 # the palm still lies on the thigh drives the fingertips down into the leg (measured
+                                 # on canonpd: a full curl at 5 mm lift sank the pads 7.4 mm; at ~30 mm it clears).
+                                 # Geometric, not a clock: any hand leaving any lap must clear it before it folds.
 FLOOR_RAMP = .015                # the key floor phases in over a stroke: lowered this much at the key (m)
 SPACING_SHARE = .85              # free fingers keep this share of the relaxed fingertip spacing from their neighbours
 SPACING_SOFTNESS = .002          # smooth maximum width (m)
@@ -2525,7 +2529,7 @@ class YieldingPath:
         return out
 
 
-def yield_offsets(paths, notes, duration, apart, speed, busy_margin, rate=60., closing=None):
+def yield_offsets(paths, notes, duration, apart, speed, busy_margin, rate=60., closing=None, opening=None):
     """Sideways offsets per hand: where the wrists come closer than ``apart`` and only one hand is playing, the idle
     one moves out (left hand to the left, right to the right) by the shortfall, ramping at ``speed`` and held at
     zero while it plays (``busy_margin``: seconds before an onset / after a release). Both playing: unchanged.
@@ -2533,8 +2537,22 @@ def yield_offsets(paths, notes, duration, apart, speed, busy_margin, rate=60., c
     ``closing`` ({hand: trip_outro}): a hand that has started back to the lap is out of the way by definition --
     it descends BEHIND the keybed, not beside the playing hand. Letting the rule push it there shoved the left
     hand 3 cm sideways while it descended and then slid it across the thigh after it landed (the user: the hand
-    "哆哆嗦嗦" on the way down and "不跟着腿面走" once down); its return must follow its own path."""
-    times = np.arange(0., duration + 1. / rate, 1. / rate)
+    "哆哆嗦嗦" on the way down and "不跟着腿面走" once down); its return must follow its own path.
+
+    ``opening`` ({hand: trip_leave}): the mirror image at the other end. A hand still resting on the lap before
+    it lifts off is out of the way already, and must follow its fitted lap pose exactly -- the right hand was
+    pushed ~21 mm outward by a yield whose envelope propagated back into the still intro, sliding the thumb off
+    the fitted spot and 7 mm into the thigh (the user: "起手式右手拇指穿腿里了"). Keep the rest stretch busy, the
+    same gate as closing, so it lands as the intro began. Both are spatial facts about a hand on the lap, not a
+    time window: any hand resting there, in any piece, is exempt."""
+
+    # The paths run on the real clock, which starts at a NEGATIVE time (the intro is played out before
+    # music 0). Sampling from 0 left the whole intro without its own grid points, and ``YieldingPath``
+    # extrapolates its left endpoint to any t below the grid -- so a 14-21 mm yield measured at music 0 was
+    # pasted, frozen, onto the resting hand for the whole intro, sliding it off the fitted thigh pose. Start
+    # the grid at the paths' own first knot (the earliest of the two hands) so the intro is sampled too.
+    t_first = min(float(np.asarray(getattr(paths[h], 'times', [0.]))[0]) for h in 'LR')
+    times = np.arange(min(0., t_first) - 1. / rate, duration + 1. / rate, 1. / rate)
     x = {h: np.array([paths[h](t)[0] for t in times], dtype=FLOAT) for h in 'LR'}
     busy = {h: np.zeros(len(times), bool) for h in 'LR'}
     for n in notes.values():
@@ -2543,6 +2561,9 @@ def yield_offsets(paths, notes, duration, apart, speed, busy_margin, rate=60., c
         start = (closing or {}).get(h)
         if start is not None:                   # reach zero before lift-off, at the yield's own speed
             busy[h] |= times >= start - .25
+        leave = (opening or {}).get(h)
+        if leave is not None:                   # still resting on the lap: keep its fitted pose, yield nothing
+            busy[h] |= times <= leave + .25
     short = np.maximum(0., apart - (x['R'] - x['L']))
     out = {}
     for h, sign in (('L', -1.), ('R', 1.)):

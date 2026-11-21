@@ -395,7 +395,8 @@ def apply_yield(paths, notes, duration):
     Returns ``({hand: YieldingPath}, offsets)``."""
     base = {h: (paths[h].base if isinstance(paths[h], YieldingPath) else paths[h]) for h in 'LR'}
     offsets = yield_offsets(base, notes, duration, HANDS_APART, YIELD_SPEED, YIELD_BUSY,
-                            closing={h: getattr(base[h], 'trip_outro', None) for h in 'LR'})
+                            closing={h: getattr(base[h], 'trip_outro', None) for h in 'LR'},
+                            opening={h: getattr(base[h], 'trip_leave', None) for h in 'LR'})
     return {h: YieldingPath(base[h], *offsets[h]) for h in 'LR'}, offsets
 
 
@@ -1684,7 +1685,7 @@ def run(args):
             tracks[h][d] = track
     # the lap rest's relaxed shape: held from the first frame to the hover's end, eased into the first note's
     # shape across the approach, and eased back onto after the piece's last keypose (the fingers on the return)
-    from .motion import LAP_FINGERS, LAP_TUCK
+    from .motion import LAP_FINGERS, LAP_TUCK, LAP_TUCK_MIN_LIFT
     from .lap_contact import shape as lap_shape
     for h in 'LR':
         leave = getattr(paths[h], 'trip_leave', None)
@@ -1693,7 +1694,24 @@ def run(args):
             track = tracks[h][d]
             track.rest = np.array(lap[d], dtype=float)
             track.tuck = LAP_TUCK[d].copy()
-            track.rest_tuck = getattr(paths[h], 'trip_draw_end', None) or leave   # the curl starts at lift-off
+            # The curl starts only once the wrist has risen clear of the thigh. Starting it at the draw's end
+            # (the old ``trip_draw_end``) curled the fingers while the palm still lay on the leg, driving the
+            # pads into the thigh (canonpd: 7.4 mm at a 5 mm lift). Find the first time the path's z clears the
+            # lap by LAP_TUCK_MIN_LIFT -- a geometric gate, the same for any piece. Falls back to the draw's
+            # end when the path is already clear there or carries no usable rise.
+            rest_tuck = getattr(paths[h], 'trip_draw_end', None) or leave
+            path_h = paths[h]
+            z0 = float(np.asarray(path_h(leave if leave is not None else rest_tuck), FLOAT)[2]) \
+                if (leave is not None or rest_tuck is not None) else None
+            if z0 is not None:
+                t_scan, t_end = float(leave if leave is not None else rest_tuck), getattr(paths[h], 'trip_lift_end', None)
+                t_end = t_end if t_end is not None else t_scan + 2.
+                while t_scan < t_end:
+                    if float(np.asarray(path_h(t_scan), FLOAT)[2]) - z0 >= LAP_TUCK_MIN_LIFT:
+                        break
+                    t_scan += 1. / 240.
+                rest_tuck = max(rest_tuck, t_scan)
+            track.rest_tuck = rest_tuck
             end = track.strokes[0].hover if track.strokes else (track.keyposes[0].time if len(track.keyposes) else None)
             if end is not None:
                 # the fingers keep the tuck until just before their OWN first stroke: the keyposes scheduled
