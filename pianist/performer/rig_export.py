@@ -58,12 +58,12 @@ if os.environ.get('PIANOMOTION_SEAT'):  # another seat (x, y, z m) for a scene o
 # model (barefoot 1.52 m) missed black-key octaves (thumb to little finger) by 3.4 mm; at 1.05 (about 1.60 m) its
 # hand holds them. The character is scaled about the middle of the bench top so it stays seated; the feet move with
 # the scale (blender_main then refits the bench and puts the feet on the floor and the pedal: performer.staging).
-CHARACTER_SCALE = 1.05
+CHARACTER_SCALE = float(os.environ.get('PIANOMOTION_CHARACTER_SCALE') or 1.05)
 # Uniform scale of both hands about the wrist joints, on top of CHARACTER_SCALE: the model's hands are small for its
 # height (wrist to middle fingertip 15.0 cm at 1.60 m, a real hand about 17 cm) and its white-key octaves landed on the
 # key edges. Set on the wrist pose bones, so the fingers follow and the skin the wrist shares with the forearm blends
 # from 1 to this over the wrist.
-HAND_SCALE = 1.12
+HAND_SCALE = float(os.environ.get('PIANOMOTION_HAND_SCALE') or 1.12)
 
 
 def scaled_seat(arm, cal, offset):
@@ -122,8 +122,37 @@ def spine_chain(arm, torso='上半身', neck='首'):
 
 
 def _bone_frames(arm, bone):
-    pre = arm.matrix_world @ bone.parent.matrix @ bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
+    if bone.parent is None:
+        pre = arm.matrix_world @ bone.bone.matrix_local
+    else:
+        pre = arm.matrix_world @ bone.parent.matrix @ bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
     return dict(bone=bone.name, head=vec(arm.matrix_world @ bone.head), pre=mat(pre), world=mat(arm.matrix_world @ bone.matrix))
+
+
+HEAD_CANDIDATES = ('頭', 'Head', 'head', 'mixamorig:Head', 'J_Bip_C_Head', 'Bip001 Head')
+EYE_CANDIDATES = {
+    'L': ('左目', 'Eye.L', 'eye.L', 'LeftEye', 'Eye_L', 'eye_l', 'mixamorig:LeftEye', 'J_Adj_L_FaceEye'),
+    'R': ('右目', 'Eye.R', 'eye.R', 'RightEye', 'Eye_R', 'eye_r', 'mixamorig:RightEye', 'J_Adj_R_FaceEye'),
+}
+BLINK_CANDIDATES = ('まばたき', 'Blink', 'blink', 'Eye_Blink', 'eye_blink', 'Fcl_EYE_Close', 'eyeClose', 'EyesClosed')
+
+
+def eyes_data(arm, skin):
+    """Export neutral head/eye bone frames and optional blink shape key for universal gaze animation."""
+    bones = arm.pose.bones
+    head_name = next((n for n in HEAD_CANDIDATES if n in bones), None)
+    eye_names = {h: next((n for n in EYE_CANDIDATES[h] if n in bones), None) for h in ('L', 'R')}
+    if head_name is None and not any(eye_names.values()):
+        return None
+    out = dict(head=_bone_frames(arm, bones[head_name]) if head_name else None)
+    for h in ('L', 'R'):
+        out[h] = _bone_frames(arm, bones[eye_names[h]]) if eye_names[h] else None
+    blink_key = None
+    if skin is not None and skin.data.shape_keys is not None:
+        keys = {kb.name for kb in skin.data.shape_keys.key_blocks}
+        blink_key = next((n for n in BLINK_CANDIDATES if n in keys), None)
+    out['blink_shape_key'] = blink_key
+    return out
 
 
 def spine_data(arm, torso, neck='首'):
@@ -179,7 +208,7 @@ def straight_back(arm, torso='上半身', neck='首'):
     while b is not None and b.name != torso:
         chain.append(b)
         b = b.parent
-    if b is None or not chain:
+    if b is None:
         return
     chain = [b] + chain[::-1]
     remove_curves(arm, lambda c: any('"' + n.name + '"' in c.data_path for n in chain[1:] + [bones[neck]]))
@@ -198,16 +227,84 @@ def straight_back(arm, torso='上半身', neck='首'):
     bpy.context.view_layer.update()
 
 
+UNDER_SKIRT_BONES = (
+    '操作中心', '全ての親', 'センター', 'グルーブ',
+    '右足IK親', '右足ＩＫ', '右つま先ＩＫ',
+    '左足IK親', '左足ＩＫ', '左つま先ＩＫ',
+)
+
+
+def strip_under_skirt_bones(arm):
+    """Remove unused MMD standing root and foot-IK control bones that hang below the seated skirt/bench."""
+    present = [n for n in UNDER_SKIRT_BONES if n in arm.data.bones]
+    if not present:
+        return
+    prev_active = bpy.context.view_layer.objects.active
+    prev_mode = arm.mode if hasattr(arm, 'mode') else 'OBJECT'
+    bpy.context.view_layer.objects.active = arm
+    bpy.ops.object.mode_set(mode='EDIT')
+    for name in present:
+        eb = arm.data.edit_bones.get(name)
+        if eb is not None:
+            arm.data.edit_bones.remove(eb)
+    bpy.ops.object.mode_set(mode=prev_mode if prev_mode != 'EDIT' else 'OBJECT')
+    bpy.context.view_layer.objects.active = prev_active
+    bpy.context.view_layer.update()
+
+
+def clean_performer_hierarchy(arm, skin):
+    """Remove leftover MMD Empties (e.g. actual_面部定位, root wrapper Empty), normalize armature/mesh names,
+    and place skin's origin inside the seated pelvis so no origin dot or parent line dangles below the floor."""
+    # 1. Remove any child Empties attached to the armature (e.g. actual_面部定位)
+    for child in list(arm.children):
+        if child.type == 'EMPTY' and not child.children:
+            bpy.data.objects.remove(child, do_unlink=True)
+    # 2. Unparent armature from any wrapper Empty (e.g. 芙宁娜·春日手信) while preserving matrix_world & scale stamps
+    parent = arm.parent
+    if parent is not None and parent.type == 'EMPTY':
+        mw = arm.matrix_world.copy()
+        for k in ('performer_character_scale', 'performer_hand_scale', 'performer_seating_offset'):
+            if k in parent and k not in arm:
+                arm[k] = parent[k]
+        arm.parent = None
+        arm.matrix_world = mw
+        if not parent.children:
+            bpy.data.objects.remove(parent, do_unlink=True)
+    # 3. Unparent skin from armature (Armature modifier already links them) and move skin origin to pelvis
+    if skin is not None:
+        mw_skin = skin.matrix_world.copy()
+        if skin.parent is not None:
+            skin.parent = None
+            skin.matrix_world = mw_skin
+        pelvis_bone = arm.pose.bones.get('下半身') or arm.pose.bones.get('腰') or arm.pose.bones.get('上半身')
+        target_origin = (arm.matrix_world @ pelvis_bone.head) if pelvis_bone is not None else Vector((0., -0.39, 0.65))
+        if (skin.matrix_world.translation - target_origin).length > 0.05:
+            local_target = skin.matrix_world.inverted() @ target_origin
+            skin.data.transform(Matrix.Translation(-local_target))
+            skin.data.update()
+            mw_new = skin.matrix_world.copy()
+            mw_new.translation = target_origin
+            skin.matrix_world = mw_new
+        skin.name = 'performer_skin'
+        skin.data.name = 'performer_skin'
+    # 4. Sync armature data-block name to the armature object name (fixes mod templates where internal data
+    # still carries another character's name such as 星穹铁道—流萤·春日手信.001 on 芙宁娜·春日手信_arm).
+    arm.data.name = arm.name
+    bpy.context.view_layer.update()
+
+
 def neutral_scene(cal, seating=None):
     """The bake's neutral state (setup()), without HandModel / mesh clearance objects, on the performer's seat."""
     (arm, skin), scene = character(), bpy.context.scene
     set_time(scene, 0)
+    strip_under_skirt_bones(arm)
     keyboard = measured_keyboard()
     seating = PERFORMER_SEATING if seating is None else seating
     cal = dict(cal, ergonomics=dict(cal.get('ergonomics', {}), world_root_offset=list(seating)))
     cal = scaled_seat(arm, cal, seating)
     scaled_hands(arm)
     apply_seating(arm, cal)
+    clean_performer_hierarchy(arm, skin)
     straight_back(arm)
     remove_curves(arm, lambda c: any('"' + s in c.data_path for s in ARM_CHANNELS))
     for h, s in SIDE.items():
@@ -321,48 +418,71 @@ def validation_poses(arm, skin, drivers, cal, hands, count, seed):
     for (h, d), frame in frames.items():
         frame.set_root_reference(cal['hands'][h]['fingers'][d]['neutral_root_quaternion'])
     samples = []
-    for _ in range(count):
-        sample = dict(hands={})
-        for h, driver in drivers.items():
-            n = Vector(cal['hands'][h]['neutral_wrist'])
-            for _ in range(100):            # only poses the arm can reach from this seat
-                wrist = n + Vector((rng.uniform(-.25, .25) * (1 if h == 'R' else -1), rng.uniform(-.04, .05),
-                                    rng.uniform(-.03, .04)))
-                yaw, roll = rng.uniform(-10, 10), rng.uniform(-10, 10)
-                try:
+    # Snapshot pose bones mutated by validation_poses so neutral pose is restored cleanly afterwards.
+    mutated_names = set()
+    for h, driver in drivers.items():
+        mutated_names.update((driver.upper.name, driver.elbow.name, driver.wrist.name, driver.forearm_twist.name))
+        for r in cal['hands'][h]['fingers'].values():
+            mutated_names.update(r['bone_names'])
+    saved_pose = {}
+    for name in mutated_names:
+        if name in arm.pose.bones:
+            b = arm.pose.bones[name]
+            saved_pose[name] = (b.rotation_mode, b.rotation_quaternion.copy(), b.rotation_euler.copy())
+    try:
+        for _ in range(count):
+            sample = dict(hands={})
+            for h, driver in drivers.items():
+                n = Vector(cal['hands'][h]['neutral_wrist'])
+                pose = None
+                for _ in range(100):            # only poses the arm can reach from this seat
+                    wrist = n + Vector((rng.uniform(-.25, .25) * (1 if h == 'R' else -1), rng.uniform(-.04, .05),
+                                        rng.uniform(-.03, .04)))
+                    yaw, roll = rng.uniform(-10, 10), rng.uniform(-10, 10)
+                    try:
+                        pose = driver.local_pose(wrist, yaw, roll)
+                        break
+                    except ValueError:
+                        continue
+                if pose is None:
+                    wrist, yaw, roll = n.copy(), 0., 0.
                     pose = driver.local_pose(wrist, yaw, roll)
-                    break
-                except ValueError:
-                    continue
-            for name, q in pose.items():
-                b = arm.pose.bones[name]
-                b.rotation_mode = 'QUATERNION'
-                b.rotation_quaternion = q
-            fingers = {}
-            for d, r in cal['hands'][h]['fingers'].items():
-                bounds = r['working_bounds_degrees']
-                values = [rng.uniform(*bounds[k]) for k in ('swing_lateral', 'swing_lift', 'mcp_delta', 'ip_delta')]
-                local_q, _ = frames[(h, d)].matrices(values)
-                root = arm.pose.bones[r['bone_names'][0]]
-                root.rotation_mode = 'QUATERNION'
-                root.rotation_quaternion = local_q
-                for i, name in enumerate(r['bone_names'][1:]):
-                    arm.pose.bones[name].rotation_mode = 'XYZ'
-                    arm.pose.bones[name].rotation_euler = child_euler(r, i, values[2 + i])
-                fingers[d] = values
-            sample['hands'][h] = dict(wrist=vec(wrist), yaw=yaw, roll=roll, fingers=fingers,
-                                      bone_quaternions={k: vec(v) for k, v in pose.items()})
+                for name, q in pose.items():
+                    b = arm.pose.bones[name]
+                    b.rotation_mode = 'QUATERNION'
+                    b.rotation_quaternion = q
+                fingers = {}
+                for d, r in cal['hands'][h]['fingers'].items():
+                    bounds = r['working_bounds_degrees']
+                    values = [rng.uniform(*bounds[k]) for k in ('swing_lateral', 'swing_lift', 'mcp_delta', 'ip_delta')]
+                    local_q, _ = frames[(h, d)].matrices(values)
+                    root = arm.pose.bones[r['bone_names'][0]]
+                    root.rotation_mode = 'QUATERNION'
+                    root.rotation_quaternion = local_q
+                    for i, name in enumerate(r['bone_names'][1:]):
+                        arm.pose.bones[name].rotation_mode = 'XYZ'
+                        arm.pose.bones[name].rotation_euler = child_euler(r, i, values[2 + i])
+                    fingers[d] = values
+                sample['hands'][h] = dict(wrist=vec(wrist), yaw=yaw, roll=roll, fingers=fingers,
+                                          bone_quaternions={k: vec(v) for k, v in pose.items()})
+            bpy.context.view_layer.update()
+            evaluated, _ = mesh_world(skin)
+            for h in 'LR':
+                out = sample['hands'][h]
+                out['wrist_head'] = vec(arm.matrix_world @ arm.pose.bones[drivers[h].wrist.name].head)
+                out['points'] = {d: {str(row['id']): vec(evaluated[row['id']]) for row in
+                                     hands[h]['fingers'][d]['pad'] + hands[h]['fingers'][d]['clearance'][::7]}
+                                 for d in hands[h]['fingers']}
+                out['root_quaternions'] = {d: vec(arm.pose.bones[cal['hands'][h]['fingers'][d]['bone_names'][0]]
+                                                  .rotation_quaternion) for d in hands[h]['fingers']}
+            samples.append(sample)
+    finally:
+        for name, (mode, q, e) in saved_pose.items():
+            b = arm.pose.bones[name]
+            b.rotation_mode = mode
+            b.rotation_quaternion = q
+            b.rotation_euler = e
         bpy.context.view_layer.update()
-        evaluated, _ = mesh_world(skin)
-        for h in 'LR':
-            out = sample['hands'][h]
-            out['wrist_head'] = vec(arm.matrix_world @ arm.pose.bones[drivers[h].wrist.name].head)
-            out['points'] = {d: {str(row['id']): vec(evaluated[row['id']]) for row in
-                                 hands[h]['fingers'][d]['pad'] + hands[h]['fingers'][d]['clearance'][::7]}
-                             for d in hands[h]['fingers']}
-            out['root_quaternions'] = {d: vec(arm.pose.bones[cal['hands'][h]['fingers'][d]['bone_names'][0]]
-                                              .rotation_quaternion) for d in hands[h]['fingers']}
-        samples.append(sample)
     return samples
 
 
@@ -412,10 +532,14 @@ def lap_measured(arm, skin):
         point = hip + (knee - hip) * LAP_ALONG
         width = (hip - other).length
         point.x += LAP_OUT * width * (1 if hip.x > other.x else -1)   # outward: away from the other hip
-        origin, down = inverse @ Vector((point.x, point.y, point.z + 1.)), inverse @ Vector((point.x, point.y, point.z))
-        direction = (down - origin).normalized()
+        origin, down = inverse @ Vector((point.x, point.y, point.z + .18)), inverse @ Vector((point.x, point.y, point.z))
+        span_vec = down - origin
+        direction = span_vec.normalized()
         while True:
-            ok, loc, _, polygon = evaluated.ray_cast(origin, direction, distance=(down - origin).length)
+            rem = (down - origin).dot(direction)
+            if rem <= 1e-4:
+                raise RuntimeError(f'no thigh surface found above {side}足')
+            ok, loc, _, polygon = evaluated.ray_cast(origin, direction, distance=rem)
             if not ok:
                 raise RuntimeError(f'no thigh surface found above {side}足')
             if not arm_skin(polygon):
@@ -449,7 +573,7 @@ def seat_free_hands(cal):
     return hands, bones, world
 
 
-TRUNK_BONES = ('上半身', '上半身2', '上半身3')       # the skin the trunk outline (performer.elbows) covers
+TRUNK_BONES = ('上半身', '上半身1', '上半身2', '上半身3')       # the skin the trunk outline (performer.elbows) covers
 ARM_BONES = {s: dict(upper=(s + '腕',) + tuple(s + '腕捩' + n for n in ('', '1', '2', '3')),
                      fore=(s + 'ひじ',) + tuple(s + '手捩' + n for n in ('', '1', '2', '3')))
              for s in '左右'}
@@ -457,11 +581,12 @@ ARM_BONES = {s: dict(upper=(s + '腕',) + tuple(s + '腕捩' + n for n in ('', '
 
 def trunk_data(arm, skin):
     """The trunk outline the elbow-swing clearance reads (performer.elbows.Trunk): the skin whose dominant bone is
-    a trunk bone, in that bone's frame, and per arm the median skin radius about its upper arm / forearm segment,
-    at the neutral pose. None without the MMD bones the model reads."""
+    a trunk bone, in that bone's unit-scale frame, and per arm the median skin radius about its upper arm / forearm
+    segment, at the neutral pose. None without the core MMD trunk/arm bones."""
     names = [g.name for g in skin.vertex_groups]
     bones = set(arm.data.bones.keys())
-    if not all(('上半身' in bones, *(b in bones for s in '左右' for group in ARM_BONES[s].values() for b in group))):
+    core = ('上半身',) + tuple(s + n for s in '左右' for n in ('腕', 'ひじ', '手首'))
+    if not all(b in bones for b in core):
         return None
     dominant = np.full(len(skin.data.vertices), '', dtype=object)
     for v in skin.data.vertices:
@@ -477,18 +602,23 @@ def trunk_data(arm, skin):
     co = co.reshape(-1, 3) @ world[:3, :3].T + world[:3, 3]
     trunk_bone = arm.pose.bones['上半身']
     trunk_m = np.array(arm.matrix_world @ trunk_bone.matrix)
-    local = (co[np.isin(dominant, TRUNK_BONES)] - trunk_m[:3, 3]) @ trunk_m[:3, :3]
+    # Orthonormalize trunk rotation so local coordinates stay in true world metres regardless of CHARACTER_SCALE.
+    trunk_r = trunk_m[:3, :3] / np.maximum(np.linalg.norm(trunk_m[:3, :3], axis=0, keepdims=True), 1e-12)
+    local = (co[np.isin(dominant, TRUNK_BONES)] - trunk_m[:3, 3]) @ trunk_r
 
     def radius(a, b, mask):
         p, d = co[mask], b - a
-        t = np.clip((p - a) @ d / (d @ d), 0, 1)
+        if not len(p):
+            return 0.04
+        t = np.clip((p - a) @ d / max(float(d @ d), 1e-12), 0, 1)
         return float(np.median(np.linalg.norm(p - (a + t[:, None] * d), axis=1)))
 
     heads = {s + n: np.array(arm.matrix_world @ arm.pose.bones[s + n].head) for s in '左右' for n in ('腕', 'ひじ', '手首')}
     radii = {h: [radius(heads[s + '腕'], heads[s + 'ひじ'], np.isin(dominant, ARM_BONES[s]['upper'])),
                  radius(heads[s + 'ひじ'], heads[s + '手首'], np.isin(dominant, ARM_BONES[s]['fore']))]
              for s, h in (('左', 'L'), ('右', 'R'))}
-    return dict(schema='performer-trunk', bone='上半身', matrix=[list(map(float, row)) for row in trunk_m],
+    return dict(schema='performer-trunk', bone='上半身', unit_frame=True,
+                matrix=[list(map(float, row)) for row in trunk_m],
                 local=[[float(x) for x in p] for p in local], radius=radii)
 
 
@@ -521,7 +651,7 @@ def main():
                         help='write trunk.json beside --output only (an existing rig.json is not touched: the '
                              'pair-table cache keys on it)')
     args = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
-    cal_path = ROOT / 'hand_calibration.json'
+    cal_path = Path(os.environ.get('PIANOMOTION_HAND_CALIBRATION') or ROOT / 'hand_calibration.json')
     cal = json.loads(cal_path.read_text(encoding='utf-8'))
     seat_free = seat_free_hands(cal) if tuple(PERFORMER_SEATING) != tuple(DEFAULT_SEATING) else None
     arm, skin, drivers, body, keyboard = neutral_scene(cal)
@@ -557,15 +687,29 @@ def main():
             # from another seat is enough to change its solves
             for key in ('fingers', 'neutral_wrist', 'neutral_wrist_matrix', 'l1', 'l2'):
                 hands[h][key] = free_hands[h][key]
+    eyes = eyes_data(arm, skin)
     rig = dict(schema='performer-rig', neutral_bones=neutral_bones, scene=bpy.data.filepath,
                scene_sha256=hashlib.sha256(Path(bpy.data.filepath).read_bytes()).hexdigest(),
                calibration_sha256=hashlib.sha256(cal_path.read_bytes()).hexdigest(),
                fps=bpy.context.scene.render.fps / bpy.context.scene.render.fps_base,
-               arm_world=mat(arm.matrix_world) if seat_free is None else free_world, hands=hands, torso=torso, keyboard=keyboard,
+               arm_world=mat(arm.matrix_world) if seat_free is None else free_world, hands=hands, torso=torso,
+               eyes=eyes, keyboard=keyboard,
                key_meshes=key_meshes(), piano_clearance=piano_clearance(),
                key_depth_gain={p: k['local_z_world_gain'] for p, k in keyboard.items()})
     rig['validation'] = validation_poses(arm, skin, drivers, cal, hands, args.samples, 7)
     out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rig), encoding='utf-8')
+    # Stage the feet/legs identically to blender_main.py before fitting the lap rest, because place_feet
+    # pitches the thighs down to meet the floor/pedals (~45 mm on Furina). Running it AFTER neutral_bones,
+    # hands and trunk are already exported keeps the rig and pair-table cache unchanged while ensuring the
+    # fitted lap_pose matches the final baked thigh surface to the millimetre.
+    from performer.kinematics import Rig as _Rig
+    from performer.lap_contact import fit_lap_poses
+    from performer.staging import place_feet
+    place_feet(arm, skin)
+    lap_poses = fit_lap_poses(arm, skin, _Rig(out))
+    for h in 'LR':
+        rig['hands'][h]['lap_pose'] = lap_poses[h]
     out.write_text(json.dumps(rig), encoding='utf-8')
     print('RIG_EXPORTED', out, 'validation', len(rig['validation']), flush=True)
     if trunk is not None:                 # after the rig: the outline is stamped with the bytes written above

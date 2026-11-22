@@ -136,6 +136,11 @@ class ThumbFrame:
         normal = (self.world.to_3x3() @ across.cross(forward)).normalized()
         if normal.z < 0:
             normal = -normal
+        # The thumb's rolled bind can put its local Z opposite the development rig's even though the world palm
+        # normal is the same. The planner's lateral swing is signed against this vector, so a model whose thumb
+        # splay is mirrored must declare it explicitly instead of silently reaching the wrong side of the keybed.
+        if row.get('palm_normal_sign', 1) < 0:
+            normal = -normal
         self.palm_normal = normal
         self.lift_axis = self.base_axis.cross(normal).normalized()
         self.rest_points, self.weights = [], []

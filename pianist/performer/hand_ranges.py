@@ -11,6 +11,7 @@ found on a grid (every bound included) and then refined by a bounded optimisatio
 import hashlib
 import itertools
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -72,10 +73,12 @@ def main():
                               'bounded optimisation (sampled_* are the grid values).',
                rig=str(Path(RIG).name), rig_sha256=hashlib.sha256(Path(RIG).read_bytes()).hexdigest(), tool_sha256=code,
                grid=dict(value_steps=VALUE_STEPS, yaw_steps=YAW_STEPS, roll_steps=ROLL_STEPS))
-    OUT.write_text(json.dumps(out, indent=2), encoding='utf-8')
+    out_path = Path(os.environ.get('PIANOMOTION_ENVELOPES_OUT') or OUT)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out, indent=2), encoding='utf-8')
     for h in 'LR':
         print(h, {d: (round(e['low_x'] * 1000, 1), round(e['high_x'] * 1000, 1)) for d, e in envelopes[h].items()})
-    print('written', OUT)
+    print('written', out_path)
 
 
 if __name__ == '__main__':

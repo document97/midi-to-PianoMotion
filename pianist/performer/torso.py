@@ -209,15 +209,19 @@ class Torso:
     def set_notes(self, rows, first, last, reach=None):
         """``rows``: (start, wrist x - shoulder x beyond .15 m, (velocity/127)^.6) per note; ``reach``: per hand
         (start, wrist distance from the shoulder over the arm's length, weight) per note."""
-        self.rows, self.first, self.last = np.asarray(rows, float).reshape(-1, 3), first, last
+        self.rows = np.array(rows, dtype=float, copy=True).reshape(-1, 3)
+        self.first, self.last = first, last
+        self.reach = {h: np.zeros((0, 3)) for h in 'LR'}
         for h, r in (reach or {}).items():
-            self.reach[h] = np.asarray(r, float).reshape(-1, 3)
+            self.reach[h] = np.array(r, dtype=float, copy=True).reshape(-1, 3)
+        self._rows_ver = getattr(self, '_rows_ver', 0) + 1
+        self._invalidate_world_cache()
 
     def set_cap(self, times, shares):
         """How much of its lean the body keeps over time (elbows.py: the elbows out of the body, the body yields
         before an elbow is raised): interpolated at ``pose``; None keeps the full lean."""
-        times = np.asarray(times, float)
-        shares = np.asarray(shares, float)
+        times = np.array(times, dtype=float, copy=True)
+        shares = np.array(shares, dtype=float, copy=True)
         old = self.cap
         if (FAST_TORSO and old is not None and old[0].shape == times.shape
                 and np.array_equal(old[0], times) and np.array_equal(old[1], shares)):
@@ -244,8 +248,8 @@ class Torso:
         """The elbows solve's wrist-deviation ask: a lean toward a hand (m, + right) over time, where the swing
         keeping its elbow out of the outline would bend the rendered wrist past the comfort floor -- the body
         moves instead of the wrist. Interpolated at ``pose`` like the cap; None is no ask."""
-        times = np.asarray(times, float)
-        shifts = np.asarray(shifts, float)
+        times = np.array(times, dtype=float, copy=True)
+        shifts = np.array(shifts, dtype=float, copy=True)
         old = self.yield_rows
         if (FAST_TORSO and old is not None and old[0].shape == times.shape
                 and np.array_equal(old[0], times) and np.array_equal(old[1], shifts)):
@@ -263,8 +267,8 @@ class Torso:
         """The ask's seat part: a slide (m, + the seat's own slide direction) over time -- the slide raises the
         palm-vs-forearm angle where the lean's tilt lowers it (measured +2 deg/cm against the lean's -1.4), so
         the two are searched jointly. Interpolated like the lean yield; None is no ask."""
-        times = np.asarray(times, float)
-        offsets = np.asarray(offsets, float)
+        times = np.array(times, dtype=float, copy=True)
+        offsets = np.array(offsets, dtype=float, copy=True)
         old = self.slide_yield_rows
         if (FAST_TORSO and old is not None and old[0].shape == times.shape
                 and np.array_equal(old[0], times) and np.array_equal(old[1], offsets)):
@@ -272,15 +276,20 @@ class Torso:
         self.slide_yield_rows = (times, offsets)
         from .motion import pchip_slopes
         self.slide_yield_slopes = pchip_slopes(self.slide_yield_rows[0], self.slide_yield_rows[1][:, None])
-        # The pose's rendered copy: same end values, the jumps ironed out. Built once per ask, off the solve's path.
-        if len(times) >= 2:
+        # Smoothed, rate-limited copy shared by solve and render so both see identical shoulders/trunk.
+        # Scale the world speed cap back into pre-BODY_STILL_SCALE units so world seat speed matches SEAT_YIELD_RATE.
+        if len(times) >= 2 and times[-1] - times[0] >= SEAT_YIELD_STEP:
             g = np.arange(times[0], times[-1] + SEAT_YIELD_STEP, SEAT_YIELD_STEP)
-            raw = np.interp(g, times, offsets)
-            smooth = _gauss_time(raw, SEAT_YIELD_STEP, SEAT_YIELD_TAU)
-            for i in range(1, len(smooth)):
-                d = smooth[i] - smooth[i - 1]
-                smooth[i] = smooth[i - 1] + math.copysign(min(abs(d), SEAT_YIELD_RATE * SEAT_YIELD_STEP), d)
-            self.slide_yield_smooth = (g, smooth, pchip_slopes(g, smooth[:, None]))
+            if len(g) >= 2:
+                raw = np.interp(g, times, offsets)
+                smooth = _gauss_time(raw, SEAT_YIELD_STEP, SEAT_YIELD_TAU)
+                max_step = (SEAT_YIELD_RATE / max(BODY_STILL_SCALE, 1e-3)) * SEAT_YIELD_STEP
+                for i in range(1, len(smooth)):
+                    d = smooth[i] - smooth[i - 1]
+                    smooth[i] = smooth[i - 1] + math.copysign(min(abs(d), max_step), d)
+                self.slide_yield_smooth = (g, smooth, pchip_slopes(g, smooth[:, None]))
+            else:
+                self.slide_yield_smooth = None
         else:
             self.slide_yield_smooth = None
         self._invalidate_world_cache()
@@ -295,13 +304,15 @@ class Torso:
         hands land on the thighs in the SAME seat as the intro's first frame (the user's spec). ``s0`` is the
         return's start, ``s1`` the moment the hands rest."""
         self.slide_return = (float(s0), float(s1))
+        self._invalidate_world_cache()
 
     def set_sway(self, times, degrees):
         """The intro's body sway (deg, + backward / - forward) on top of the hips' forward lean: the drawing
         arms tip the chest back a hair, the reaching arms carry it a little forward (the user's spec)."""
-        self.sway_rows = (np.asarray(times, float), np.asarray(degrees, float))
+        self.sway_rows = (np.array(times, dtype=float, copy=True), np.array(degrees, dtype=float, copy=True))
         from .motion import pchip_slopes
         self.sway_slopes = pchip_slopes(self.sway_rows[0], self.sway_rows[1][:, None])
+        self._invalidate_world_cache()
 
     def _sway(self, t):
         if self.sway_rows is None:
@@ -334,7 +345,7 @@ class Torso:
         """(times, m) the rows' windowed average, smoothed (LEAN_TAU) and rate-limited (LEAN_RATE): the
         lean's commitment, built once per notes set. The per-call gaussian window alone answered a 1.4 s
         figure with a .3 s dart (23 cm/s) -- faster than any deliberate human lean."""
-        key = (id(self.rows), self.first, self.last)
+        key = (getattr(self, '_rows_ver', 0), self.first, self.last)
         got = getattr(self, '_shift_cache', None)
         if got is not None and got[0] == key:
             return got[1], got[2]
@@ -348,9 +359,10 @@ class Torso:
         else:
             values = np.zeros(len(times))
         values = _gauss_time(values, LEAN_STEP, LEAN_TAU)
+        max_step = (LEAN_RATE / max(BODY_STILL_SCALE, 1e-3)) * LEAN_STEP
         for i in range(1, len(values)):          # rate limit, forward pass (the tau already made it smooth)
             d = values[i] - values[i - 1]
-            values[i] = values[i - 1] + math.copysign(min(abs(d), LEAN_RATE * LEAN_STEP), d)
+            values[i] = values[i - 1] + math.copysign(min(abs(d), max_step), d)
         self._shift_cache = (key, times, values)
         return times, values
 
@@ -404,15 +416,22 @@ class Torso:
 
     def _slide_need(self):
         """Per note (onset, m the music asks the seat to slide there), once."""
-        if getattr(self, '_need_rows', None) is not self.rows:
+        need_key = (getattr(self, '_rows_ver', 0), self.slide_max)
+        if getattr(self, '_need_key', None) != need_key:
             need = []
             for start in self.rows[:, 0]:
                 near = self.rows[np.abs(self.rows[:, 0] - start) < 3. * SLIDE_SECONDS]
                 weights = np.exp(-.5 * ((near[:, 0] - start) / SLIDE_SECONDS) ** 2) * near[:, 2]
                 need.append(float(np.sum(near[:, 1] * weights) / (.25 + np.sum(weights))))
             self._need = np.c_[self.rows[:, 0], np.clip(need, -self.slide_max, self.slide_max)] if len(need) else np.zeros((0, 2))
-            self._need_rows = self.rows
+            self._need_key = need_key
         return self._need
+
+    def opening_slide(self):
+        """World-space (+x, m) opening seat offset (scaled by BODY_STILL_SCALE, matching pose())."""
+        if not self.slide_max:
+            return 0.
+        return float(self._slide_curve()[1][0]) * BODY_STILL_SCALE
 
     def slide(self, t):
         """m the seat has slid along the bench (+x) at ``t``: toward each side, the most any note asks, reached
@@ -449,7 +468,7 @@ class Torso:
         """(times, m) of the seat's plan travel: the raw ask quantized to a committed place -- moved only when the
         ask leaves SLIDE_DEADBAND around it (plus SLIDE_HYST once the place is committed) and the place has been
         held SLIDE_DWELL s -- then smoothed over SLIDE_TAU and rate-limited. Built once per notes set."""
-        key = (id(self.rows), self.first, self.last, self.slide_max)
+        key = (getattr(self, '_rows_ver', 0), self.first, self.last, self.slide_max)
         got = getattr(self, '_slide_cache', None)
         if got is not None and got[0] == key:
             return got[1], got[2]
@@ -463,9 +482,9 @@ class Torso:
         for i, t in enumerate(times):
             away = abs(raw[i] - place)
             if away > SLIDE_DEADBAND and t - held >= SLIDE_DWELL:
-                # the ask has to keep going the same way: a value dancing on the edge of the band settles nothing
+                # the ask has to keep moving outward: a value bouncing back across the band edge settles nothing
                 j = min(i + 1, len(times) - 1)
-                if away > SLIDE_DEADBAND + SLIDE_HYST or (raw[i] - place) * (raw[j] - place) > 0:
+                if away > SLIDE_DEADBAND + SLIDE_HYST or (raw[j] - raw[i]) * (raw[i] - place) > 0:
                     place, held = round(float(raw[i]) / SLIDE_GRID) * SLIDE_GRID, t
             committed[i] = place
         values = _gauss_time(committed, SLIDE_STEP, SLIDE_TAU)
@@ -494,7 +513,7 @@ class Torso:
             import json as _json
             with open(os.environ['PIANOMOTION_DEBUG_TORSO'], 'a') as f:
                 _json.dump([[float(t), float(shift), math.degrees(turn), float(cap), float(self._yield(t)),
-                             float(self._slide_yield(t)), float(self.slide(t)), float(offset[0])]], f)
+                             float(self._slide_yield(t, True)), float(self.slide(t)), float(offset[0])]], f)
         heads = [b['head'] for b in self.spine]
         sway = self._sway(t)
         chain = spine_transforms(shift, turn, heads, self.neck['head'], self.height, offset, sway)
@@ -517,7 +536,7 @@ class Torso:
     def shoulder_world(self, h, t, cap=None):
         """The hand's shoulder pre-matrix at ``t`` (pose's pre[h]) for a lean ``cap``: the elbow-swing search."""
         if not FAST_TORSO:
-            shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
+            shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap, smooth=True)
             chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
                                      offset, self._sway(t))
             return self._shoulders(t, chain[-1])[0][h]
@@ -525,7 +544,7 @@ class Torso:
         hit = self._world_cache.get(key)
         if hit is not None:
             return hit
-        shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
+        shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap, smooth=True)
         chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
                                  offset, self._sway(t))
         out = self._shoulders(t, chain[-1], only=h, pre_only=True)[0][h]
@@ -537,7 +556,7 @@ class Torso:
         The lowest spine bone takes its share of the lean about the neutral pose (spine_transforms) on top of its
         exported world matrix."""
         if not FAST_TORSO:
-            shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
+            shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap, smooth=True)
             chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
                                      offset, self._sway(t))
             return (chain[0] @ self.spine[0]['world']).astype(FLOAT)
@@ -545,7 +564,7 @@ class Torso:
         hit = self._world_cache.get(key)
         if hit is not None:
             return hit
-        shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap)
+        shift, turn, offset = self._lean(t, self._cap(t) if cap is None else cap, smooth=True)
         chain = spine_transforms(shift, turn, [b['head'] for b in self.spine], self.neck['head'], self.height,
                                  offset, self._sway(t))
         out = (chain[0] @ self.spine[0]['world']).astype(FLOAT)

@@ -46,10 +46,11 @@ def _curve(data, h):
     got = data[h].get('_slopes')
     node = np.asarray(data[h]['times'], float)
     ang = np.asarray(data[h]['angles'], float)[:, None]
-    if got is None or got[0] is not data[h]['angles']:
-        got = (data[h]['angles'], pchip_slopes(node, ang))
+    if (got is None or got[0] is not data[h]['angles'] or got[1] is not data[h]['times']
+            or got[2].shape != ang.shape):
+        got = (data[h]['angles'], data[h]['times'], pchip_slopes(node, ang))
         data[h]['_slopes'] = got
-    return node, ang, got[1]
+    return node, ang, got[2]
 
 
 def palm_at(solver, torso, curves, hand, v, t):
@@ -61,7 +62,10 @@ def palm_at(solver, torso, curves, hand, v, t):
     arm = solver.arm
     phi = float(hermite_eval(node, ang, slopes, float(t))[0])
     shoulder = torso.shoulder_world(hand, float(t))[:3, 3]
-    elbow = closest_elbow(shoulder, np.asarray(v[:3], float), arm.l1, arm.l2, arm.side, angle=phi)
+    try:
+        elbow = closest_elbow(shoulder, np.asarray(v[:3], float), arm.l1, arm.l2, arm.side, angle=phi)
+    except ValueError:
+        return 0.
     return _palm_deg(arm, float(v[3]), float(v[4]), np.asarray(v[:3], float) - elbow)
 
 
@@ -129,7 +133,12 @@ def idle_attitude(path, want, busy, rate=1. / 60., tau=.15, gate=3., speed=90., 
     hand stops aiming -- a hand still on the lap (the piece has not started, or it is over) keeps its own relaxed
     yaw instead of snapping keyboardward at the first frame; the aim engages as the hand rises past it, so the turn
     reads as part of the lift, the way a real hand turns while it travels to the keys."""
+    if len(want[0]) < 2:
+        return np.asarray(want[0], float), np.zeros(len(want[0])), np.zeros(len(want[0]))
     times = np.arange(want[0][0], want[0][-1], rate)
+    if len(times) < 2:
+        cur = np.array([np.asarray(path(float(t)), float) for t in times]).reshape(len(times), 5)
+        return times, cur[:, 3], cur[:, 4]
     cur = np.array([np.asarray(path(float(t)), float) for t in times])
     playing = np.interp(times, want[0], busy.astype(float)) > .05      # any overlap counts: a key is being kept
     aiming = np.ones(len(times), bool) if aim_z is None else cur[:, 2] >= aim_z
@@ -143,35 +152,40 @@ def idle_attitude(path, want, busy, rate=1. / 60., tau=.15, gate=3., speed=90., 
             _json.dump(dict(rows=[[float(t), float(g), float(o), bool(p), bool(a)]
                                   for t, g, o, p, a in zip(times[sel], np.interp(times, want[0], want[1])[sel],
                                                            cur[sel, 3], playing[sel], aiming[sel])]), f)
+    # Interpolate yaw & roll safely: non-finite samples in ``want`` fall back to ``own`` instead of poisoning
+    # _gauss and latching _follow to NaN for the rest of the piece.
+    own_y, own_r = cur[:, 3], cur[:, 4]
+    goals = []
+    for k, own in ((1, own_y), (2, own_r)):
+        g = np.interp(times, want[0], want[k])
+        goals.append(np.where(np.isfinite(g), g, own))
+    gy, gr = goals
+    # Joint Schmitt gate across (yaw, roll), reset outside active idle stretches so state never leaks across
+    # playing/lap windows and a compensating +-3 deg roll from _frame_yaw stays coupled with its yaw.
+    on_mask = np.zeros(len(times), bool)
+    on = False
+    for i in range(len(times)):
+        if playing[i] or not aiming[i]:
+            on = False
+            continue
+        gap = max(abs(float(gy[i]) - float(own_y[i])), abs(float(gr[i]) - float(own_r[i])))
+        if not on and gap >= gate:
+            on = True
+        elif on and gap < gate * .25:
+            on = False
+        on_mask[i] = on
     out = []
-    for k, own in ((1, cur[:, 3]), (2, cur[:, 4])):
-        goal = np.interp(times, want[0], want[k])
-        # The idle aim engages past ``gate`` and holds until the gap nearly closes (a Schmitt trigger). A plain
-        # per-frame threshold re-flips the target wherever the goal drifts back across the band's edge, and the
-        # chase then sweeps between the goal and the path's own yaw at its speed limit -- the 90 deg/s reversals
-        # the user flags as a jittering arm (daylight's frame 920 window, elise's 50-53 s: seven of them).
-        v_idle = own.copy()
-        on = False
-        for i in range(len(own)):
-            gap = abs(float(goal[i]) - float(own[i]))
-            if not on and gap > gate:
-                on = True
-            elif on and gap < gate * .25:
-                on = False
-            if on:
-                v_idle[i] = goal[i]
-        v = np.where(playing | ~aiming, own, v_idle)
-        # The idle stretch's target (smoothed); the playing frames' -- and the resting hand's -- target is the
-        # path's own wrist itself. Both are reached by one bounded-speed chase from the wrist's real value, so the
-        # switch between them is a walk, not a jump -- the old splice (own forced on the playing frames, the
-        # smoothed curve on the idle ones) jumped the whole |goal-own| in the first idle frame, 9.6 deg in one
-        # 1/60 s frame at t=4.18 on the daylight piece.
-        target = np.where(playing | ~aiming, own, _gauss(v, rate, tau))
-        out.append(_follow(own, target, speed * rate))
-    return times, out[0], out[1]      # the playing frames keep the path's own wrist exactly
+    locked = playing | ~aiming
+    for g, own in ((gy, own_y), (gr, own_r)):
+        v = np.where(on_mask, g, own)
+        target = np.where(locked, own, _gauss(v, rate, tau))
+        out.append(_follow(own, target, speed * rate, locked=locked))
+    return times, out[0], out[1]      # playing frames track the path's own wrist without speed clipping
 
 
 def _gauss(values, step, tau):
+    if len(values) < 2:
+        return np.array(values, float)
     r = max(1, int(round(tau / step * 2.)))
     k = np.arange(-r, r + 1) * step
     w = np.exp(-.5 * (k / tau) ** 2)
@@ -191,27 +205,74 @@ def _rate_limit(values, step, rate):
     return out
 
 
-def _follow(cur, goal, limit):
-    """``cur`` chased toward ``goal`` at ``limit`` per step: the chase starts from where the wrist really is, so a
-    playing/idle switch cannot jump. When the goal moves slower than the limit (the playing frames' own path does)
-    the chase sits exactly on it, so the playing frames keep the path's own wrist as before; when the goal steps
-    away (an idle turn) the wrist walks there at the bounded rate instead of teleporting the difference."""
+def _follow(cur, goal, limit, locked=None):
+    """``cur`` chased toward ``goal`` at ``limit`` per step: smooth across playing/idle transitions, while
+    allowing locked (playing) frames already on ``cur`` to follow fast settled wrist turns unclipped."""
     out = np.empty_like(cur)
     prev = float(cur[0])
     out[0] = prev
     for i in range(1, len(cur)):
-        prev += min(max(float(goal[i]) - prev, -limit), limit)
+        g = float(goal[i])
+        if not math.isfinite(g):
+            g = float(cur[i])
+        if locked is not None and locked[i] and abs(prev - float(cur[i - 1])) <= 1e-6:
+            prev = float(cur[i])
+        else:
+            prev += min(max(g - prev, -limit), limit)
         out[i] = prev
     return out
 
 
-def targets(paths, curves, torso, solvers, t0, t1, step=STEP):
+_ATT_CTX = None
+
+
+def _att_init(ctx):
+    global _ATT_CTX
+    _ATT_CTX = ctx
+
+
+def _att_chunk(job):
+    from .arm import closest_elbow
+    from .motion import hermite_eval
+    h, times = job
+    c = _ATT_CTX
+    path, (node, ang, slopes), torso, arm, y0, dy = c['paths'][h], c['curves'][h], c['torso'], c['arms'][h], c['cal'][h][0], c['cal'][h][1]
+    yaw = np.full(len(times), np.nan)
+    roll = np.full(len(times), np.nan)
+    for i, t in enumerate(times):
+        v = np.asarray(path(float(t)), float)
+        try:
+            phi = float(hermite_eval(node, ang, slopes, float(t))[0])
+            shoulder = torso.shoulder_world(h, float(t))[:3, 3]
+            elbow = closest_elbow(shoulder, v[:3], arm.l1, arm.l2, arm.side, angle=phi)
+        except ValueError:
+            continue
+        (yaw[i], roll[i]), _ = _frame_yaw(arm, v, elbow, y0, dy)
+    return h, yaw, roll
+
+
+def targets(paths, curves, torso, solvers, t0, t1, step=STEP, workers=1):
     """{hand: (times, yaw, roll)}: where the wrist would sit at each grid time if the fingers pointed down the keys on
     the elbow the swing curve places -- the attitude refine inserts an anchor wherever this sits far from the path."""
     from .arm import closest_elbow
     from .motion import hermite_eval
     from .posture import _calibration
     times = np.arange(t0, t1, step)
+    if workers and workers > 1 and len(times) >= 128:
+        from concurrent.futures import ProcessPoolExecutor
+        c_curves = {h: _curve(curves, h) for h in 'LR'}
+        c_arms = {h: solvers[h].arm for h in 'LR'}
+        c_cal = {h: _calibration(solvers[h])[:2] for h in 'LR'}
+        torso._invalidate_world_cache()
+        ctx = dict(paths=paths, curves=c_curves, torso=torso, arms=c_arms, cal=c_cal)
+        splits = [c for c in np.array_split(times, max(2, workers * 2)) if len(c)]
+        jobs = [(h, c) for h in 'LR' for c in splits]
+        parts = {'L': [], 'R': []}
+        with ProcessPoolExecutor(max_workers=min(workers, len(jobs)), initializer=_att_init, initargs=(ctx,)) as ex:
+            for h, y, r in ex.map(_att_chunk, jobs):
+                parts[h].append((y, r))
+        return {h: (times, np.concatenate([p[0] for p in parts[h]]), np.concatenate([p[1] for p in parts[h]]))
+                for h in 'LR'}
     out = {}
     for h in 'LR':
         node, ang, slopes = _curve(curves, h)

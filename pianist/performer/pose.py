@@ -165,6 +165,7 @@ class PoseSolver:
         self.regions = regions or KeyRegions(rig.keyboard)
         self.identity = np.eye(4, dtype=FLOAT)
         self.neutral = rig.neutral_wrist[hand]
+        self.wrist_travel = WRIST_TRAVEL.copy()   # per-solver: the raised playing wrist keeps the table's lower reach
         self._pad_cache = {}
         self._static = {}
         owner = rig.bone_owner[hand]
@@ -275,9 +276,9 @@ class PoseSolver:
             x_hint = wrist[0]
         fingers = self.rig.fingers[self.hand]
         centre = np.array([x_hint, self.neutral[1], self.neutral[2]], dtype=FLOAT)
-        lower = np.r_[centre - WRIST_TRAVEL, YAW_BOUNDS[0], ROLL_BOUNDS[0],
+        lower = np.r_[centre - self.wrist_travel, YAW_BOUNDS[0], ROLL_BOUNDS[0],
                       np.concatenate([fingers[d].lower for d in digits]) if digits else []]
-        upper = np.r_[centre + WRIST_TRAVEL, YAW_BOUNDS[1], ROLL_BOUNDS[1],
+        upper = np.r_[centre + self.wrist_travel, YAW_BOUNDS[1], ROLL_BOUNDS[1],
                       np.concatenate([fingers[d].upper for d in digits]) if digits else []]
         x = np.r_[wrist, yaw, roll, np.concatenate([values[d] for d in digits]) if digits else []]
         x = np.clip(x, lower, upper)
@@ -411,8 +412,8 @@ class PoseSolver:
         fingers = self.rig.fingers[self.hand]
         base = np.asarray(vector, FLOAT)
         seed = {d: np.asarray(values[d], FLOAT) for d in digits}
-        lower = np.r_[base[:3] - WRIST_TRAVEL, YAW_BOUNDS[0], ROLL_BOUNDS[0], np.concatenate([fingers[d].lower for d in digits])]
-        upper = np.r_[base[:3] + WRIST_TRAVEL, YAW_BOUNDS[1], ROLL_BOUNDS[1], np.concatenate([fingers[d].upper for d in digits])]
+        lower = np.r_[base[:3] - self.wrist_travel, YAW_BOUNDS[0], ROLL_BOUNDS[0], np.concatenate([fingers[d].lower for d in digits])]
+        upper = np.r_[base[:3] + self.wrist_travel, YAW_BOUNDS[1], ROLL_BOUNDS[1], np.concatenate([fingers[d].upper for d in digits])]
         x = np.clip(np.r_[base, np.concatenate([seed[d] for d in digits])], lower, upper)
         vals = dict(values)
 

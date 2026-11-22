@@ -49,7 +49,7 @@ def elbow_circle(shoulder, wrist, l1, l2, side):
     s, w = np.asarray(shoulder, FLOAT), np.asarray(wrist, FLOAT)
     d = w - s
     distance = float(np.linalg.norm(d))
-    if distance >= l1 + l2 - .0001 or distance <= abs(l1 - l2) + .0001:
+    if not (abs(l1 - l2) + .0001 < distance < l1 + l2 - .0001):
         raise ValueError(f'Arm target outside unstretched reach: {distance:.6f}')
     u = d / distance
     a = (l1 * l1 - l2 * l2 + distance * distance) / (2 * distance)

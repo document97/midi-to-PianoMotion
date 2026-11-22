@@ -78,7 +78,7 @@ if njit is not None:
             wx, wy, wz = W[i, 0], W[i, 1], W[i, 2]
             dx, dy, dz = wx - sx, wy - sy, wz - sz
             dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-            if dist >= l1 + l2 - 1e-4 or dist <= abs(l1 - l2) + 1e-4:
+            if not (abs(l1 - l2) + 1e-4 < dist < l1 + l2 - 1e-4):
                 ok[i] = False                # elbow_circle's reach guards, the scan's "stretched" sample
                 continue
             ok[i] = True
@@ -147,8 +147,8 @@ def swing_block(packed, S, W, R, O, l1, l2, side, rup, rfo, cosv, sinv, up, fo):
     R = np.ascontiguousarray(R, dtype=np.float64)
     O = np.ascontiguousarray(O, dtype=np.float64)
     n, nang = len(S), len(cosv)
-    depth = np.empty((n, nang), dtype=np.float64)
-    rise = np.empty((n, nang), dtype=np.float64)
+    depth = np.full((n, nang), np.nan, dtype=np.float64)
+    rise = np.full((n, nang), np.nan, dtype=np.float64)
     ok = np.zeros(n, dtype=np.bool_)
     _swing_block(S, W, R, O, float(l1), float(l2), float(side), float(rup), float(rfo),
                  packed['keys'], packed['origin'], packed['normal'], packed['lo'], packed['step'],

@@ -18,8 +18,11 @@ from thumb_driver import mesh_world
 PEDAL_DEPTH = .008             # m the damper pedal goes down where the foot presses
 PIANO_DAMPER = 'piano_part_034'   # the grand's right pedal
 FLOOR = 'floor'                # the floor object (its top is the floor height; 0 without one)
-FOOT_TARGET = '右足ＩＫ'        # the right leg's IK target; the toe target is its child
-FOOT_TARGETS = {'L': '左足ＩＫ', 'R': FOOT_TARGET}
+# The seating script drops the leg IK constraints, so the IK target bones drive nothing. The legs are placed here
+# by an analytic two-bone solve that writes FK rotations straight onto the thigh/shin/foot bones; the mesh is
+# skinned to the matching 足D/ひざD/足首D bones, which follow those rotations through their own constraint chain.
+LEGS = {'L': ('左足', '左ひざ', '左足首'), 'R': ('右足', '右ひざ', '右足首')}
+FOOT_TARGET = '右足首'          # the bone the pedal press turns (about the heel)
 ANKLES = {'L': '左足首', 'R': '右足首'}
 BALL_ON_PEDAL = .04            # m from the damper pedal's tip back to under the ball of the foot
 OLD_STAGING = ('pedal_extender', 'extender_pedal_L', 'extender_pedal_R')   # earlier versions' footrest objects
@@ -32,6 +35,8 @@ def fit_bench(skin):
     """Lower the bench top to the lowest seated-body point over it behind the hip joints (the buttocks carry the
     weight; the thighs in front slope down to the knees and press into the front edge); the legs get shorter.
     Returns the drop (m)."""
+    if 'bench_seat' not in bpy.data.objects:
+        return 0.
     seat = bpy.data.objects['bench_seat']
     coords, _ = mesh_world(skin)
     seated = {g.index for g in skin.vertex_groups if g.name in SEATED_BONES}
@@ -54,6 +59,8 @@ def fit_bench(skin):
             world = leg.matrix_world
             points = [world @ v.co for v in leg.data.vertices]
             low, high = min(p.z for p in points), max(p.z for p in points)
+            if high - low <= drop + 1e-4:
+                continue
             for vertex, point in zip(leg.data.vertices, points):
                 point.z = low + (point.z - low) * (1 - drop / (high - low))
                 vertex.co = world.inverted() @ point
@@ -63,10 +70,11 @@ def fit_bench(skin):
 def boot_contacts(arm, skin):
     """Per boot: heel tip (lowest point of its back 40 %) and ball (lowest point of its front half), world xyz."""
     coords, _ = mesh_world(skin)
+    mid_x = 0.5 * (float(_world_head(arm, HIP_JOINTS[0]).x) + float(_world_head(arm, HIP_JOINTS[1]).x))
     out = {}
     for h, sx in SIDE.items():
         ankle = arm.matrix_world @ arm.pose.bones[ANKLES[h]].head
-        boot = coords[(coords[:, 0] * sx > .02) & (np.abs(coords[:, 0] - ankle.x) < .12) & (coords[:, 2] < ankle.z + .05)
+        boot = coords[((coords[:, 0] - mid_x) * sx > .02) & (np.abs(coords[:, 0] - ankle.x) < .12) & (coords[:, 2] < ankle.z + .05)
                       & (np.abs(coords[:, 1] - ankle.y) < .3)]
         back, front = boot[:, 1].min(), boot[:, 1].max()
         rear = boot[boot[:, 1] < back + .4 * (front - back)]
@@ -80,49 +88,112 @@ def _bounds(obj):
     return corners.min(0), corners.max(0)
 
 
-def _place_foot(arm, skin, h, target, steps=8):
-    """Move and pitch the foot's IK target until the boot's heel and ball are at ``target(heel, ball)`` -> (heel, ball)
-    targets (world). Returns the remaining miss (m)."""
-    bone = arm.pose.bones[FOOT_TARGETS[h]]
-    bone.rotation_mode = 'QUATERNION'
-    miss = np.inf
-    for _ in range(steps):
+def _world_head(arm, name):
+    return arm.matrix_world @ arm.pose.bones[name].head
+
+
+def _aim(arm, pb, head, direction):
+    """Turn a pose bone about ``head`` so its Y axis (the bone) points along ``direction``; world space."""
+    m = arm.matrix_world @ pb.matrix
+    cur = (m.to_3x3() @ Vector((0., 1., 0.))).normalized()
+    q = cur.rotation_difference(direction.normalized())
+    world = Matrix.Translation(head) @ q.to_matrix().to_4x4() @ Matrix.Translation(-head) @ m
+    pb.matrix = arm.matrix_world.inverted() @ world
+    bpy.context.view_layer.update()
+
+
+def _solve_leg(arm, h, ankle, pole):
+    """Two-bone IK from the hip to ``ankle`` with the knee pushed towards ``pole``; writes FK rotations."""
+    thigh_name, shin_name, foot_name = LEGS[h]
+    thigh, shin = arm.pose.bones[thigh_name], arm.pose.bones[shin_name]
+    H = _world_head(arm, thigh_name)
+    L1 = (_world_head(arm, shin_name) - H).length
+    L2 = (_world_head(arm, foot_name) - _world_head(arm, shin_name)).length
+    v = Vector(ankle) - H
+    d = min(max(v.length, abs(L1 - L2) + 1e-4), L1 + L2 - 1e-4)
+    axis = v.normalized()
+    p = Vector(pole)
+    p = p - axis * p.dot(axis)
+    if p.length < 1e-6:
+        p = Vector((0., 1., 0.))
+    p.normalize()
+    ca = (L1 * L1 + d * d - L2 * L2) / (2 * L1 * d)
+    ang = float(np.arccos(min(max(ca, -1.), 1.)))
+    K = H + axis * (L1 * float(np.cos(ang))) + p * (L1 * float(np.sin(ang)))
+    _aim(arm, thigh, H, K - H)
+    K = _world_head(arm, shin_name)
+    _aim(arm, shin, K, Vector(ankle) - K)
+
+
+def _pitch_foot(arm, skin, h, target_pitch_deg, iters=5):
+    """Turn the boot about its ankle until heel->ball reaches ``target_pitch_deg`` (degrees, + = toes up)."""
+    foot = arm.pose.bones[LEGS[h][2]]
+    for _ in range(iters):
         c = boot_contacts(arm, skin)[h]
         heel, ball = c['heel'], c['ball']
-        heel_to, ball_to = target(heel, ball)
-        miss = max(np.linalg.norm(heel_to - heel), np.linalg.norm(ball_to - ball))
-        if miss < 5e-4:
+        cur = np.degrees(np.arctan2(ball[2] - heel[2], ball[1] - heel[1]))
+        err = target_pitch_deg - float(cur)
+        if abs(err) < .3:
             break
-        pitch = (np.arctan2(ball_to[2] - heel_to[2], ball_to[1] - heel_to[1]) - np.arctan2(ball[2] - heel[2], ball[1] - heel[1]))
-        world = Matrix.Translation(Vector(heel_to)) @ Matrix.Rotation(pitch, 4, 'X') @ Matrix.Translation(-Vector(heel))
-        bone.matrix = arm.matrix_world.inverted() @ world @ arm.matrix_world @ bone.matrix
+        head = _world_head(arm, LEGS[h][2])
+        m = arm.matrix_world @ foot.matrix
+        world = Matrix.Translation(head) @ Matrix.Rotation(np.radians(err), 4, 'X') @ Matrix.Translation(-head) @ m
+        foot.matrix = arm.matrix_world.inverted() @ world
         bpy.context.view_layer.update()
-    return float(miss)
+    return boot_contacts(arm, skin)[h]
 
 
 def place_feet(arm, skin):
-    """Left boot flat on the floor, right boot's heel on the floor and ball on the damper pedal (by the leg IK targets).
-    Removes earlier versions' footrest. Returns the contact geometry and the misses."""
+    """Left boot flat on the floor, right boot's heel on the floor and its ball on the damper pedal.
+
+    The seating script removes the leg IK constraints, so this drives the bones directly: a two-bone solve puts
+    the ankle where the foot has to be, then the boot is pitched until heel and ball sit at the right heights.
+    Removes earlier versions' footrest. Returns the contact geometry and the residual miss in mm.
+    """
     for name in OLD_STAGING:
         if bpy.data.objects.get(name) is not None:
             bpy.data.objects.remove(bpy.data.objects[name])
     floor = _bounds(bpy.data.objects[FLOOR])[1][2] if bpy.data.objects.get(FLOOR) else 0.
     lo, hi = _bounds(bpy.data.objects[PIANO_DAMPER])
-    on_pedal = np.array([(lo[0] + hi[0]) / 2, lo[1] + BALL_ON_PEDAL, hi[2]])
+    pedal_top = float(hi[2])
+    pedal_x = float((lo[0] + hi[0]) / 2)
+    pedal_y = float(lo[1] + BALL_ON_PEDAL)
+    hip_y = float(_world_head(arm, '右足').y)
+    left_hip_x = float(_world_head(arm, '左足').x)
 
-    def right(heel, ball):
-        length = np.linalg.norm(ball - heel)
-        heel_to = on_pedal - [ball[0] - heel[0], np.sqrt(max(length ** 2 - (on_pedal[2] - floor) ** 2, 0.)), on_pedal[2] - floor]
-        return heel_to, on_pedal
-    misses = dict(R=_place_foot(arm, skin, 'R', right))
-    right_heel = boot_contacts(arm, skin)['R']['heel']
-
-    def left(heel, ball):
-        heel_to = np.array([heel[0], right_heel[1], floor])
-        return heel_to, heel_to + [ball[0] - heel[0], np.hypot(ball[1] - heel[1], ball[2] - heel[2]), 0.]
-    misses['L'] = _place_foot(arm, skin, 'L', left)
+    # ankle targets: x from the hip width, y from the hip (shin near vertical), z solved against the floor.
+    # The ball sits ~4 cm outboard and ~9.5 cm in front of the ankle, so aim the ankle back from the pedal.
+    spec = {
+        'L': dict(x=left_hip_x - .015, y=hip_y + .424, pitch=0.),
+        'R': dict(x=pedal_x - .042, y=pedal_y - .095, pitch=float(np.degrees(np.arctan2(pedal_top - floor, .095)))),
+    }
+    misses = {}
+    target_ball_z = {'L': float(floor), 'R': pedal_top}
+    for h in ('L', 'R'):
+        sx = SIDE[h]
+        t = np.array([spec[h]['x'], spec[h]['y'], floor + .14], float)
+        pitch = spec[h]['pitch']
+        for _ in range(6):
+            _solve_leg(arm, h, t, np.array([sx * .12, 1., .12]))
+            c = _pitch_foot(arm, skin, h, pitch)
+            dz = float(c['heel'][2]) - floor
+            t[2] -= dz                                                # heel onto the floor
+            foot_len = max(float(np.linalg.norm(c['ball'] - c['heel'])), 1e-3)
+            # Account for the dz shift already applied to t[2] so heel error isn't double-counted into pitch.
+            err = target_ball_z[h] - (float(c['ball'][2]) - dz)
+            pitch += float(np.degrees(np.arcsin(max(-.9, min(.9, err / foot_len)))))
+            if h == 'R':                                              # ball over the pedal, not just at its height
+                t[1] += pedal_y - float(c['ball'][1])
+                t[0] += pedal_x - float(c['ball'][0])
+        _solve_leg(arm, h, t, np.array([sx * .12, 1., .12]))
+        c = _pitch_foot(arm, skin, h, pitch)
+        heel, ball = c['heel'], c['ball']
+        ball_target = np.array([pedal_x, pedal_y, target_ball_z[h]]) if h == 'R' else np.array([ball[0], ball[1], target_ball_z[h]])
+        misses[h] = float(max(np.linalg.norm(heel - np.array([heel[0], heel[1], floor])),
+                              np.linalg.norm(ball - ball_target)))
     contacts = boot_contacts(arm, skin)
     contacts['floor'], contacts['miss_mm'] = floor, {h: m * 1000 for h, m in misses.items()}
+    contacts['pedal_top'] = pedal_top
     return contacts
 
 
@@ -145,7 +216,10 @@ def damper_pose(arm, skin, contacts):
     rest = (bone.location.copy(), bone.rotation_quaternion.copy())
     rest_matrix = bone.matrix.copy()
     coords, _ = mesh_world(skin)
-    near = np.flatnonzero(np.linalg.norm(coords[:, :2] - ball[:2], axis=1) < .015)
+    near = np.flatnonzero((np.linalg.norm(coords[:, :2] - ball[:2], axis=1) < .015)
+                          & (np.abs(coords[:, 2] - ball[2]) < .03))
+    if not len(near):
+        near = np.flatnonzero(np.linalg.norm(coords[:, :2] - ball[:2], axis=1) < .015)
 
     def drop(angle):
         turn = Matrix.Translation(Vector(heel)) @ Matrix.Rotation(-angle, 4, 'X') @ Matrix.Translation(-Vector(heel))
@@ -153,10 +227,14 @@ def damper_pose(arm, skin, contacts):
         bpy.context.view_layer.update()
         return ball[2] - mesh_world(skin)[0][near, 2].min()
 
-    angle = PEDAL_DEPTH / (ball[1] - heel[1])
+    angle = PEDAL_DEPTH / max(ball[1] - heel[1], 1e-3)
     for _ in range(4):                     # the drop is nearly proportional to the angle: rescale
         got = drop(angle)
-        angle *= PEDAL_DEPTH / max(got, 1e-5)
+        if got < 1e-5:                     # the foot did not move: rescaling would blow the angle up
+            print('damper: foot does not follow, press skipped', flush=True)
+            angle = 0.
+            break
+        angle = min(angle * PEDAL_DEPTH / got, float(np.radians(20.)))
     reached = drop(angle)
     pressed = (bone.location.copy(), bone.rotation_quaternion.copy())
     bone.location, bone.rotation_quaternion = rest
@@ -181,8 +259,14 @@ def animate_damper(arm, skin, contacts, frames, depth, intervals, fps, write_cur
     _pivot_origin(piano, ((lo[0] + hi[0]) / 2, hi[1], (lo[2] + hi[2]) / 2))
     piano.rotation_mode = 'XYZ'
     rest_x = piano.rotation_euler.x
-    # its tip points at the player (-y), so the same press is the opposite turn
-    write_curve(piano, 'rotation_euler', frames, rest_x + depth[:, 0] * PEDAL_DEPTH / (hi[1] - lo[1]), index=0)
+    # its tip points at the player (-y), so the same press is the opposite turn; divide by the real contact lever arm
+    lever = max(float(hi[1] - (lo[1] + BALL_ON_PEDAL)), 0.02)
+    write_curve(piano, 'rotation_euler', frames, rest_x + depth[:, 0] * PEDAL_DEPTH / lever, index=0)
+    from thumb_driver import animation_curves
+    if piano.animation_data and piano.animation_data.action:
+        for curve in list(animation_curves(piano)):
+            if curve.data_path == '["damper"]':
+                curve.keyframe_points.clear()
     piano['damper'] = 0.
     piano.keyframe_insert(data_path='["damper"]', frame=1)
     for begin, end in intervals:
@@ -191,7 +275,6 @@ def animate_damper(arm, skin, contacts, frames, depth, intervals, fps, write_cur
         if np.isfinite(end):
             piano['damper'] = 0.
             piano.keyframe_insert(data_path='["damper"]', frame=1 + end * fps)
-    from thumb_driver import animation_curves
     for curve in animation_curves(piano):
         if curve.data_path == '["damper"]':
             for point in curve.keyframe_points:

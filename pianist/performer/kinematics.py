@@ -12,6 +12,7 @@ those four values only, never on the wrist, so finger and wrist solve separately
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,10 @@ import numpy as np
 # Every array of the solve is float32 (Blender stores poses and keys as float32 too). Steps, tolerances
 # and the Jacobians are chosen for it (pose.PoseSolver._levenberg_marquardt, fast_settle).
 FLOAT = np.float32
-CALIBRATION = Path(__file__).resolve().parents[1] / 'hand_calibration.json'
+# Another rig needs its own per-digit pad ids, hinge axes and rest angles: rig.json stamps the calibration hash,
+# but the finger rows themselves are still read here. The env override keeps that pairing explicit.
+CALIBRATION = Path(os.environ.get('PIANOMOTION_HAND_CALIBRATION') or
+                   Path(__file__).resolve().parents[1] / 'hand_calibration.json')
 
 # 针对当前模型与观感调的参数；换模型需微调（髋宽倍数）。
 LAP_FROM_SURFACE = dict(inward=.10574, forward=.05151, down=.13620)

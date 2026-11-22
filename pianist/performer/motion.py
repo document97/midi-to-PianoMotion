@@ -170,8 +170,10 @@ PIP_POSTURE_SCALE = float(os.environ.get('PIANOMOTION_PIP_POSTURE', 2.5))  # deg
 
 
 def posture_flat(digit):
-    """The bands as one flat array for the compiled ride (lo, hi per joint); None becomes an unreachable bound."""
-    return tuple(x for lo, hi in POSTURE_BANDS[digit]
+    """The bands for joints 1..3 as one flat array for the compiled ride (lo, hi per joint; sideways joint 0 is
+    free, matching posture_residual and fast_settle.ride_residuals's ``scales[4 + 2*(j-1)]``); None becomes an
+    unreachable bound."""
+    return tuple(x for lo, hi in POSTURE_BANDS[digit][1:]
                  for x in (-1e4 if lo is None else lo, 1e4 if hi is None else hi))
 
 
@@ -230,10 +232,13 @@ LAP_TUCK = {1: np.array([0., 0., 12., 24.], dtype=FLOAT),
             4: np.array([0., 0., 16., 40.], dtype=FLOAT),
             5: np.array([0., 0., 16., 40.], dtype=FLOAT)}
 LAP_TUCK_SECONDS = .30           # the group curl is in during the crisp lift (it starts at the draw's end)
-LAP_TUCK_MIN_LIFT = .028         # m: the curl waits until the wrist has risen this far off the lap. Curling while
+LAP_TUCK_MIN_LIFT = .075         # m: the curl waits until the wrist has risen this far off the lap. Curling while
                                  # the palm still lies on the thigh drives the fingertips down into the leg (measured
-                                 # on canonpd: a full curl at 5 mm lift sank the pads 7.4 mm; at ~30 mm it clears).
+                                 # on canonpd: a full curl at 5 mm lift sank the pads 7.4 mm; at ~30 mm it cleared).
                                  # Geometric, not a clock: any hand leaving any lap must clear it before it folds.
+                                 # Raised to 75 mm for the Furina body: its fingers are ~40 % longer than canonpd's,
+                                 # so a 40 deg curl drops the thumb tip that much further -- 28 mm still buried the
+                                 # opening right thumb 13.7 mm into the thigh (measured on the 6 s slice).
 FLOOR_RAMP = .015                # the key floor phases in over a stroke: lowered this much at the key (m)
 SPACING_SHARE = .85              # free fingers keep this share of the relaxed fingertip spacing from their neighbours
 SPACING_SOFTNESS = .002          # smooth maximum width (m)
@@ -589,8 +594,10 @@ def lap_arrival(path, rest, clear=OUTRO_UNFOLD_CLEAR):
     rest = np.asarray(rest, dtype=float)
     ts = np.linspace(t0, t1, 241)
     z = np.array([path(t)[2] for t in ts], dtype=float)
-    below = np.nonzero(z <= rest[2] + clear)[0]
-    return float(ts[below[0]]) if len(below) else None
+    # Scan only after the return's highest point so a low keyboard / high thigh cannot match at t0.
+    apex = int(np.argmax(z))
+    below = np.nonzero(z[apex:] <= rest[2] + clear)[0]
+    return float(ts[apex + below[0]]) if len(below) else None
 
 
 def strike_lift(a, b, notes, free, keep, travel):
@@ -1009,8 +1016,8 @@ def chunked(A, b, lo, hi, x0=None, dirty=None):
         if i0 > 0:
             lo_w[:3] = hi_w[:3] = x[i0:i0 + 3]
         sol = bounded_lsq(A[rows][:, i0:i1].toarray(), b[rows], lo_w, np.maximum(hi_w, lo_w + 1e-12))
-        if warm and not stop and i0 > dirty[1] and np.abs(sol[:3] - x[i0:i0 + 3]).max() < 1e-9:
-            return x                    # the carry-over is the earlier answer's: the rest is that answer too
+        if warm and not stop and i0 > dirty[1] and np.abs(sol[:3] - x0[i0:i0 + 3]).max() < 1e-9:
+            return x                    # the carry-over matches the earlier answer: the rest is that answer too
         x[i0:i1 if stop else i0 + keep] = sol[:(i1 - i0) if stop else keep]
         if stop:
             return x
@@ -1105,7 +1112,7 @@ def wrist_path(anchors, notes, strokes, rest, duration, t_start=0., leave_overri
     p_lift = rest.copy()
     p_lift[0] += side * REST_DRAW_OUT * .4
     p_lift[1] -= REST_DRAW_BACK * .5
-    p_lift[2] = REST_LIFT_MID_Z
+    p_lift[2] = max(REST_LIFT_MID_Z, p_draw[2] + .035)
     # The wrist the playing solve actually HOLDS once this hand's intro is over: its depth family settles
     # where the first figure wants it, up to a couple of centimetres off the anchor's raw pose. Seating the
     # hand on anything else means a one-frame yank at the handover (the hand arrives, then jumps to where
@@ -1115,7 +1122,7 @@ def wrist_path(anchors, notes, strokes, rest, duration, t_start=0., leave_overri
     p_poke = rest.copy()
     p_poke[0] += (hold[0] - rest[0]) * REST_HOVER_OUT
     p_poke[1] -= REST_POKE_FWD
-    p_poke[2] = REST_HOVER_HEIGHT
+    p_poke[2] = max(REST_HOVER_HEIGHT, p_lift[2] + .045)
     p_reach = hold.copy()
     p_reach[:3] += np.asarray(REST_REACH_FROM_KEY, dtype=FLOAT)
     # The fall is ONE shallow sail: the hand keeps drifting forward the whole way (linear share, eased by
@@ -1152,7 +1159,10 @@ def wrist_path(anchors, notes, strokes, rest, duration, t_start=0., leave_overri
                 skip.update(range(i + 1, j))  # the apex round spans several dense sail samples
                 a0, b0 = points[i - 1, :3] - p[:3], points[j, :3] - p[:3]
                 la, lb = np.linalg.norm(a0), np.linalg.norm(b0)
-                r = min(.020, .5 * la, .5 * lb)
+                if la < 1e-6 or lb < 1e-6:
+                    rounded.append(p)
+                    continue
+                r = min(.020, .45 * la, .45 * lb)
                 a, b = p.copy(), p.copy()
                 a[:3] += a0 * (r / la)
                 b[:3] += b0 * (r / lb)
@@ -1163,7 +1173,11 @@ def wrist_path(anchors, notes, strokes, rest, duration, t_start=0., leave_overri
             else:
                 rounded.append(p)
         rounded.append(points[-1])
-        points_r = np.asarray(rounded)
+        dedup = [rounded[0]]
+        for pt in rounded[1:]:
+            if np.linalg.norm(pt[:3] - dedup[-1][:3]) > 1e-6:
+                dedup.append(pt)
+        points_r = np.asarray(dedup)
         chord = np.r_[0., np.cumsum(np.linalg.norm(np.diff(points_r[:, :3], axis=0), axis=1))]
         chord /= chord[-1]
         spatial = CubicSpline(chord, points_r, axis=0, bc_type='natural')
@@ -1216,11 +1230,11 @@ def wrist_path(anchors, notes, strokes, rest, duration, t_start=0., leave_overri
         p_up = rest.copy()
         p_up[0] += side * REST_DRAW_OUT * .6
         p_up[1] -= REST_QUIET_CLEAR + .004
-        p_up[2] = REST_LIFT_MID_Z
+        p_up[2] = max(REST_LIFT_MID_Z, p_off[2] + .035)
         p_top = rest.copy()
         p_top[0] += side * REST_DRAW_OUT * .8
         p_top[1] -= REST_QUIET_CLEAR + .004
-        p_top[2] = REST_QUIET_APEX
+        p_top[2] = max(REST_QUIET_APEX, p_up[2] + .035)
         pts = [rest, p_off, p_up, p_top]
         for x in np.linspace(0., 1., 11)[1:-1]:
             pt = p_top.copy()
@@ -2370,8 +2384,15 @@ def frame_hand(t, path, tracks, notes, waypoints, solver, ik, depths=None, previ
     # key clearance and neighbour gaps both read the hand under the keybed and would curl it back up). At both
     # ends of the piece -- before the first stroke and after the closing gesture lands -- the hand is at rest,
     # so the two gates must bracket the playing exactly alike (the user's spec: land as the intro began).
+    # Aggregate rest gates across all active digits (not only digit 1 / thumb).
     t0 = tracks[DIGITS[0]]
-    if (t0.rest_start is not None and t <= t0.rest_start) or (t0.rest_end is not None and t >= t0.rest_end):
+    active_starts = [tracks[d].rest_start for d in DIGITS if tracks[d].strokes and tracks[d].rest_start is not None]
+    if not active_starts:
+        active_starts = [tracks[d].rest_start for d in DIGITS if tracks[d].rest_start is not None]
+    rest_start = min(active_starts) if active_starts else None
+    rest_ends = [tracks[d].rest_end for d in DIGITS if tracks[d].rest_end is not None]
+    rest_end = min(rest_ends) if rest_ends else None
+    if (rest_start is not None and t <= rest_start) or (rest_end is not None and t >= rest_end):
         return vector, values, error
     room = ik.spacing.make_room(values, {d: give_way(tracks[d].stroke(t), t) for d in DIGITS})
     if apply_room:

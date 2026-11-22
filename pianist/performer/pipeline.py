@@ -15,9 +15,17 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
+import sys
 import time
+
+# Windows spawn otherwise picks sys._base_executable. For a venv (ComfyUI here) that is the base Python, so the
+# pool silently ran under a second interpreter without numba. Pin every worker to the interpreter running this
+# module: one Python for the parent, the planner and all workers.
+if sys.platform == 'win32':
+    mp.set_executable(sys.executable)
 
 import numpy as np
 
@@ -101,10 +109,16 @@ CHUNKS_PER_WORKER = 4
 REFINE_ROUNDS = 2                 # wrist path -> contact check -> intermediate poses (Daylight: after 1 round L 18 checks >8 mm, after 2 10; the 2nd round ~30 s)
 SPIKE_ERROR = .005                # pad error above which a short run of frames is replaced by its neighbours
 SPIKE_FRAMES = 4
-SPIKE_LEAVE = .08                 # rad of finger travel into a frame that marks a candidate flicker run
-SPIKE_JUMP = .07                  # rad: how far off the trajectory the run must go before it is worth bridging
+SPIKE_LEAVE = 4.6                 # deg of finger travel into a frame that marks a candidate flicker run (~0.08 rad)
+SPIKE_JUMP = 4.0                  # deg: how far off the trajectory the run must go before it is worth bridging (~0.07 rad)
 
 _ctx = {}
+
+
+def _pick_time(obj, attr, default):
+    """Read an optional timestamp attribute without treating exact 0.0 as missing."""
+    v = getattr(obj, attr, None)
+    return default if v is None else v
 
 
 def _init(context):
@@ -134,13 +148,13 @@ def _init(context):
         _configure_closing()
 
 
-def _closing_palm(path, t):
+def _closing_palm(path, t, lap=LAP_PITCH):
     """Gentle release of the playing plane; compact FINGERS, not a wrist snap, provide clearance."""
     from .motion import OUTRO_TUCK_SECONDS, ease
     start = float(path.trip_outro) + OUTRO_TUCK_SECONDS
-    end = getattr(path, 'trip_outro_touch', None) or path.trip_outro_land
+    end = _pick_time(path, 'trip_outro_touch', path.trip_outro_land)
     w = ease(float(np.clip((t - start) / max(end - start, 1e-6), 0., 1.)))
-    return PALM_PITCH * (1. - w) + LAP_PITCH * w
+    return PALM_PITCH * (1. - w) + lap * w
 
 
 def _configure_closing():
@@ -159,7 +173,7 @@ def _configure_closing():
         start = getattr(path, 'trip_outro', None)
         if start is None:
             continue
-        end = getattr(path, 'trip_outro_touch', None) or path.trip_outro_land
+        end = _pick_time(path, 'trip_outro_touch', path.trip_outro_land)
         tuck_end = start + OUTRO_TUCK_SECONDS
         if end <= tuck_end:
             continue
@@ -198,9 +212,10 @@ def _configure_closing():
         # existing key-clearance lead, not a scene-time constant. Final unfolding ends ABOVE the thigh.
         times = np.linspace(tuck_end, end, max(2, int(np.ceil((end - tuck_end) * FRAME_RATE)) + 1))
         unfold = end - 1. / FRAME_RATE
+        lap_h = (_ctx.get('lap_pitch') or {}).get(h, LAP_PITCH)
         for t in times:
             v = path(t)
-            wrist = rig.arms[h].arm_inverse @ _ctx['solvers'][h].palm(v[:3], v[3], v[4], _closing_palm(path, t))
+            wrist = rig.arms[h].arm_inverse @ _ctx['solvers'][h].palm(v[:3], v[3], v[4], _closing_palm(path, t, lap=lap_h))
             points = np.concatenate([rig.clearance_points(h, d, wrist, gathered) for d in DIGITS])
             # Reserve 4 raster cells: the real fractional-frame mesh consumed the first two during
             # unfolding (1.4 mm residual in the diagnostic). This moves only the departure clock.
@@ -625,7 +640,7 @@ def _frames(times):
                      if swing is not None and h in swing else None)
             try:
                 pose_r = rig.arms[h].pose(rest_v[:3], rest_v[3], rest_v[4], pre_r, phi_r,
-                                          pitch=LAP_PITCH)
+                                          pitch=(_ctx.get('lap_pitch') or {}).get(h, LAP_PITCH))
             except ValueError:
                 continue
             lap_ref[h] = {d: float(rig.clearance_points(h, d, pose_r['armature'], rest_values)[:, 2].min())
@@ -637,12 +652,7 @@ def _frames(times):
     # lateral travel, scaled to the leg surface's measured travel (0.91 of the seat's: the rest is the lean).
     # The opening seat is the reference -- lap_contact's fit was measured there, so at delta=0 the pads match.
     torso_f = _ctx['torso']
-    if torso_f is None or not torso_f.slide_max:
-        slide_base = 0.
-    else:
-        # The opening seat = first value of the slide curve (what the closing eases back to). Independent of
-        # which chunk of ``times`` this worker got -- using times[0] here would differ per parallel chunk.
-        slide_base = float(torso_f._slide_curve()[1][0])
+    slide_base = 0. if torso_f is None else torso_f.opening_slide()
     out = dict(times=np.asarray(times), torso=np.zeros((n, 4)), key_depth=np.zeros((n, len(pitches))))
     out.update({f'{h}_collar_q': np.zeros((n, 4)) for h in 'LR'}, slide=np.zeros((n, 3)))
     spine_names = [] if _ctx['torso'] is None else [b['bone'] for b in _ctx['torso'].spine] + [_ctx['torso'].neck['bone']]
@@ -670,20 +680,21 @@ def _frames(times):
     # The intro palm is one continuous angular curve, not a chain of ease-to-zero stages. Only the true
     # endpoints and genuine reversals have zero angular speed; interior marks never dwell. Monotone cubic
     # slopes keep the hang and tension peaks inside their specified angles (no cubic overshoot past +30).
+    rest_pitch = _ctx.get('lap_pitch') or {h: LAP_PITCH for h in 'LR'}
     intro_pitch = {}
     for h in 'LR':
         path_h = _ctx['paths'][h]
         leave_h = getattr(path_h, 'trip_leave', None)
         if leave_h is None:
             continue
-        de = getattr(path_h, 'trip_draw_end', None) or leave_h + .30
-        top = getattr(path_h, 'trip_lift_end', None) or de + .45
-        tlt = getattr(path_h, 'trip_tilt_end', None) or top + .33
-        red = getattr(path_h, 'trip_reach_end', None) or tlt + 1.5
+        de = _pick_time(path_h, 'trip_draw_end', leave_h + .30)
+        top = _pick_time(path_h, 'trip_lift_end', de + .45)
+        tlt = _pick_time(path_h, 'trip_tilt_end', top + .33)
+        red = _pick_time(path_h, 'trip_reach_end', tlt + 1.5)
         mid = (de + top) * .5
         quiet = tlt <= top + 1e-6
         kt = [de, mid, top] + ([] if quiet else [tlt]) + [red]
-        kv = [LAP_PITCH, HANG_PITCH, FLAT_PITCH] + ([] if quiet else [TILT_PITCH]) + [PALM_PITCH]
+        kv = [rest_pitch[h], HANG_PITCH, FLAT_PITCH] + ([] if quiet else [TILT_PITCH]) + [PALM_PITCH]
         kt, kv = np.asarray(kt), np.asarray(kv)[:, None]
         slopes = pchip_slopes(kt, kv)
         grid = np.linspace(de, red, max(121, int(np.ceil((red - de) * 120))))
@@ -696,11 +707,11 @@ def _frames(times):
         out_h = getattr(_ctx['paths'][h], 'trip_outro', None)
         if out_h is None:
             continue
-        land_h = getattr(_ctx['paths'][h], 'trip_outro_land', None) or out_h + OUTRO_T - OUTRO_HOLD
+        land_h = _pick_time(_ctx['paths'][h], 'trip_outro_land', out_h + OUTRO_T - OUTRO_HOLD)
         # The palm must be flat on the lap by the time the hand TOUCHES it, not by the gesture's nominal end:
         # the last stretch of the return is a slow slide along the leg, so a palm still drooping there puts
         # the fingertips a couple of millimetres into the thigh for a few tenths of a second.
-        touch_h = getattr(_ctx['paths'][h], 'trip_outro_touch', None) or land_h
+        touch_h = _pick_time(_ctx['paths'][h], 'trip_outro_touch', land_h)
         # Hold the playing plane while the gathered fingers back off from the keys, then reach the deep
         # HANG_PITCH BEFORE the wrist sinks into the key-front band. The palm must cross the dangerous
         # -14..-19 deg band while the wrist is still high (z~0.78, which is clip-free), NOT a moment later
@@ -712,7 +723,7 @@ def _frames(times):
         flat_at = out_h + .91 * (touch_h - out_h)
         tt = np.maximum.accumulate(np.asarray([out_h, hold_at, droop_at, max(droop_at + .04, flat_at),
                                                max(flat_at + .04, touch_h)], float) + np.arange(5) * 1e-3)
-        vv = np.asarray([[PALM_PITCH], [PALM_PITCH], [HANG_PITCH], [HANG_PITCH], [LAP_PITCH]], float)
+        vv = np.asarray([[PALM_PITCH], [PALM_PITCH], [HANG_PITCH], [HANG_PITCH], [rest_pitch[h]]], float)
         mm = pchip_slopes(tt, vv)
         grid = np.linspace(tt[0], tt[-1], max(121, int(np.ceil((tt[-1] - tt[0]) * 120))))
         outro_pitch[h] = (grid[0], grid[-1], grid, np.asarray([hermite_eval(tt, vv, mm, t)[0] for t in grid]))
@@ -747,12 +758,16 @@ def _frames(times):
             # share) only while this hand is on the lap, fading in over LAP_SLIDE_FADE around the landing so
             # the return itself is untouched. A hand playing the keys keeps its world-fixed wrist.
             rest_slide = None
+            path_h = _ctx['paths'][h]
+            leave_h = getattr(path_h, 'trip_leave', None)
             if slide is not None:
-                t1 = tracks[h][DIGITS[0]]
-                before = min(1., max(0., (getattr(t1, 'rest_start', None) - t) / LAP_SLIDE_FADE + 1.)) \
-                    if getattr(t1, 'rest_start', None) is not None else 0.
-                after = min(1., max(0., (t - t1.rest_end) / LAP_SLIDE_FADE + 1.)) \
-                    if getattr(t1, 'rest_end', None) is not None else 0.
+                # Follow the seat's slide only while resting on the lap, fading out over LAP_SLIDE_FADE after lift-off
+                # (well before reaching the keys) and fading in as the hand returns to the thigh.
+                before = 1. if leave_h is None else min(1., max(0., 1. - (t - leave_h) / LAP_SLIDE_FADE))
+                rest_ends = [getattr(tracks[h][d], 'rest_end', None) for d in DIGITS]
+                rest_ends = [re for re in rest_ends if re is not None]
+                rest_end_h = min(rest_ends) if rest_ends else None
+                after = min(1., max(0., (t - rest_end_h) / LAP_SLIDE_FADE + 1.)) if rest_end_h is not None else 0.
                 follow = max(before, after)
                 if follow > 0.:
                     rest_slide = np.array([LAP_SLIDE_FOLLOW * (float(slide[0]) - slide_base) * follow, 0., 0.])
@@ -764,22 +779,20 @@ def _frames(times):
             # One continuous palm curve: the draw stays on the lap plane; then hang, flatten, the optional
             # tension peak and the playing plane are blended without ease-to-zero stops at each mark.
             pitch = None
-            path_h = _ctx['paths'][h]
-            leave_h = getattr(path_h, 'trip_leave', None)
             if h in outro_pitch and t >= outro_pitch[h][0]:
                 # closing gesture: the palm eases from the playing plane back to the lap, in step with
                 # the wrist's single continuous return (no palm still pointing at the keys on the lap).
                 _, _, o_t, o_v = outro_pitch[h]
                 if getattr(tracks[h][DIGITS[0]], 'outro_gathered', None) is not None:
-                    pitch = _closing_palm(path_h, t)
+                    pitch = _closing_palm(path_h, t, rest_pitch[h])
                 else:
                     pitch = float(np.interp(t, o_t, o_v))
             elif leave_h is not None:
                 if t <= leave_h or h not in intro_pitch:
-                    pitch = LAP_PITCH
+                    pitch = rest_pitch[h]
                 else:
                     de, top, pitch_t, pitch_v = intro_pitch[h]
-                    pitch = LAP_PITCH if t < de else float(np.interp(t, pitch_t, pitch_v))
+                    pitch = rest_pitch[h] if t < de else float(np.interp(t, pitch_t, pitch_v))
                     if de < t < top:             # low-hand peel: clearance has priority over the ideal curve
                         z = float(path_h(t)[2])
                         free = math.degrees(math.asin(min(1., max(0., (z - PEEL_SKIN - .004) / PEEL_REACH))))
@@ -788,7 +801,7 @@ def _frames(times):
             # nor outro_pitch exists for it). Set the SAME value used below by arm.pose, so the recorded
             # pitch and the mesh agree (native_check's pad difference stays at its normal baseline).
             if pitch is None:
-                pitch = LAP_PITCH
+                pitch = rest_pitch[h]
             # The palm's pendulum. In free time the hand turns up a few degrees on the rise and gives them back
             # on the way down (the wrist's slight effort, the hand's own inertia) -- keyed to the same up-and-back
             # the wrist does, not a vibration, and never while a finger is down: a palm turning under a held
@@ -827,15 +840,21 @@ def _frames(times):
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
                 out[f'{h}_arm_world'][i] = [pose['shoulder'], pose['elbow']]
                 out[f'{h}_palm_deg'][i] = pose['palm_forearm_deg']
-            except ValueError:          # wrist beyond the unstretched arm
+            except ValueError:          # wrist beyond the unstretched arm (or too close to shoulder)
                 # Never leave the arm's rotations at zero (Blender collapses such a bone and the arm vanishes):
-                # stretch the arm toward the wrist instead; the hand stops just short of where it was sent.
+                # clamp wrist distance inside (|l1-l2|, l1+l2) along the shoulder->wrist ray, preserving phi.
                 out[f'{h}_arm_ok'][i] = False
                 shoulder_pre = arm.pre_upper_world if pre is None else pre[h]
                 reach = shoulder_pre[:3, 3]
                 aim = np.asarray(vector[:3], float) - reach
-                stretched = reach + aim * (ARM_STRETCH * (arm.l1 + arm.l2) / np.linalg.norm(aim))
-                pose = arm.pose(stretched, vector[3], vector[4], shoulder_pre, pitch=pitch)
+                dist = float(np.linalg.norm(aim))
+                direction = (aim / dist) if dist > 1e-6 else np.array([0., 1., 0.])
+                lo_d = abs(arm.l1 - arm.l2) + 0.002
+                hi_d = ARM_STRETCH * (arm.l1 + arm.l2)
+                clamped_d = min(max(dist, lo_d), hi_d)
+                stretched = reach + direction * clamped_d
+                pose = arm.pose(stretched, vector[3], vector[4], shoulder_pre, phi, pitch=pitch)
+                out[f'{h}_wrist'][i, :3] = stretched
                 out[f'{h}_arm_q'][i] = [pose['local'][arm.names[k]] for k in ('upper', 'elbow', 'wrist', 'twist')]
                 out[f'{h}_arm_world'][i] = [pose['shoulder'], pose['elbow']]
                 out[f'{h}_palm_deg'][i] = pose['palm_forearm_deg']
@@ -962,31 +981,33 @@ def despike(frames):
         # three frames). A landing only counts when the motion settles afterwards (a trill lands too, and
         # keeps going).
         values = frames[f'{h}_values']
+        land_slack = math.degrees(.04)
         i = 5
         while i < n - 2:
             slope = values[i - 1] - values[i - 2]
-            offs = np.arange(-4, SPIKE_FRAMES + 2)[:, None, None]
+            # offs[0..3] = -4..-1 (frames i-5..i-2), offs[4] = 0 (frame i-1), offs[5] = +1 (frame i), ...
+            offs = np.arange(-4, SPIKE_FRAMES + 3)[:, None, None]
             pred = values[i - 1] + offs * slope[None]          # the trajectory's forecast, before and after i
             back = float(np.abs(values[i - 5:i - 1] - pred[:4]).max())   # was the trajectory quiet before?
-            dev0 = float(np.abs(values[i] - pred[4]).max())
+            dev0 = float(np.abs(values[i] - pred[5]).max())
             if dev0 < SPIKE_LEAVE or back >= SPIKE_LEAVE:
                 i += 1
                 continue
             cap = min(i + SPIKE_FRAMES, n - 2)
             j = i
             while j < cap:
-                land = float(np.abs(values[j + 1] - pred[4 + (j + 1 - i)]).max())
+                land = float(np.abs(values[j + 1] - pred[5 + (j + 1 - i)]).max())
                 quiet = float(np.abs(values[j + 2] - values[j + 1]).max())
-                if dev0 > SPIKE_JUMP and land < .55 * dev0 + .04 and quiet < SPIKE_LEAVE:
+                if dev0 > SPIKE_JUMP and land < .55 * dev0 + land_slack and quiet < SPIKE_LEAVE:
                     break           # landed back on a quiet trajectory: a flicker, not a trill or a flight
                 j += 1
-                dev0 = max(dev0, float(np.abs(values[j] - pred[4 + (j - i)]).max()))
+                dev0 = max(dev0, float(np.abs(values[j] - pred[5 + (j - i)]).max()))
             if j < cap:
-                land = float(np.abs(values[j + 1] - pred[4 + (j + 1 - i)]).max())
+                land = float(np.abs(values[j + 1] - pred[5 + (j + 1 - i)]).max())
                 quiet = float(np.abs(values[j + 2] - values[j + 1]).max())
             else:
-                land, quiet = 1., 1.
-            if j < cap and dev0 > SPIKE_JUMP and land < .55 * dev0 + .04 and quiet < SPIKE_LEAVE:
+                land, quiet = 1e9, 1e9
+            if j < cap and dev0 > SPIKE_JUMP and land < .55 * dev0 + land_slack and quiet < SPIKE_LEAVE:
                 w = ((np.arange(i, j + 1) - (i - 1)) / (j - i + 2))
                 for key in ('values', 'root_q', 'child_euler'):
                     aa, bb = frames[f'{h}_{key}'][i - 1], frames[f'{h}_{key}'][j + 1]
@@ -1274,13 +1295,17 @@ def run(args):
                                                    keys=False), dtype=float)
         orientation[0] += REST_YAW * (1. if h == 'R' else -1.)
         rest[h] = np.r_[wrist, orientation]
+    lap_pitch = {h: LAP_PITCH for h in 'LR'}
     if LAP_CONTACT:
         # The lap point is a point on the thigh, and the hand laid flat on it neither fits the slope nor stays out
         # of it: the little finger sinks, the index finger hangs. The fitted place and finger shape (lap_contact,
         # measured on this seat) put every pad on the leg.
-        from .lap_contact import place
+        from .lap_contact import place, pitch as lap_pitch_of
         for h in 'LR':
-            place(rest, h)
+            place(rest, h, rig)
+            # The palm's own plane. LAP_PITCH is the development body's flat lap; a body whose thigh falls
+            # toward the knee needs its own angle, or the hand touches at the wrist and lifts at the fingers.
+            lap_pitch[h] = float(lap_pitch_of(h, rig))
         print('[lap contact] wrist %s roll %s' % (
             {h: [round(float(v) * 1000., 1) for v in rest[h][:3] - np.array(rig.data['hands'][h]['lap'], dtype=float)]
              for h in 'LR'}, {h: round(float(rest[h][4]), 1) for h in 'LR'}), flush=True)
@@ -1478,19 +1503,48 @@ def run(args):
     by_pitch = {}
     for n in notes.values():
         by_pitch.setdefault(n.pitch, []).append(n)
-    context = dict(base, paths=paths, waypoints=waypoints, torso_rows=(torso_rows, first, last, reach_rows), by_pitch=by_pitch)
+    context = dict(base, paths=paths, waypoints=waypoints, torso_rows=(torso_rows, first, last, reach_rows),
+                   by_pitch=by_pitch, lap_pitch=lap_pitch)
 
-    # The closing gesture returns the seat to its opening place so the resting hands meet the thighs in the same
-    # seat as the intro's first frame (wrist, pitch, torso AND slide aligned). Set unconditionally: the frame
-    # workers rebuild their own Torso in _init and read this there, whether or not the elbow solve loaded a trunk
-    # (a short tail clip often has no trunk model). Carried through the dump for the diagnostic scripts too.
+    # The closing gesture returns the seat to its opening place once the LAST playing hand begins its return
+    # (never earlier: if one hand finishes long before the other, the seat stays with the soloing hand).
     if rig.data.get('torso'):
         _out_start = [getattr(paths[h], 'trip_outro', None) for h in 'LR']
         _out_land = [getattr(paths[h], 'trip_outro_land', None) for h in 'LR']
         if any(t is not None for t in _out_start) and any(t is not None for t in _out_land):
-            context['torso_slide_return'] = (min(t for t in _out_start if t is not None),
+            context['torso_slide_return'] = (max(t for t in _out_start if t is not None),
                                              max(t for t in _out_land if t is not None))
             print('[closing] seat returns to opening place at %.2f..%.2f' % context['torso_slide_return'], flush=True)
+        # Intro & closing torso sway computed unconditionally before elbows.solve so elbows, attitude and _frames
+        # all see the exact same spine/shoulder trajectory (whether or not trunk.json or reaim is enabled).
+        if context.get('torso_rows'):
+            opener = min('LR', key=lambda h: abs(_pick_time(paths[h], 'trip_land', 1e9) - intro_land_path))
+            lv = getattr(paths[opener], 'trip_leave', None)
+            if lv is not None:
+                de = _pick_time(paths[opener], 'trip_draw_end', lv + .30)
+                top = _pick_time(paths[opener], 'trip_lift_end', de + .45)
+                tlt = _pick_time(paths[opener], 'trip_tilt_end', top + .30)
+                red = _pick_time(paths[opener], 'trip_reach_end', tlt + 1.15)
+                sw_t = np.array([lv - 1., lv, de, top, tlt, red, red + 1.2, red + 3.2], dtype=float)
+                sw_t = np.maximum.accumulate(sw_t + np.arange(len(sw_t)) * 1e-3)
+                context['torso_sway'] = (sw_t,
+                                         np.array([0., 0., 1.2, 1.8, .9, -2.5, -1.2, 0.], dtype=float))
+                print('[torso sway] back 1.8 deg at the poke, forward 2.5 deg at the reach', flush=True)
+            if any(t is not None for t in _out_start) and any(t is not None for t in _out_land):
+                s0 = max(t for t in _out_start if t is not None)
+                s1 = max(t for t in _out_land if t is not None)
+                out_t = np.asarray([s0 - .35, s0 + .30, s1], float)
+                out_v = np.asarray([0., 1.4, 0.], float)
+                if context.get('torso_sway') is not None:
+                    old_t, old_v = context['torso_sway']
+                    if old_t[-1] >= out_t[0]:
+                        grid = np.unique(np.r_[old_t, out_t])
+                        context['torso_sway'] = (grid, np.interp(grid, old_t, old_v) + np.interp(grid, out_t, out_v))
+                    else:
+                        context['torso_sway'] = (np.r_[old_t, out_t], np.r_[old_v, out_v])
+                else:
+                    context['torso_sway'] = (out_t, out_v)
+                print('[torso sway] closing straightens 1.4 deg', flush=True)
 
     # 4.5 elbows: one smooth swing-angle curve per arm that keeps them out of the trunk's outline (elbows.solve,
     # the trunk.json export beside the rig), the body leaning less where no swing clears; the frames stage
@@ -1499,11 +1553,16 @@ def run(args):
     context['elbow_swing'], context['torso_cap'], context['torso_yield'] = None, None, None
     context['torso_slide_yield'] = None
     elbows_report = {}
+    torso = None
     if rig.data.get('torso') and context.get('torso_rows'):
+        torso = Torso(rig.data['torso'], rig.arms)
+        torso.set_notes(*context['torso_rows'])
+        if context.get('torso_sway') is not None:
+            torso.set_sway(*context['torso_sway'])
+        if context.get('torso_slide_return') is not None:
+            torso.set_slide_return(*context['torso_slide_return'])
         trunk_model = elbows.load(RIG)
         if trunk_model is not None:
-            torso = Torso(rig.data['torso'], rig.arms)
-            torso.set_notes(*context['torso_rows'])
             dump = os.environ.get('PIANOMOTION_ELBOW_DUMP')   # dev hook: the elbow solve's own inputs, for the bench
             if dump:
                 import pickle
@@ -1512,7 +1571,7 @@ def run(args):
                                 fh, protocol=4)
                 print(f'[elbows] dumped {dump}', flush=True)
             context['elbow_swing'], elbows_report = elbows.solve(torso, paths, -intro, duration, rig, trunk_model,
-                                                                 solvers=performer_solvers(rig))
+                                                                 solvers=performer_solvers(rig), workers=workers)
             context['elbow_swing_slopes'] = {h: pchip_slopes(c['times'], c['angles'][:, None])
                                              for h, c in context['elbow_swing'].items()}
             context['torso_cap'] = torso.cap           # the yield the solve asked (the workers' torso reads it)
@@ -1550,8 +1609,11 @@ def run(args):
         # keys are kept, which turning the yaw alone does not (measured: 17 deg at a fixed wrist, fingers 49 mm off).
         t0 = time.perf_counter()
         inserted = 0
+        want_cached = None
         for att_round in range(ATT_ROUNDS):
-            want = attitude.targets(paths, context['elbow_swing'], torso, posture_solvers, -intro, duration, ATT_STEP)
+            want = attitude.targets(paths, context['elbow_swing'], torso, posture_solvers, -intro, duration,
+                                    ATT_STEP, workers=workers)
+            want_cached = want
             new = []
             for h in 'LR':
                 times_h, yaw_h, roll_h = want[h]
@@ -1608,6 +1670,7 @@ def run(args):
             anchors = anchors + kept
             inserted += len(kept)
             paths, waypoints = rebuild(anchors)
+            want_cached = None
             print(f'[attitude] round {att_round + 1}: {len(kept)} of {len(new)} anchors settle on the placed elbow',
                   flush=True)
         if inserted:
@@ -1616,7 +1679,8 @@ def run(args):
         # too (a folded wrist in the air reads as a stiff hand), smoothed and rate-limited, the playing frames
         # untouched.
         if APPLY_IDLE:
-            want = attitude.targets(paths, context['elbow_swing'], torso, posture_solvers, -intro, duration, ATT_STEP)
+            want = want_cached if want_cached is not None else attitude.targets(
+                paths, context['elbow_swing'], torso, posture_solvers, -intro, duration, ATT_STEP, workers=workers)
             from .motion import KeyFloor
             # the wrist rides ~4 cm above the white keys' top when playing and sits below it on the lap, so the
             # line between (the key tops themselves) splits resting from aiming on any seat height
@@ -1629,53 +1693,13 @@ def run(args):
                 paths[h].set_attitude(*attitude.idle_attitude(paths[h], want[h], busy, aim_z=aim_z))
             print('[attitude] idle stretches turned onto the forearm', flush=True)
         paths, _ = apply_yield(paths, notes, duration)
-        # When the closing wrist actually reaches the thigh: the return curve's last stretch is a slow slide
-        # along the leg, so this is well before the gesture's nominal end. Everything that must be settled by
-        # the CONTACT -- the fingers' unfold, the palm's pitch -- reads this, not the end.
-        for h in 'LR':
-            if getattr(paths[h], 'trip_outro_land', None) is not None:
-                paths[h].trip_outro_touch = lap_arrival(paths[h], paths[h](float(paths[h].times[-1])))
         context['paths'], context['waypoints'] = paths, waypoints
-        # the intro's body sway (the user's spec): the drawing arms tip the chest a hair back while the hands
-        # pull in and the forearm pokes up; the reaching arms carry it a little forward, easing back to neutral
-        # as the playing settles. Positive = backward, on top of the hips' constant forward lean. The sway
-        # rides the OPENING hand's gesture (a late hand's quiet approach does not re-tip the chest).
-        opener = min('LR', key=lambda h: abs(getattr(paths[h], 'trip_land', 1e9) - intro_land_path))
-        lv = getattr(paths[opener], 'trip_leave', None)
-        if lv is not None and rig.data.get('torso') and context.get('torso_rows'):
-            de = getattr(paths[opener], 'trip_draw_end', None) or lv + .30
-            top = getattr(paths[opener], 'trip_lift_end', None) or de + .45
-            tlt = getattr(paths[opener], 'trip_tilt_end', None) or top + .30
-            red = getattr(paths[opener], 'trip_reach_end', None) or tlt + 1.15
-            # strictly rising rows (trip markers can coincide after a scale collapse; two rows at one time
-            # poison the pchip slopes and the sway then wobbles the whole fall's world wrist)
-            sw_t = np.array([lv - 1., lv, de, top, tlt, red, red + 1.2, red + 3.2], dtype=float)
-            sw_t = np.maximum.accumulate(sw_t + np.arange(len(sw_t)) * 1e-3)
-            context['torso_sway'] = (sw_t,
-                                     np.array([0., 0., 1.2, 1.8, .9, -2.5, -1.2, 0.], dtype=float))
-            print('[torso sway] back 1.8 deg at the poke, forward 2.5 deg at the reach', flush=True)
-        # The closing gesture straightens the chest 1-2 deg as the upper arm withdraws, back to the piece's
-        # own lean by the time the hands rest. A second, much later row set; when a very short piece overlaps
-        # the intro's sway the two contributions are summed on one strictly rising timeline.
-        if rig.data.get('torso') and context.get('torso_rows'):
-            out_start = [getattr(paths[h], 'trip_outro', None) for h in 'LR']
-            out_land = [getattr(paths[h], 'trip_outro_land', None) for h in 'LR']
-            if any(t is not None for t in out_start) and any(t is not None for t in out_land):
-                s0 = min(t for t in out_start if t is not None)
-                s1 = max(t for t in out_land if t is not None)
-                out_t = np.asarray([s0 - .35, s0 + .30, s1], float)
-                out_v = np.asarray([0., 1.4, 0.], float)
-                if context.get('torso_sway') is not None:
-                    old_t, old_v = context['torso_sway']
-                    if old_t[-1] >= out_t[0]:
-                        grid = np.unique(np.r_[old_t, out_t])
-                        context['torso_sway'] = (grid, np.interp(grid, old_t, old_v) + np.interp(grid, out_t, out_v))
-                    else:
-                        context['torso_sway'] = (np.r_[old_t, out_t], np.r_[old_v, out_v])
-                else:
-                    context['torso_sway'] = (out_t, out_v)
-                print('[torso sway] closing straightens 1.4 deg', flush=True)
         _mark('attitude', t0, stages)
+
+    # Always compute when the closing wrist reaches the thigh (even if elbow_swing is None or REAIM_OFF=1).
+    for h in 'LR':
+        if getattr(paths[h], 'trip_outro_land', None) is not None:
+            paths[h].trip_outro_touch = lap_arrival(paths[h], paths[h](float(paths[h].times[-1])))
 
     # 4.7 finger keyposes on the settled wrists
     t0 = time.perf_counter()
@@ -1689,7 +1713,7 @@ def run(args):
     from .lap_contact import shape as lap_shape
     for h in 'LR':
         leave = getattr(paths[h], 'trip_leave', None)
-        lap = lap_shape(h) if LAP_CONTACT else {d: LAP_FINGERS[d] for d in DIGITS}
+        lap = lap_shape(h, rig) if LAP_CONTACT else {d: LAP_FINGERS[d] for d in DIGITS}
         for d in DIGITS:
             track = tracks[h][d]
             track.rest = np.array(lap[d], dtype=float)
@@ -1699,7 +1723,7 @@ def run(args):
             # pads into the thigh (canonpd: 7.4 mm at a 5 mm lift). Find the first time the path's z clears the
             # lap by LAP_TUCK_MIN_LIFT -- a geometric gate, the same for any piece. Falls back to the draw's
             # end when the path is already clear there or carries no usable rise.
-            rest_tuck = getattr(paths[h], 'trip_draw_end', None) or leave
+            rest_tuck = _pick_time(paths[h], 'trip_draw_end', leave)
             path_h = paths[h]
             z0 = float(np.asarray(path_h(leave if leave is not None else rest_tuck), FLOAT)[2]) \
                 if (leave is not None or rest_tuck is not None) else None
@@ -1771,6 +1795,17 @@ def run(args):
     frames['key_pitches'] = np.array(sorted(by_pitch))
     bridged = despike(frames)
     brushed = brushed_keys(frames, FRAME_RATE)
+    # 5.5 Universal head-eye gaze coordination & natural blinking (model-agnostic: skips gracefully if no eye rig)
+    eyes_report = None
+    if rig.data.get('eyes'):
+        from . import eyes as eyes_mod
+        t_eye = time.perf_counter()
+        eye_out = eyes_mod.solve(frames['times'], frames, notes, paths, rig, torso)
+        if eye_out is not None:
+            eyes_report = eye_out.pop('report', None)
+            for k, arr in eye_out.items():
+                frames[k] = arr
+            print(f'[eyes] solved gaze & head follow ({time.perf_counter() - t_eye:.2f}s): {eyes_report}', flush=True)
     diagnostics = {k: frames[k] for k in frames if k.endswith(('_finger_gap', '_riding', '_finger_overlap', '_raised', '_pointing', 'hands_gap'))}
     np.savez_compressed(out / 'diagnostics.npz', times=frames['times'], **diagnostics)
     crossed = crossings(frames, FRAME_RATE)
@@ -1839,7 +1874,8 @@ def run(args):
                                                  max=round(float(np.abs(frames[f'{h}_pointing'][:, 2]).max()), 1),
                                                  over_20=round(float((np.abs(frames[f'{h}_pointing'][:, 2]) > 20).mean()), 3))
                                          for h in 'LR'},
-                    elbow_swing=elbows_report),
+                    elbow_swing=elbows_report,
+                    eyes=eyes_report),
         seconds=dict(stages, total=time.perf_counter() - started), workers=workers,
         music_seconds=duration - TAIL_SECONDS, intro_seconds=intro)
     plan = dict(schema='performer-plan', notes=final_rows, omitted_ids=sorted(n['id'] for n in source if n['id'] not in played),

@@ -16,6 +16,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -63,10 +64,21 @@ def continuous_quaternions(q):
     return q
 
 
-def write_animation(arm, rig, motion):
+def write_animation(arm, skin, rig, motion):
     scene = bpy.context.scene
     fps = scene.render.fps / scene.render.fps_base
     frames = 1 + motion['times'] * fps
+    # Clear stale FCurves on leg bones, slide bone, head, and eyes so static staging (place_feet) or zero curves
+    # are never overwritten by leftover base-file keyframes.
+    from probe_driver import remove_curves
+    clear_bones = {'左足', '左ひざ', '左足首', '右足', '右ひざ', '右足首', '両目'}
+    if rig.get('torso') and rig['torso'].get('slide_bone'):
+        clear_bones.add(rig['torso']['slide_bone'])
+    if rig.get('eyes'):
+        for k in ('head', 'L', 'R'):
+            if rig['eyes'].get(k):
+                clear_bones.add(rig['eyes'][k]['bone'])
+    remove_curves(arm, lambda c: any(f'"{b}"' in c.data_path for b in clear_bones))
     for h in 'LR':
         names = rig['hands'][h]['bones']
         for k, role in enumerate(('upper', 'elbow', 'wrist', 'twist')):
@@ -93,9 +105,14 @@ def write_animation(arm, rig, motion):
             bone.rotation_mode = 'QUATERNION'
             write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion['torso']))
         slide_bone = rig['torso'].get('slide_bone')
-        if slide_bone and 'slide' in motion and np.any(motion['slide']):
+        if slide_bone and slide_bone not in arm.pose.bones and '腰' in arm.pose.bones:
+            slide_bone = '腰'
+        if slide_bone and slide_bone in arm.pose.bones and 'slide' in motion and np.any(motion['slide']):
             bone = arm.pose.bones[slide_bone]       # the seat's slide (world offset) as the bone's location
-            pre = arm.matrix_world @ bone.parent.matrix @ bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
+            if bone.parent is None:
+                pre = arm.matrix_world @ bone.bone.matrix_local
+            else:
+                pre = arm.matrix_world @ bone.parent.matrix @ bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
             to_local = np.array(pre.to_3x3().inverted())
             write_curve(bone, 'location', frames, np.array(bone.location)[None] + motion['slide'] @ to_local.T)
         for h, s in rig['torso'].get('shoulders', {}).items():
@@ -103,6 +120,26 @@ def write_animation(arm, rig, motion):
                 bone = arm.pose.bones[s['bone']]
                 bone.rotation_mode = 'QUATERNION'
                 write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion[f'{h}_collar_q']))
+    # Universal head micro-follow, binocular eye gaze, and optional blink shape key
+    eyes_cfg = rig.get('eyes') or {}
+    if eyes_cfg:
+        head_cfg = eyes_cfg.get('head')
+        if head_cfg and 'head_q' in motion and head_cfg['bone'] in arm.pose.bones:
+            bone = arm.pose.bones[head_cfg['bone']]
+            bone.rotation_mode = 'QUATERNION'
+            write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion['head_q']))
+        for h in ('L', 'R'):
+            ec = eyes_cfg.get(h)
+            key = f'{h}_eye_q'
+            if ec and key in motion and ec['bone'] in arm.pose.bones:
+                bone = arm.pose.bones[ec['bone']]
+                bone.rotation_mode = 'QUATERNION'
+                write_curve(bone, 'rotation_quaternion', frames, continuous_quaternions(motion[key]))
+        blink_name = eyes_cfg.get('blink_shape_key')
+        if (blink_name and 'blink' in motion and skin is not None
+                and skin.data.shape_keys is not None and blink_name in skin.data.shape_keys.key_blocks):
+            kb = skin.data.shape_keys.key_blocks[blink_name]
+            write_curve(kb, 'value', frames, motion['blink'])
     # Every key starts from rest with no animation: the scene may carry another performance's key curves
     # (the base file's), and a key this run never plays would replay them on its own.
     for key in [ob for ob in bpy.data.objects if ob.name.startswith('key_')]:
@@ -163,6 +200,40 @@ def native_check(skin, rig_path, motion, frames):
     return dict(frames_checked=len(range(0, len(frames), step)), worst_pad_difference_mm=worst * 1000)
 
 
+def drop_default_cube():
+    """The downloaded character/scene sometimes carries Blender's default 2 m Cube; it sits through the piano."""
+    cube = bpy.data.objects.get('Cube')
+    if cube is not None and cube.type == 'MESH' and max(cube.dimensions) > 1.5:
+        bpy.data.objects.remove(cube, do_unlink=True)
+        print('DROPPED default Cube', flush=True)
+
+
+def strip_mmd_helpers():
+    """Remove the MMD physics display junk: joint/rigidbody Empties plus their tiny display meshes.
+
+    Empties never render, so a render check looks clean while the viewport shows ~540 small green
+    arrows arranged along the character's rest pose - i.e. a second, standing person next to the
+    seated one. They carry no animation, no weights and no parenting that matters, so they go.
+    """
+    keep = {'GrandPiano_Placement', 'joints', 'rigidbodies'}
+    pattern = re.compile(r'^[0-9A-Z]{3}_')
+    doomed = []
+    for ob in list(bpy.data.objects):
+        if ob.name in keep:
+            continue
+        if ob.type == 'EMPTY' and (pattern.match(ob.name) or ob.name == 'actual_面部定位'):
+            doomed.append(ob)
+        elif ob.type == 'MESH' and ob.hide_render and len(ob.data.vertices) <= 50 and pattern.match(ob.name):
+            doomed.append(ob)
+    for ob in doomed:
+        bpy.data.objects.remove(ob, do_unlink=True)
+    for name in ('joints', 'rigidbodies'):
+        ob = bpy.data.objects.get(name)
+        if ob is not None and not ob.children:
+            bpy.data.objects.remove(ob, do_unlink=True)
+    print(f'STRIPPED {len(doomed)} MMD helper objects', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True)
@@ -174,7 +245,10 @@ def main():
     started = time.perf_counter()
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    cal = json.loads((ROOT / 'hand_calibration.json').read_text(encoding='utf-8'))
+    drop_default_cube()
+    strip_mmd_helpers()
+    cal_path = Path(os.environ.get('PIANOMOTION_HAND_CALIBRATION') or ROOT / 'hand_calibration.json')
+    cal = json.loads(cal_path.read_text(encoding='utf-8'))
     arm, skin, _, _, _ = neutral_scene(cal)
     contacts = place_feet(arm, skin)        # before the bench: the thighs follow the legs
     bench_drop = fit_bench(skin)
@@ -190,12 +264,14 @@ def main():
     motion = dict(np.load(out / 'motion.npz'))
     from performer.pipeline import RIG as rig_path
     rig = json.loads(rig_path.read_text(encoding='utf-8'))
-    frames = write_animation(arm, rig, motion)
+    frames = write_animation(arm, skin, rig, motion)
     staging = dict(bench_drop_mm=bench_drop * 1000, feet_miss_mm=contacts['miss_mm'])
     if 'damper' in motion:
         fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
         staging.update(animate_damper(arm, skin, contacts, frames, motion['damper'], motion['damper_intervals'], fps, write_curve))
     audio_frames = add_audio(out / 'preview.wav') if (out / 'preview.wav').exists() else 0
+    if audio_frames:
+        bpy.context.scene.frame_end = max(bpy.context.scene.frame_end, math.ceil(audio_frames))
     blend = out / 'performer.blend'
     bpy.ops.wm.save_as_mainfile(filepath=str(blend), relative_remap=True)
     check = native_check(skin, rig_path, motion, frames)

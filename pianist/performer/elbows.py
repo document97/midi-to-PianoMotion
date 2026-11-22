@@ -94,6 +94,13 @@ ASK_LOG = None                   # dev hook: a list to append the honest trials'
 # tests, a build is one least-squares over the piece, and the wrist ask runs a full scan+build per candidate pair
 # per run -- the counts say which of the two the piece is paying for.
 PROFILE = os.environ.get('PIANOMOTION_ELBOW_PROFILE') == '1'
+# Dev gate for the candidate-parallel experiment: a pool worker cannot see the previous candidate's yield arrays,
+# so it computes ``moved`` against the baseline instead. Set to 1 to measure whether that changes the answer.
+ASK_ISOLATE = os.environ.get('PIANOMOTION_ASK_ISOLATE') == '1'
+# Spans/picks evaluated in parallel processes. Unset (None) = follow pipeline's --workers (default 1 when
+# elbows.solve is called directly); 0 or 1 = force the serial path (opt-out gate for bit-exact A/B).
+_ASK_WORKERS_ENV = os.environ.get('PIANOMOTION_ASK_WORKERS')
+ASK_WORKERS = None if _ASK_WORKERS_ENV is None or _ASK_WORKERS_ENV == '' else int(_ASK_WORKERS_ENV)
 _prof = {}
 
 
@@ -147,9 +154,10 @@ class Trunk:
     far in from the outline at its height it sits (positive inside, negative the clearance out). A slice too
     sparse for a hull is no hole: its band reads the nearer hulled slice's hull."""
 
-    def __init__(self, local, radius):
+    def __init__(self, local, radius, unit_frame=False):
         local = np.asarray(local, float)
         self.radius = np.asarray(radius, float).reshape(2, 2)       # per hand (upper arm, forearm)
+        self.unit_frame = bool(unit_frame)
         self.lo = float(local[:, AXIS].min())
         self.step = SLICE
         self._fast = None                                           # the compiled kernel's arrays, built on first use
@@ -164,7 +172,7 @@ class Trunk:
         for i, (k, h) in enumerate(sorted(buckets.items())):
             e = np.roll(h, -1, axis=0) - h
             n = np.c_[e[:, 1], -e[:, 0]] / np.linalg.norm(e, axis=1)[:, None]
-            if np.mean((h - h.mean(0)) @ n.T) < 0:
+            if np.mean(((h - h.mean(0)) * n).sum(axis=1)) < 0:
                 n = -n
             m = len(h)
             self.origin[i, :m], self.normal[i, :m] = h, n
@@ -175,7 +183,7 @@ class Trunk:
         radius = data['radius']
         if isinstance(radius, dict):
             radius = [radius[h] for h in 'LR']
-        return cls(data['local'], radius)
+        return cls(data['local'], radius, unit_frame=bool(data.get('unit_frame', False)))
 
     @classmethod
     def from_json(cls, path):
@@ -189,11 +197,18 @@ class Trunk:
             self._fast = hit
         return hit or None
 
+    def _unit_rot(self, R):
+        if not self.unit_frame:
+            return R
+        R = np.asarray(R, float)
+        norms = np.linalg.norm(R, axis=-2, keepdims=True)
+        return R / np.maximum(norms, 1e-12)
+
     def depth(self, points, matrix):
         """Signed depth (m) of world ``points`` in the outline, ``matrix`` the trunk bone's world matrix: -1 off
         the outline's height range; a point between hulled slices reads the nearer slice's hull (a slice the
         skin's bones leave too sparse for a hull is no hole: the surface runs on between its neighbours)."""
-        R, o = matrix[:3, :3], matrix[:3, 3]
+        R, o = self._unit_rot(matrix[:3, :3]), matrix[:3, 3]
         p = (np.asarray(points, float).reshape(-1, 3) - o) @ R
         k = np.floor((p[:, AXIS] - self.lo) / SLICE).astype(int)
         out = np.full(len(p), -1.)
@@ -238,12 +253,12 @@ class Trunk:
         (swing raises there; a scan wants the whole grid's answer and its own way of handling the stretched
         sample -- the frames stage stretches it and the angle is unused)."""
         r_up, r_fo = self.radius[hand]
-        return elbows_fast.swing_block(self._packed(), S, W, R, O, l1, l2, side, r_up, r_fo,
+        return elbows_fast.swing_block(self._packed(), S, W, self._unit_rot(R), O, l1, l2, side, r_up, r_fo,
                                        np.cos(TRUNK_ANG), np.sin(TRUNK_ANG), UP, FO)
 
 
 def _runs(free, ang):
-    """The free mask's circular runs as (lo, hi) angle pairs, hi > lo (a span may cross +-pi)."""
+    """The free mask's circular runs as (lo, hi) angle pairs, hi >= lo (a span may cross +-pi)."""
     n = len(free)
     s = int(np.argmin(free))            # start at a gap: no run wraps in the rolled mask
     rolled = np.roll(free, -s)
@@ -254,7 +269,7 @@ def _runs(free, ang):
             while j < n and rolled[j]:
                 j += 1
             lo = float(ang[(i + s) % n])
-            out.append((lo, lo + (j - i) * math.radians(ANGLE_STEP)))
+            out.append((lo, lo + (j - i - 1) * math.radians(ANGLE_STEP)))
             i = j
         else:
             i += 1
@@ -266,6 +281,23 @@ def _near(angle, anchor):
     return angle + 2 * math.pi * round((anchor - angle) / (2 * math.pi))
 
 
+def _shift_interval(lo, hi, anchor):
+    """Shift (lo, hi) by a whole number of 2*pi turns so it covers or lies closest to ``anchor``."""
+    span = hi - lo
+    mid = lo + .5 * span
+    base_k = round((anchor - mid) / (2 * math.pi))
+    best = None
+    best_key = None
+    for dk in (-1, 0, 1):
+        shift = 2 * math.pi * (base_k + dk)
+        a, b = lo + shift, hi + shift
+        dist = max(a - anchor, anchor - b, 0.)
+        key = (dist, abs(.5 * (a + b) - anchor))
+        if best_key is None or key < best_key:
+            best_key, best = key, (a, b)
+    return best
+
+
 def _choose(runs, target, prev):
     """The run this sample is bounded to: the previous one while it lasts (the arcs move slowly, the curve does
     not jump between them), else the one nearest the pull target; unwrapped around ``prev`` or the target.
@@ -273,25 +305,31 @@ def _choose(runs, target, prev):
     the first one in angle order is arbitrary: canon 200.20-200.35 had the natural hang's own arc free (distance
     0 deg) beside a 6-12 deg sliver 60-73 deg below it, and the curve dove into the sliver, swung 70 deg in .2 s
     and sprang back (the user's 6145-6190). Nearest the hang wins there; the single-overlap case is unchanged."""
-    anchor = (.5 * (prev[0] + prev[1])) if prev is not None else target
+    anchor = (.5 * (prev[0] + prev[1])) if prev is not None else (target if np.isfinite(target) else 0.)
     if prev is not None:
         cands = []
         for lo, hi in runs:
             a = prev[0] + ((lo - prev[0]) % (2 * math.pi))       # the run starts inside the previous interval ...
             b = lo + ((prev[0] - lo) % (2 * math.pi))            # ... or the previous interval starts in the run
             if a <= prev[1] + 1e-9 or b <= hi + 1e-9:
-                near = _near(lo, anchor)
-                cands.append((near, near + (hi - lo)))
+                cands.append(_shift_interval(lo, hi, anchor))
         if cands:
             if len(cands) == 1 or not np.isfinite(target):
                 return cands[0]
-            return min(cands, key=lambda c: max(c[0] - target, target - c[1], 0.))
+            def _tdist(c):
+                t_u = _near(target, .5 * (c[0] + c[1]))
+                return max(c[0] - t_u, t_u - c[1], 0.)
+            return min(cands, key=_tdist)
     best, cost = None, None
     for lo, hi in runs:
-        near = _near(lo, anchor)
-        d = max(near - target, target - (near + hi - lo), 0.) if np.isfinite(target) else 0.
+        a, b = _shift_interval(lo, hi, anchor)
+        if np.isfinite(target):
+            t_u = _near(target, .5 * (a + b))
+            d = max(a - t_u, t_u - b, 0.)
+        else:
+            d = 0.
         if cost is None or d < cost:
-            best, cost = (near, near + (hi - lo)), d
+            best, cost = (a, b), d
     return best
 
 
@@ -353,22 +391,25 @@ def _trace(torso, path, grid, label, kin, moved):
 
 def _least_lean(torso, t, wrist, label, hand, arm, trunk, prev, levels=CAP_LEVELS):
     """The least lean (share of the cap, 0..1) at which ``wrist`` is inside the arm's length AND some swing of the
-    elbow clears the trunk: (share, bound, depth, rise, target), or None when even the upright body cannot reach
-    it. The elbow solver's rule is that the body yields before the arm breaks (elbows.solve); a hand parked on the
-    lap through the other hand's far passage is the case that rule was missing -- there the body had leaned until
-    this arm was dead straight, and a straight arm's elbow is solved through the chest."""
+    elbow clears the trunk: (share, bound, depth, rise, target, rise_cap), or None when even the upright body cannot
+    reach it."""
     for share in np.linspace(min(1., torso._cap(t)), 0., levels):
         try:
             s = torso.shoulder_world(label, t, cap=float(share))[:3, 3]
             m = torso.trunk_world(t, cap=float(share))
+            target = closest_elbow_angle(s, wrist, arm.l1, arm.l2, arm.side)
             ang, deep, rise = trunk.swing(s, wrist, arm.l1, arm.l2, arm.side, m, hand)
         except ValueError:                  # still beyond the arm at this lean: lean less
             continue
-        free = deep <= 0.
+        rise_cap = float(rise[int(np.argmin(np.abs(ang - target)))]) + RISE_LIMIT
+        free = (deep <= 0.) & (rise <= rise_cap)
         if not free.any():
             continue
-        target = closest_elbow_angle(s, wrist, arm.l1, arm.l2, arm.side)
-        return float(share), _choose(_runs(free, ang), target, prev), deep, rise, target
+        if free.all():
+            return float(share), (-np.inf, np.inf), deep, rise, target, rise_cap
+        bound = _choose(_runs(free, ang), target, prev)
+        target = _near(target, .5 * (bound[0] + bound[1]))
+        return float(share), bound, deep, rise, target, rise_cap
     return None
 
 
@@ -424,69 +465,105 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance, kin=None, moved
         depths[idx], rises[idx] = blk, ris
         reach[idx[~ok]] = False         # swing would have raised there: the scan's stretched sample, below
     prev = None
-    if not fresh and len(todo) and todo[0] > 0:     # the bound the sample before the span carried, unwrapped
-        j = int(todo[0]) - 1
-        if fine[j] and reach[j]:
-            prev = (raw_lo[j], raw_hi[j])
+    prev_idx = -2
     for i in todo:
         i = int(i)
+        if i != prev_idx + 1:
+            prev = None
+            if not fresh and i > 0 and fine[i - 1] and st['have'][i - 1] and np.isfinite(raw_lo[i - 1]) and np.isfinite(raw_hi[i - 1]):
+                prev = (raw_lo[i - 1], raw_hi[i - 1])
+        prev_idx = i
         t = float(grid[i])
         anchor = (.5 * (prev[0] + prev[1])) if prev is not None else 0.
         required[i] = 1.
+        tight[i] = False
+        necessary[i] = 0.
         if not reach[i]:
+            if st['have'][i]:           # wrist exists but was out of arm reach: let the body yield first
+                got = _least_lean(torso, t, W[i], label, hand, arm, trunk, prev)
+                if got is not None:
+                    share, bound, deep_i, rise, raw_target[i], rise_caps[i] = got
+                    required[i] = share
+                    raw_lo[i], raw_hi[i] = bound
+                    deep[i] = float(deep_i.min())
+                    depths[i], rises[i] = deep_i, rise
+                    ws[i] = W[i]
+                    if np.isfinite(bound[0]) and np.isfinite(bound[1]):
+                        prev = bound
+                        fine[i] = True
+                    else:
+                        prev = None
+                        fine[i] = False
+                    continue
             raw_lo[i], raw_hi[i] = anchor, anchor
+            raw_target[i] = np.nan
+            deep[i] = np.nan
+            rise_caps[i] = np.nan
             fine[i] = False
             prev = None
             continue
-        s, w = S[i], W[i]
-        # The lean may not carry a hand away from its own wrist past a comfortable reach. A hand parked on the
-        # lap while the other plays far out is the case: the lean takes its shoulder across the body, the arm
-        # goes dead straight, and its elbow has no freedom left -- it is solved into the chest. (The hand the
-        # lean is FOR is the other case: there the shoulder comes toward its wrist, nothing to cap.)
+        s, w, m_i = S[i], W[i], M[i]
+        body_moved = False
+        # The lean may not carry a hand away from its own wrist past a comfortable reach.
         limit = REACH_FULL * (arm.l1 + arm.l2)
         if np.linalg.norm(w - s) > limit:
             still = torso.shoulder_world(label, t, cap=0.)[:3, 3]
             if float(np.dot(s - still, w - s)) < 0.:
                 for share in np.linspace(torso._cap(t), 0., CAP_LEVELS):
-                    moved = torso.shoulder_world(label, t, cap=float(share))[:3, 3]
-                    if np.linalg.norm(w - moved) <= limit:
+                    moved_s = torso.shoulder_world(label, t, cap=float(share))[:3, 3]
+                    if np.linalg.norm(w - moved_s) <= limit:
                         required[i] = float(share)
-                        s, M[i] = moved, torso.trunk_world(t, cap=float(share))
+                        s, m_i = moved_s, torso.trunk_world(t, cap=float(share))
+                        body_moved = True
                         break
-        if trunk._packed() is None:     # no numba: the one-sample swing, as the scan always did
+        if trunk._packed() is None or body_moved:
             try:
-                _, deep_i, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, M[i], hand)
+                _, deep_i, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, m_i, hand)
+                tgt_i = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
             except ValueError:
-                # The body leaned away from this hand until its wrist sits beyond the arm's length (the other
-                # hand's lean carried this shoulder off while the wrist stayed put -- a hand parked on the lap
-                # through the other hand's high passage). The frames stage would stretch the arm, and a
-                # stretched arm has no elbow freedom: the elbow is solved straight through the chest. The body
-                # yields instead -- the least lean at which this wrist is inside the arm AND a swing clears the
-                # trunk (a passage where the other hand is far out has the slack for it; where it has not, the
-                # stretch stands as before).
                 got = _least_lean(torso, t, w, label, hand, arm, trunk, prev)
                 if got is None:
                     raw_lo[i], raw_hi[i] = anchor, anchor
+                    raw_target[i] = np.nan
+                    deep[i] = np.nan
+                    rise_caps[i] = np.nan
                     fine[i] = False
                     prev = None
                     continue
-                share, bound, deep_i, rise, raw_target[i] = got
+                share, bound, deep_i, rise, raw_target[i], rise_caps[i] = got
                 required[i] = share
                 raw_lo[i], raw_hi[i] = bound
+                deep[i] = float(deep_i.min())
                 depths[i], rises[i] = deep_i, rise
                 ws[i] = w
-                prev = bound
-                fine[i] = True
+                if np.isfinite(bound[0]) and np.isfinite(bound[1]):
+                    prev = bound
+                    fine[i] = True
+                else:
+                    prev = None
+                    fine[i] = False
                 continue
             depths[i], rises[i] = deep_i, rise
         else:
             deep_i, rise = depths[i], rises[i]
-        raw_target[i] = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
+            try:
+                tgt_i = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
+            except ValueError:          # float64 vs float32 boundary edge
+                raw_lo[i], raw_hi[i] = anchor, anchor
+                raw_target[i] = np.nan
+                deep[i] = np.nan
+                rise_caps[i] = np.nan
+                fine[i] = False
+                prev = None
+                continue
+        raw_target[i] = tgt_i
         rise_caps[i] = float(rise[int(np.argmin(np.abs(ang - raw_target[i])))]) + RISE_LIMIT
         deep[i] = float(deep_i.min())
         free = (deep_i <= -clearance) & (rise <= rise_caps[i])
         if free.all():                  # the whole circle is free (the arm far out): no bound at all
             raw_lo[i], raw_hi[i] = -np.inf, np.inf
+            if prev is not None:
+                raw_target[i] = _near(raw_target[i], anchor)
             fine[i] = False
             prev = None
             continue
@@ -494,8 +571,16 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance, kin=None, moved
             free = (deep_i <= 0.) & (rise <= rise_caps[i])      # the margin is beyond this pose: not running in is what there is
             tight[i] = free.any()
         if free.any():
+            if free.all():
+                raw_lo[i], raw_hi[i] = -np.inf, np.inf
+                if prev is not None:
+                    raw_target[i] = _near(raw_target[i], anchor)
+                fine[i] = False
+                prev = None
+                continue
             bound = _choose(_runs(free, ang), raw_target[i], prev)
             raw_lo[i], raw_hi[i] = bound
+            raw_target[i] = _near(raw_target[i], .5 * (bound[0] + bound[1]))
             prev = bound
             fine[i] = True
             continue
@@ -503,33 +588,52 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance, kin=None, moved
         now = torso._cap(t)
         for share in np.linspace(min(1., now), 0., CAP_LEVELS):
             try:
-                s = torso.shoulder_world(label, t, cap=float(share))[:3, 3]
-                m = torso.trunk_world(t, cap=float(share))
-                raw_target[i] = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
-                ang, deep2, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, m, hand)
+                s2 = torso.shoulder_world(label, t, cap=float(share))[:3, 3]
+                m2 = torso.trunk_world(t, cap=float(share))
+                tgt2 = closest_elbow_angle(s2, w, arm.l1, arm.l2, arm.side)
+                ang, deep2, rise2 = trunk.swing(s2, w, arm.l1, arm.l2, arm.side, m2, hand)
             except ValueError:
                 continue
-            free = (deep2 <= 0.) & (rise <= rise_caps[i])
+            rcap2 = float(rise2[int(np.argmin(np.abs(ang - tgt2)))]) + RISE_LIMIT
+            free = (deep2 <= 0.) & (rise2 <= rcap2)
             if free.any():
                 required[i] = float(share)
-                bound = _choose(_runs(free, ang), raw_target[i], prev)
-                raw_lo[i], raw_hi[i] = bound
-                depths[i], rises[i] = deep2, rise
-                prev = bound
-                fine[i] = True
+                rise_caps[i] = rcap2
+                deep[i] = float(deep2.min())
+                depths[i], rises[i] = deep2, rise2
+                if free.all():
+                    raw_lo[i], raw_hi[i] = -np.inf, np.inf
+                    raw_target[i] = _near(tgt2, anchor) if prev is not None else tgt2
+                    prev = None
+                    fine[i] = False
+                else:
+                    bound = _choose(_runs(free, ang), tgt2, prev)
+                    raw_lo[i], raw_hi[i] = bound
+                    raw_target[i] = _near(tgt2, .5 * (bound[0] + bound[1]))
+                    prev = bound
+                    fine[i] = True
                 break
-        else:                           # no share opens an arc: the elbow takes the least deep swing there is
-            best = float(ang[int(np.argmin(deep_i))])
+        else:                           # no share opens an arc: take the least deep swing within the rise cap
+            in_rise = rise <= rise_caps[i]
+            if in_rise.any():
+                idx_r = np.flatnonzero(in_rise)
+                best = float(ang[idx_r[int(np.argmin(deep_i[idx_r]))]])
+            else:
+                best = float(ang[int(np.argmin(deep_i))])
             raw_lo[i] = raw_hi[i] = _near(best, anchor)
+            raw_target[i] = _near(raw_target[i], raw_lo[i])
             depths[i], rises[i] = deep_i, rise
             prev = (raw_lo[i], raw_hi[i])
             fine[i] = True
+    W_pad = int(np.ceil(SMOOTH_TAU / CURVE_STEP)) + 1
     for b0, b1 in _blocks(todo):        # each block of the change, not the gap between two of them
         _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance,
                raw=(raw_lo, raw_hi, raw_target), span=(b0, b1))
-        for i in range(max(0, b0 - 1), min(n, b1 + 1)):
+        for i in range(max(0, b0 - W_pad - 1), min(n, b1 + W_pad + 2)):
             if np.isfinite(target[i]) and np.isfinite(lo[i]) and np.isfinite(hi[i]):
                 necessary[i] = max(0., lo[i] - target[i], target[i] - hi[i])
+            else:
+                necessary[i] = 0.
     return dict(lo=lo, hi=hi, target=target, required=required, deep=deep, necessary=necessary, tight=tight,
                 depths=depths, rises=rises, rise_caps=rise_caps)
 
@@ -561,12 +665,15 @@ def _relax(grid, lo, hi, target, fine, ws, depths, rises, rise_caps, clearance, 
         spd[0], spd[-1] = d[0], d[-1]
         spd[1:-1] = np.fmax(d[:-1], d[1:])      # either neighbour moving counts as moving
     tau = np.where(np.isfinite(spd), SMOOTH_TAU / (1. + spd / TRACK_RATE), SMOOTH_TAU)
-    barrier = ~fine | ~np.isfinite(lo) | ~np.isfinite(hi) | ~np.isfinite(target)
-    seg = np.zeros(n, int)
-    seg[barrier] = -1
-    for i in range(1, n):
-        if seg[i] >= 0:
-            seg[i] = seg[i - 1] + (1 if barrier[i - 1] else 0)
+    b_lo, b_hi, b_tgt = (lo, hi, target) if raw is None else raw
+    barrier = ~fine | ~np.isfinite(b_lo) | ~np.isfinite(b_hi) | ~np.isfinite(b_tgt)
+    seg = np.full(n, -1, int)
+    cur_seg = -1
+    for i in range(n):
+        if not barrier[i]:
+            if i == 0 or barrier[i - 1]:
+                cur_seg += 1
+            seg[i] = cur_seg
     W = int(np.ceil(SMOOTH_TAU / CURVE_STEP)) + 1
     r0, r1 = (0, n) if span is None else (max(0, span[0] - W - 1), min(n, span[1] + W + 2))
     for k, values in enumerate((lo, hi, target)):
@@ -627,11 +734,14 @@ def _wrap_deg(angle):
 
 
 def _cap_curve(required, n):
-    """The body's shared yield over time: pulled to no yield, never below what the samples ask, smooth over the
-    spans it yields in (one body, both hands' asks minimized into ``required``)."""
+    """The body's shared yield over time: pulled to no yield (1), never above what the samples ask (required),
+    smooth over the spans it yields in (one body, both hands' asks minimized into ``required``)."""
+    required = np.clip(np.asarray(required, float), 0., 1.)
+    if n < 4:
+        return required
     from .motion import chunked
     A, b = _rows(n, CURVE_STEP, JERK, ACC, VEL, CAP_PULL, np.ones(n))
-    return chunked(A, b, required, np.ones(n))
+    return chunked(A, b, np.zeros(n), required)
 
 
 def _ease(values, step, tau=YIELD_TAU):
@@ -757,7 +867,225 @@ def _build(data, paths, grid, cache=None, prev=None, dirty=None):
     return out
 
 
-def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, rescan, kin=None, traced=None):
+# --- candidate-parallel ask -----------------------------------------------------------------------------------
+# The 79 body-yield spans are independent: each one sets its own lean/slide on its own samples, then clears it.
+# Measured on a 40 s slice, evaluating every candidate from the baseline instead of from the previous candidate's
+# yield arrays gives bit-identical output (11 arrays, 2953 frames, max diff 0.0), because ``traced`` only decides
+# which samples a rescan recomputes -- it is a cache key, not an input. So the spans can run in separate processes;
+# each worker keeps its own torso and kinematic cache and starts every span from the baseline body.
+_ASK_CTX = None
+
+
+def _ask_init(ctx):
+    global _ASK_CTX
+    # Avoid numba thread oversubscription across worker processes: each worker evaluates tiny moved spans
+    # (18-40 samples), so 1 numba thread per worker keeps all CPU cores busy without thread-pool contention.
+    try:
+        import numba
+        numba.set_num_threads(1)
+    except Exception:
+        pass
+    grid, paths = ctx['grid'], ctx['paths']
+    kin = ctx.get('kin') or {}
+    # Ensure identity checks in _trace/_build (``got['path'] is path``, ``got['grid'] is grid``) stay true
+    # after unpickling, and snapshot the baseline arrays so each candidate starts from an exact baseline.
+    base_kin = {}
+    for h in 'LR':
+        if h in kin:
+            kin[h]['path'] = paths[h]
+            kin[h]['grid'] = grid
+            base_kin[h] = {k: v.copy() for k, v in kin[h].items() if isinstance(v, np.ndarray) and k != 'grid'}
+        st_key = ('state', h)
+        if st_key in kin:
+            base_kin[st_key] = {k: v.copy() for k, v in kin[st_key].items() if isinstance(v, np.ndarray)}
+        pts_key = ('pts', h)
+        if pts_key in kin:
+            kin[pts_key] = (grid, kin[pts_key][1], kin[pts_key][2])
+    ctx['kin'] = kin
+    ctx['base_kin'] = base_kin
+    _ASK_CTX = ctx
+
+
+def _pick_job(ks):
+    """Evaluate the cheap per-sample forecast for a chunk of breaching grid indices in a worker process."""
+    from . import posture
+    from .arm import closest_elbow, closest_elbow_angle
+    c = _ASK_CTX
+    grid, floor, room = c['grid'], c['floor'], c['room']
+    paths, rig, trunk, clearance, solvers = c['paths'], c['rig'], c['trunk'], c['clearance'], c['solvers']
+    base_ang_g, base_sw, leans, slides = c['base_ang_g'], c['base_sw'], c['leans'], c['slides']
+    torso = c['torso']
+
+    def cheap(k, ln, sl):
+        if abs(sl) > room[k]:
+            return None
+        t = float(grid[k])
+        torso.set_yield(np.array([t - 1., t + 1.]), np.full(2, ln))
+        torso.set_slide_yield(np.array([t - 1., t + 1.]), np.full(2, sl))
+        cost, swings = 0., []
+        for i, h in enumerate('LR'):
+            arm, solver = rig.arms[h], solvers[h]
+            try:
+                v = np.asarray(paths[h](t), float)
+                w = v[:3]
+                s2 = torso.shoulder_world(h, t)[:3, 3]
+                tgth = closest_elbow_angle(s2, w, arm.l1, arm.l2, arm.side)
+                angb, deep2, rise2 = trunk.swing(s2, w, arm.l1, arm.l2, arm.side, torso.trunk_world(t), i)
+                cap2 = float(rise2[int(np.argmin(np.abs(angb - tgth)))]) + RISE_LIMIT
+                free2 = (deep2 <= -clearance) & (rise2 <= cap2)
+                if not free2.any():
+                    free2 = (deep2 <= 0.) & (rise2 <= cap2)
+                if not free2.any():
+                    return None
+                if free2.all():
+                    realized2 = tgth
+                else:
+                    lo2, hi2 = _choose(_runs(free2, angb), tgth, None)
+                    tgth_u = _near(tgth, .5 * (lo2 + hi2))
+                    realized2 = min(max(tgth_u, lo2), hi2)
+                    tgth = tgth_u
+                e2 = closest_elbow(s2, w, arm.l1, arm.l2, arm.side, angle=realized2)
+                a = posture.palm_forearm_deg(solver, w, v[3], v[4], s2, elbow=e2)
+            except ValueError:
+                return None
+            cost += max(0., floor - a) ** 2
+            swings.append(realized2 - tgth)
+        return cost, swings
+
+    def grown(g, k):
+        return g[0] + SWING_COST * sum(max(0., math.degrees(abs(sw) - abs(base_sw[h][k]))) ** 2
+                                       for h, sw in zip('LR', g[1]))
+
+    out = []
+    try:
+        for k in ks:
+            base_cost = sum(max(0., floor - base_ang_g[h][k]) ** 2 for h in 'LR')
+            best = (0., 0., base_cost)
+            best_ln = (0., base_cost)
+            best_sl = (0., base_cost)
+            for ln in leans:
+                g = cheap(k, ln, 0.)
+                if g is not None:
+                    gc = grown(g, k)
+                    if gc < best_ln[1] - 1e-9:
+                        best_ln = (ln, gc)
+                    if gc < best[2] - 1e-9:
+                        best = (ln, 0., gc)
+            for sl in slides:
+                g = cheap(k, 0., sl)
+                if g is not None:
+                    gc = grown(g, k)
+                    if gc < best_sl[1] - 1e-9:
+                        best_sl = (sl, gc)
+                    if gc < best[2] - 1e-9:
+                        best = (0., sl, gc)
+            if best_ln[0] and best_sl[0]:
+                g = cheap(k, best_ln[0], best_sl[0])
+                if g is not None and grown(g, k) < best[2] - 1e-9:
+                    best = (best_ln[0], best_sl[0], grown(g, k))
+            if best[2] < base_cost - 1e-9 and (best[0] or best[1]):
+                out.append((k, (best[0], best[1])))
+    finally:
+        torso.clear_yield()
+        torso.clear_slide_yield()
+    return out
+
+
+def _ask_job(task):
+    """Evaluate one span's candidates with a real rescan each, in a worker process: (idx, best_pair, best_cost)."""
+    idx, run, cands = task
+    c = _ASK_CTX
+    n, grid, ft, floor = c['n'], c['grid'], c['ft'], c['floor']
+    paths, rig, trunk, clearance, solvers = c['paths'], c['rig'], c['trunk'], c['clearance'], c['solvers']
+    base_ang, base_sw, shield, env = c['base_ang'], c['base_sw'], c['shield'], c['env']
+    caps, curves = c['caps'], c['curves']
+    torso, kin, base_kin = c['torso'], c['kin'], c['base_kin']
+    torso.clear_yield()
+    torso.clear_slide_yield()
+    W = int(np.ceil(SMOOTH_TAU / CURVE_STEP)) + 1
+    kf = (ft >= float(grid[run[0]]) - .5 / RENDER_RATE) & (ft <= float(grid[run[-1]]) + .5 / RENDER_RATE)
+    base_span = float(sum(float(np.sum(np.maximum(0., floor - base_ang[h][kf][np.isfinite(base_ang[h][kf])]) ** 2))
+                          for h in 'LR'))
+
+    def rescan(moved):
+        torso.set_cap(grid, caps)
+        required = np.ones(n)
+        d = {}
+        for i, h in enumerate('LR'):
+            d[h] = _scan(torso, paths[h], grid, rig.arms[h], h, i, trunk, clearance, kin=kin, moved=moved)
+            required = np.minimum(required, d[h]['required'])
+        span = None if moved is None or not moved.any() else (
+            max(0, int(np.argmax(moved)) - W - 2),
+            min(n - 1, int(len(moved) - 1 - np.argmax(moved[::-1])) + W + 2))
+        return d, _build(d, paths, grid, cache=kin, prev=curves if span is not None else None, dirty=span), required
+
+    def restore_kin(moved):
+        if not base_kin or moved is None:
+            return
+        nz = np.flatnonzero(moved)
+        if not len(nz):
+            return
+        r0 = max(0, int(nz[0]) - W - 1)
+        r1 = min(n, int(nz[-1]) + W + 3)
+        for key, snap in base_kin.items():
+            dst = kin[key]
+            for k, arr in snap.items():
+                dst[k][r0:r1] = arr[r0:r1]
+
+    def honest(p):
+        ln, sl = p
+        rows = np.zeros(n)
+        rows[run] = ln
+        srows = np.zeros(n)
+        srows[run] = sl
+        ky = _ease(rows, CURVE_STEP)
+        ks_ = _ease(srows, CURVE_STEP, YIELD_SLIDE_TAU)
+        torso.set_yield(grid, ky)
+        torso.set_slide_yield(grid, ks_)
+        moved = (ky != 0.) | (ks_ != 0.)        # the baseline body: no previous candidate to diff against
+        try:
+            cdata, ccurves, _ = rescan(moved)
+            cost = 0.
+            inside = np.zeros(len(grid), bool)
+            inside[run] = True
+            for h in 'LR':
+                ang = base_ang[h].copy()
+                moved_t = np.abs(ccurves[h]['angles'] - curves[h]['angles'])
+                moved_t[inside] = 0.
+                moved_t[~np.isfinite(moved_t)] = np.inf
+                j = np.flatnonzero(moved_t > 1e-5)
+                if len(j):
+                    extra = ((ft >= float(grid[j[0]]) - .5 / RENDER_RATE)
+                             & (ft <= float(grid[j[-1]]) + .5 / RENDER_RATE) & ~kf)
+                    if extra.any():
+                        ang[extra] = _rendered(torso, ccurves[h], ft[extra], paths[h], h, rig.arms[h], solvers[h])
+                ang[kf] = _rendered(torso, ccurves[h], ft[kf], paths[h], h, rig.arms[h], solvers[h])
+                sw = _swing_of(cdata[h], ccurves[h])
+                if shield[h] and ((ang[kf] < floor - 1e-9).any() or (ang[~kf] < floor - 1e-9).any()
+                                  or (np.isfinite(base_ang[h]) & ~np.isfinite(ang)).any()):
+                    return None
+                if env[h] and (np.percentile(np.abs(sw[run]), 90) > math.radians(SWING_ENV_DEG) + 1e-12
+                               or np.abs(sw[run]).max() > math.radians(SWING_ENV_MAX_DEG) + 1e-12):
+                    return None
+                fin = np.isfinite(ang[kf])
+                cost += float(np.sum(np.maximum(0., floor - ang[kf][fin]) ** 2))
+                cost += SWING_COST * float(np.sum(np.degrees(np.maximum(0., np.abs(sw[run]) - np.abs(base_sw[h][run]))) ** 2))
+            return cost
+        finally:
+            restore_kin(moved)
+            torso.clear_yield()
+            torso.clear_slide_yield()
+
+    best_pair, best_cost = None, base_span
+    for p in cands:
+        got = honest(p)
+        if got is not None and got < best_cost - 1e-9:
+            best_cost, best_pair = got, p
+    return idx, best_pair, best_cost, base_span
+
+
+def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, rescan, kin=None, traced=None,
+               caps=None, workers=1):
     """The wrist-deviation ask (torso.Torso.set_yield / set_slide_yield): where the swing keeping the elbow out
     of the outline would bend the rendered wrist past the user's floor (posture.PALM_FLOOR_DEG) -- the path's
     own yaw/roll are what the render stores (motion.frame_hand hands them to arm.pose verbatim, and across
@@ -815,8 +1143,13 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
                     free2 = (deep2 <= 0.) & (rise2 <= cap2)   # not running in is what there is
                 if not free2.any():
                     return None          # this move leaves no swing at all: not a candidate
-                lo2, hi2 = _choose(_runs(free2, angb), tgth, None)
-                realized2 = min(max(tgth, lo2), hi2)
+                if free2.all():
+                    realized2 = tgth
+                else:
+                    lo2, hi2 = _choose(_runs(free2, angb), tgth, None)
+                    tgth_u = _near(tgth, .5 * (lo2 + hi2))
+                    realized2 = min(max(tgth_u, lo2), hi2)
+                    tgth = tgth_u
                 e2 = closest_elbow(s2, w, arm.l1, arm.l2, arm.side, angle=realized2)
                 a = posture.palm_forearm_deg(solver, w, v[3], v[4], s2, elbow=e2)
             except ValueError:
@@ -827,28 +1160,115 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
 
     def grown(g, k):
         """The cheap forecast's full cost: the breach plus the swing growth past the baseline's."""
-        return g[0] + SWING_COST * sum(max(0., abs(sw) - abs(base_sw[h][k])) ** 2
+        return g[0] + SWING_COST * sum(max(0., math.degrees(abs(sw) - abs(base_sw[h][k]))) ** 2
                                        for h, sw in zip('LR', g[1]))
 
     picks = [None] * n
     t_pick = time.perf_counter()
-    for k in range(n):
-        if not ((base_ang_g['L'][k] < floor) or (base_ang_g['R'][k] < floor)):
-            continue
+    breach_ks = [k for k in range(n) if (base_ang_g['L'][k] < floor) or (base_ang_g['R'][k] < floor)]
+    pool_workers = ASK_WORKERS if ASK_WORKERS is not None else int(workers or 1)
+    if pool_workers > 1 and len(breach_ks) > 1:
+        # One warm pool handles both the per-sample cheap picks and the independent honest spans, so Windows
+        # spawn + numba cache load is paid only once. Workers keep their own torso and baseline kinematic cache.
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        torso.clear_yield()
+        torso.clear_slide_yield()
+        ctx = dict(torso=torso, paths=paths, rig=rig, trunk=trunk, clearance=clearance, solvers=solvers,
+                   caps=caps, curves=curves, grid=grid, ft=ft, n=n, floor=floor,
+                   base_ang=base_ang, base_ang_g=base_ang_g, base_sw=base_sw, shield=shield, env=env,
+                   kin=kin, room=room, leans=leans, slides=slides)
+        nchunks = min(len(breach_ks), pool_workers * 4)
+        pick_chunks = [breach_ks[i::nchunks] for i in range(nchunks)]
+        ask = np.zeros(n)
+        sask = np.zeros(n)
+        with ProcessPoolExecutor(max_workers=pool_workers, initializer=_ask_init, initargs=(ctx,)) as ex:
+            for chunk_out in ex.map(_pick_job, pick_chunks):
+                for k, pair in chunk_out:
+                    picks[k] = pair
+            _tick('picks', time.perf_counter() - t_pick)
+            print(f'[elbows]   picks {time.perf_counter() - t_pick:.1f}s, {sum(p is not None for p in picks)} of {n} samples '
+                  f'want a body move', flush=True)
+            trig = [k for k in range(n) if picks[k] is not None]
+            runs = []
+            for k in trig:
+                if runs and k - runs[-1][-1] <= 4:
+                    runs[-1].append(k)
+                else:
+                    runs.append([k])
+            ladder_L = [(0., .05), (0., .08), (0., .11), (-.016, .05), (-.016, .08), (-.032, .05), (-.032, .08)]
+            ladder_R = [(0., -.05), (0., -.08), (0., -.11), (.016, -.05), (.016, -.08), (.032, -.05), (.032, -.08)]
+
+            def _cands(run):
+                seen = []
+                for k in run:
+                    if picks[k] not in seen:
+                        seen.append(picks[k])
+                l_bad = any(base_ang_g['L'][k] < floor for k in run)
+                r_bad = any(base_ang_g['R'][k] < floor for k in run)
+                lad = (ladder_L if l_bad else []) + (ladder_R if r_bad else [])
+                if torso.slide_max <= 0.:
+                    lad = [(ln, 0.) for ln, _ in lad if ln != 0.]
+                else:
+                    max_room = float(np.min(room[run])) if len(run) else float(torso.slide_max)
+                    lad = [p for p in lad if abs(p[1]) <= max_room + 1e-9]
+                cands = seen + [p for p in lad if p not in seen]
+                if len(cands) > MAX_HONEST:
+                    worst = sorted(run, key=lambda k: min(base_ang_g['L'][k], base_ang_g['R'][k]))[:3]
+                    cands.sort(key=lambda p: sum(1e9 if (g := cheap(k, *p)) is None else grown(g, k) for k in worst))
+                    cands = cands[:MAX_HONEST]
+                cands.sort(key=lambda p: abs(p[0]) + abs(p[1]))
+                return cands
+
+            t_runs = time.perf_counter()
+            if runs:
+                tasks = [(i, run, _cands(run)) for i, run in enumerate(runs)]
+                torso.clear_yield()
+                torso.clear_slide_yield()
+                ordered = sorted(tasks, key=lambda t: len(t[2]) * len(t[1]), reverse=True)
+                results = {}
+                done = 0
+                futs = [ex.submit(_ask_job, t) for t in ordered]
+                for fut in as_completed(futs):
+                    idx, best_pair, best_cost, base_span = fut.result()
+                    results[idx] = (best_pair, best_cost, base_span)
+                    done += 1
+                    if len(runs) >= 20 and done % max(1, len(runs) // 10) == 0:
+                        print(f'[elbows]   ask {done}/{len(runs)} runs {time.perf_counter() - t_runs:.1f}s', flush=True)
+                for idx, run in enumerate(runs):
+                    best_pair, best_cost, base_span = results[idx]
+                    if best_pair is not None:
+                        _ask_log(chosen=best_pair, span=(run[0], run[-1]), base=round(base_span, 1), cost=round(best_cost, 1))
+                        ask[run] = best_pair[0]
+                        sask[run] = best_pair[1]
+        torso.clear_yield()
+        torso.clear_slide_yield()
+        return ask, sask
+
+    for k in breach_ks:
         base_cost = sum(max(0., floor - base_ang_g[h][k]) ** 2 for h in 'LR')
         best = (0., 0., base_cost)
+        best_ln = (0., base_cost)
+        best_sl = (0., base_cost)
         for ln in leans:                            # the lean alone
             g = cheap(k, ln, 0.)
-            if g is not None and grown(g, k) < best[2] - 1e-9:
-                best = (ln, 0., grown(g, k))
+            if g is not None:
+                gc = grown(g, k)
+                if gc < best_ln[1] - 1e-9:
+                    best_ln = (ln, gc)
+                if gc < best[2] - 1e-9:
+                    best = (ln, 0., gc)
         for sl in slides:                           # the slide alone
             g = cheap(k, 0., sl)
+            if g is not None:
+                gc = grown(g, k)
+                if gc < best_sl[1] - 1e-9:
+                    best_sl = (sl, gc)
+                if gc < best[2] - 1e-9:
+                    best = (0., sl, gc)
+        if best_ln[0] and best_sl[0]:               # the pair the two alone found
+            g = cheap(k, best_ln[0], best_sl[0])
             if g is not None and grown(g, k) < best[2] - 1e-9:
-                best = (0., sl, grown(g, k))
-        if best[0] and best[1]:                     # the pair the two alone found
-            g = cheap(k, best[0], best[1])
-            if g is not None and grown(g, k) < best[2] - 1e-9:
-                best = (best[0], best[1], grown(g, k))
+                best = (best_ln[0], best_sl[0], grown(g, k))
         if best[2] < base_cost - 1e-9 and (best[0] or best[1]):
             picks[k] = (best[0], best[1])
     _tick('picks', time.perf_counter() - t_pick)
@@ -871,8 +1291,11 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
         torso.set_slide_yield(grid, ks_)
         moved = None
         if traced is not None:                  # the body moved on this span and (back) on the last one's: re-trace those
-            moved = (ky != traced.get('y', 0.)) | (ks_ != traced.get('s', 0.))
-            traced['y'], traced['s'] = ky, ks_
+            if ASK_ISOLATE:                     # dev gate: each candidate starts from the baseline, as a pool worker would
+                moved = (ky != 0.) | (ks_ != 0.)
+            else:
+                moved = (ky != traced.get('y', 0.)) | (ks_ != traced.get('s', 0.))
+                traced['y'], traced['s'] = ky, ks_
         try:
             t_ = time.perf_counter()
             count[0] += 1
@@ -916,7 +1339,7 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
                     return None         # a hand inside the study's envelope stays inside it
                 fin = np.isfinite(ang[kf])
                 cost += float(np.sum(np.maximum(0., floor - ang[kf][fin]) ** 2))
-                cost += SWING_COST * float(np.sum(np.maximum(0., np.abs(sw[ks]) - np.abs(base_sw[h][ks])) ** 2))
+                cost += SWING_COST * float(np.sum(np.degrees(np.maximum(0., np.abs(sw[ks]) - np.abs(base_sw[h][ks]))) ** 2))
             _ask_log(pair=p, span=(run[0], run[-1]), cost=round(cost, 1),
                      breach_frames=int((ang[kf] < floor).sum()))
             return cost
@@ -934,21 +1357,35 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
             runs[-1].append(k)
         else:
             runs.append([k])
-    ladder = [(0., .05), (0., .08), (0., .11), (-.016, .05), (-.016, .08), (-.032, .05), (-.032, .08)]
-    t_runs = time.perf_counter()
-    for done, run in enumerate(runs, 1):
-        if len(runs) >= 20 and done % max(1, len(runs) // 10) == 0:
-            print(f'[elbows]   ask {done}/{len(runs)} runs {time.perf_counter() - t_runs:.1f}s', flush=True)
+    ladder_L = [(0., .05), (0., .08), (0., .11), (-.016, .05), (-.016, .08), (-.032, .05), (-.032, .08)]
+    ladder_R = [(0., -.05), (0., -.08), (0., -.11), (.016, -.05), (.016, -.08), (.032, -.05), (.032, -.08)]
+
+    def candidates_of(run):
         seen = []
         for k in run:
             if picks[k] not in seen:
                 seen.append(picks[k])
-        cands = seen + [p for p in ladder if p not in seen]
+        l_bad = any(base_ang_g['L'][k] < floor for k in run)
+        r_bad = any(base_ang_g['R'][k] < floor for k in run)
+        lad = (ladder_L if l_bad else []) + (ladder_R if r_bad else [])
+        if torso.slide_max <= 0.:
+            lad = [(ln, 0.) for ln, _ in lad if ln != 0.]
+        else:
+            max_room = float(np.min(room[run])) if len(run) else float(torso.slide_max)
+            lad = [p for p in lad if abs(p[1]) <= max_room + 1e-9]
+        cands = seen + [p for p in lad if p not in seen]
         if len(cands) > MAX_HONEST:             # the cheap forecast only prunes a pathological pool
             worst = sorted(run, key=lambda k: min(base_ang_g['L'][k], base_ang_g['R'][k]))[:3]
             cands.sort(key=lambda p: sum(1e9 if (g := cheap(k, *p)) is None else grown(g, k) for k in worst))
             cands = cands[:MAX_HONEST]
         cands.sort(key=lambda p: abs(p[0]) + abs(p[1]))     # least motion first: it wins ties
+        return cands
+
+    t_runs = time.perf_counter()
+    for done, run in enumerate(runs, 1):
+        if len(runs) >= 20 and done % max(1, len(runs) // 10) == 0:
+            print(f'[elbows]   ask {done}/{len(runs)} runs {time.perf_counter() - t_runs:.1f}s', flush=True)
+        cands = candidates_of(run)
         kf = (ft >= float(grid[run[0]]) - .5 / RENDER_RATE) & (ft <= float(grid[run[-1]]) + .5 / RENDER_RATE)
         base_span = float(sum(float(np.sum(np.maximum(0., floor - base_ang[h][kf][np.isfinite(base_ang[h][kf])]) ** 2))
                               for h in 'LR'))
@@ -964,7 +1401,7 @@ def _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers,
     return ask, sask
 
 
-def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
+def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None, workers=1):
     """Both arms' swing curves over the piece (times t0..t1): ({hand: dict(times, angles)}, report). The torso's
     cap is set on ``torso`` (the body yields where no swing clears), and where the forced swing would bend the
     rendered wrist past the comfort floor the body leans and slides instead (the wrist-deviation ask,
@@ -981,6 +1418,8 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
     kin = {}        # the traced kinematics per hand, valid while the cap and the body's own move hold
     traced = {}     # the ask arrays the cache was traced on (what a rescan's ``moved`` is measured against)
 
+    W_dirty = int(np.ceil(SMOOTH_TAU / CURVE_STEP)) + 1
+
     def scan_build(moved=None):
         torso.set_cap(grid, caps)       # the scans read the shared cap from the torso
         required = np.ones(n)
@@ -991,7 +1430,9 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
             required = np.minimum(required, d[h]['required'])
         _tick('scan', time.perf_counter() - t_)
         t_ = time.perf_counter()
-        span = None if moved is None or not moved.any() else (int(np.argmax(moved)), int(len(moved) - 1 - np.argmax(moved[::-1])))
+        span = None if moved is None or not moved.any() else (
+            max(0, int(np.argmax(moved)) - W_dirty - 2),
+            min(n - 1, int(len(moved) - 1 - np.argmax(moved[::-1])) + W_dirty + 2))
         curve = _build(d, paths, grid, cache=kin, prev=curves if span is not None else None, dirty=span)
         _tick('build', time.perf_counter() - t_)
         _tick('scan_build')
@@ -1006,17 +1447,23 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
         print(f'[elbows] {name} {now - t_phase:.1f}s', flush=True)
         t_phase = now
 
+    req_acc = np.ones(n)
     for round_ in range(CAP_ROUNDS + 2):
         data, curves, required = scan_build()
+        req_acc = np.minimum(req_acc, required)
         if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
             break
-        caps = _cap_curve(required, n)  # the cap smooths over spans; the next round re-checks both hands on it
+        new_caps = _cap_curve(req_acc, n)
+        if np.allclose(new_caps, caps, atol=1e-4):
+            break
+        caps = new_caps
         kin.clear(), traced.clear()     # a new cap leans the whole body: every sample is re-traced
     phase(f'cap ({round_ + 1} scans, min {float(required.min()):.2f})')
     if solvers is not None:
+        base_data = {h: {k: v.copy() for k, v in data[h].items()} for h in 'LR'}
         t_ask = time.perf_counter()
         ys, ss = _wrist_ask(torso, data, curves, grid, paths, rig, trunk, clearance, solvers, scan_build,
-                            kin=kin, traced=traced)
+                            kin=kin, traced=traced, caps=caps, workers=workers)
         _tick('wrist_ask', time.perf_counter() - t_ask)
         phase('wrist ask')
         if ys.any() or ss.any():
@@ -1026,13 +1473,21 @@ def solve(torso, paths, t0, t1, rig, trunk, clearance=CLEARANCE, solvers=None):
                 torso.set_slide_yield(grid, _ease(ss, CURVE_STEP, YIELD_SLIDE_TAU))
             asked = int(((ys != 0.) | (ss != 0.)).sum())
             # 2. the cap re-checks on the moved body
+            kin.clear(), traced.clear()
+            req_acc = caps.copy()
             for round_ in range(CAP_ROUNDS + 2):
                 data, curves, required = scan_build()
+                req_acc = np.minimum(req_acc, required)
                 if required.min() >= 1. or round_ == CAP_ROUNDS + 1:
                     break
-                caps = _cap_curve(required, n)
+                new_caps = _cap_curve(req_acc, n)
+                if np.allclose(new_caps, caps, atol=1e-4):
+                    break
+                caps = new_caps
                 kin.clear(), traced.clear()
             phase(f'recheck ({round_ + 1} scans, min {float(required.min()):.2f})')
+        else:
+            data = base_data
     damped = {h: _damped(curves[h]) for h in 'LR'}   # what the frames will read; the report below follows it
     phase('damped')
     if os.environ.get('PIANOMOTION_DEBUG_ELBOWS'):       # diagnosis only: the swing curve against its bounds

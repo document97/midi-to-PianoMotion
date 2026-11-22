@@ -1,4 +1,5 @@
 """Input loading, plan export and listening-relevant report."""
+import os
 from pathlib import Path
 
 from .instrument import Instrument
@@ -21,6 +22,11 @@ def load_raw(inputs):
     if missing:
         raise ValueError(f'piece inputs missing: {missing}')
     paths = {k: DATA / v for k, v in {**DEFAULT_INPUTS, **inputs}.items()}
+    # A different character needs its own sampled hand windows and reach radii; the development tables are
+    # kept as the default so existing runs do not change.
+    for key, variable in (('envelopes', 'PIANOMOTION_ENVELOPES'), ('radii', 'PIANOMOTION_RADII')):
+        if os.environ.get(variable):
+            paths[key] = Path(os.environ[variable]).resolve()
     return dict(timeline=load_json(paths['timeline']), demands=load_json(paths['demands']),
                 keyboard=load_json(paths['keyboard_plan'])['keyboard'],
                 envelopes=load_json(paths['envelopes'])['envelopes'], radii=load_json(paths['radii'])['radii'],

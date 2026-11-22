@@ -89,6 +89,10 @@ def radial_dev(arm, yaw, roll, forearm, side):
     from .kinematics import q_mat3
     p = q_mat3(arm.palm_q(yaw, roll)) @ np.array([0., 1., 0.], dtype=FLOAT)
     f = np.asarray(forearm, FLOAT)
+    fn = float(np.linalg.norm(f))
+    if fn < 1e-9:
+        return 0.
+    f = f / fn
     p = p - (p @ f) * f
     th = np.array([-side, 0., 0.], dtype=FLOAT)
     th = th - (th @ f) * f
@@ -122,9 +126,12 @@ def turn_to_keys(arm, wrist, yaw, roll, elbow, tol=KEY_TOL, floor=KEY_FLOOR,
     # its own. Clamping it in makes an out-of-range input searchable instead of silently unalignable.
     roll = float(np.clip(roll, ROLL_BOUNDS[0], ROLL_BOUNDS[1]))
     here = abs(finger_deg(arm, yaw, roll))
-    if here <= tol:
-        return (float(yaw), float(roll)), palm_vs(arm, yaw, roll, forearm)
-    best, best_palm = (here, float(yaw), float(roll)), palm_vs(arm, yaw, roll, forearm)
+    here_palm = palm_vs(arm, yaw, roll, forearm)
+    here_dev = radial_dev(arm, yaw, roll, f, side) if side else 0.
+    here_ok = (here_palm >= floor) and (not side or (-ulnar_max <= here_dev <= radial_max))
+    if here <= tol and here_ok:
+        return (float(yaw), float(roll)), here_palm
+    best, best_palm = ((here if here_ok else float('inf')), float(yaw), float(roll)), here_palm
     for droll in rolls:
         r = roll + droll
         if not (ROLL_BOUNDS[0] <= r <= ROLL_BOUNDS[1]):
@@ -136,7 +143,7 @@ def turn_to_keys(arm, wrist, yaw, roll, elbow, tol=KEY_TOL, floor=KEY_FLOOR,
                 if d < floor:           # the wrist's floor: this way is closed, the other side may still be open
                     continue
                 dev = radial_dev(arm, y, r, f, side) if side else 0.   # + toward the thumb, - toward the little finger
-                if side and ((sgn == -side and dev > radial_max) or (sgn == side and -dev > ulnar_max)):
+                if side and ((sgn == side and dev > radial_max) or (sgn == -side and -dev > ulnar_max)):
                     continue            # a lean past either cap: the hand reads wrenched -- the
                 f_deg = abs(finger_deg(arm, y, r))   # forearm should have moved, so this pose is not taken
                 if f_deg <= tol:
@@ -198,15 +205,17 @@ def natural_orientation(solver, wrist, shoulder=None, elbow=None, keys=True):
         forearm_yaw = math.degrees(math.atan2(forearm[0], forearm[1]))
     yaw = (HAND_FOLLOW * forearm_yaw - y0) / dy
     roll = (-LITTLE_SIDE_DOWN - t0) / dt
-    if KEY_AIM and keys and elbow is not None:   # the keys are the aim; the corridor's line is this turn's floor
+    key_aimed = bool(KEY_AIM and keys and elbow is not None)
+    if key_aimed:   # the keys are the aim; the corridor's line is this turn's floor
         (yaw, roll), _ = turn_to_keys(arm, wrist, yaw, roll, elbow, strict=True, side=arm.side)
-    elif PALM_CORRIDOR and abs(dy) > 1e-9:  # the comfort corridor: where the relaxed hand would sit below the
+    if PALM_CORRIDOR and abs(dy) > 1e-9:  # the comfort corridor: where the relaxed hand would sit below the
         now = palm_forearm_deg(solver, wrist, yaw, roll, shoulder, elbow=elbow)   # sustained line, the palm follows
-        if now < PALM_SOFT_DEG:         # the forearm further -- the wrist unbends (the arm line, not the hand's
+        soft = KEY_FLOOR if key_aimed else PALM_SOFT_DEG
+        if now < soft:                  # the forearm further -- the wrist unbends (the arm line, not the hand's
             full = (forearm_yaw - y0) / dy   # bend, carries the reach); never past the forearm itself
             far = palm_forearm_deg(solver, wrist, full, roll, shoulder, elbow=elbow)
             if far > now:
-                share = 1. if far <= PALM_SOFT_DEG else min(1., HAND_FOLLOW + (1. - HAND_FOLLOW) *
-                                                            (PALM_SOFT_DEG - now) / (far - now))
+                share = 1. if far <= soft else min(1., HAND_FOLLOW + (1. - HAND_FOLLOW) *
+                                                   (soft - now) / (far - now))
                 yaw = (share * forearm_yaw - y0) / dy
     return np.array([yaw, roll], dtype=FLOAT)

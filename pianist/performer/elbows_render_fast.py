@@ -50,6 +50,8 @@ if njit is not None:
     @njit(cache=True, fastmath=False, nogil=True)
     def _eval_one(times, values, slopes, t):
         n = len(times)
+        if n == 0:
+            return 0.
         if n == 1:
             return values[0, 0]
         # searchsorted(times, t, side='right') - 1, clipped to [0, n-2]
@@ -77,7 +79,7 @@ if njit is not None:
         return (h00 * values[i, 0] + h10 * h * slopes[i, 0]
                 + h01 * values[i + 1, 0] + h11 * h * slopes[i + 1, 0])
 
-    @njit(cache=True, fastmath=False, nogil=True, parallel=True)
+    @njit(cache=True, fastmath=False, nogil=True)
     def _eval_many(times, values, slopes, queries, out):
         for i in range(len(queries)):
             out[i] = _eval_one(times, values, slopes, queries[i])

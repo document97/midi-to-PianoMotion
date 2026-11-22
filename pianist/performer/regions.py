@@ -41,6 +41,11 @@ def performer_solvers(rig):
     for solver in solvers.values():
         deepen(solver.regions)
         solver.neutral = solver.neutral + PLAYING_WRIST_OFFSET
+        if rig.data.get('piano_clearance') and PLAYING_WRIST_OFFSET[2] > 0:
+            # Newer rigs export the keybed envelope and seat the wrist at the pair table's height. Raising
+            # the playing wrist must not take away the table's downward travel: without this, low right-hand
+            # chords (G3-D4, B3-G4) clip the lower bound by 5 mm and become unsolvable for this hand.
+            solver.wrist_travel = solver.wrist_travel + np.array([0., 0., PLAYING_WRIST_OFFSET[2]], dtype=FLOAT)
         if hips:                            # the elbow rests against the ribs, never inside them
             center = .5 * (float(hips[0][0]) + float(hips[1][0]))
             solver.arm.set_body_wall(center, .5 * abs(float(hips[1][0]) - float(hips[0][0])) + BODY_SHELL)
