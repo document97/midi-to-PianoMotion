@@ -1,13 +1,27 @@
 """Read-only: every key's animation in the .blend against the run's motion.npz; the damper pedal (foot, extender pedal,
 piano pedal, exact pedal state); stale animation elsewhere; scene playback settings."""
-import bpy, json, sys, numpy as np
+import bpy, json, os, sys, numpy as np
 from pathlib import Path
 run = Path(sys.argv[sys.argv.index('--') + 1])
 z = np.load(run / 'motion.npz'); t = z['times']; P = [int(p) for p in z['key_pitches']]
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'lib')]
 from performer import staging as ST
-rig = json.load(open(ROOT / 'performer' / 'rig_cache' / 'rig.json', encoding='utf-8'))
+
+
+def run_rig(run):
+    """The rig this run was solved with: PIANOMOTION_RIG, the cache, or the file beside the run (its report names it)."""
+    if os.environ.get('PIANOMOTION_RIG'):
+        return Path(os.environ['PIANOMOTION_RIG'])
+    report = run / 'report.json'
+    name = json.loads(report.read_text(encoding='utf-8')).get('rig', 'rig_unscaled.json') if report.exists() else 'rig.json'
+    for candidate in (ROOT / 'performer' / 'rig_cache' / name, run.parent / name):
+        if candidate.is_file():
+            return candidate
+    return ROOT / 'performer' / 'rig_cache' / name
+
+
+rig = json.load(open(run_rig(run), encoding='utf-8'))
 fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
 frames = 1 + t * fps
 def curves(ob):

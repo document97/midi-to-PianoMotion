@@ -9,6 +9,8 @@ Everything is fitted to the posed skin, not to fixed numbers:
 - pressing turns the right boot about its heel tip and the piano's damper pedal about its back end, by the same
   depth at the contact.
 """
+import os
+
 import bpy
 import numpy as np
 from mathutils import Matrix, Vector
@@ -16,8 +18,10 @@ from mathutils import Matrix, Vector
 from thumb_driver import mesh_world
 
 PEDAL_DEPTH = .008             # m the damper pedal goes down where the foot presses
-PIANO_DAMPER = 'piano_part_034'   # the grand's right pedal
-FLOOR = 'floor'                # the floor object (its top is the floor height; 0 without one)
+# Scene object names are configuration, not constants: the instrument and room may come from another file.
+PIANO_DAMPER = os.environ.get('PIANOMOTION_DAMPER') or 'piano_part_034'   # the grand's right pedal
+FLOOR = os.environ.get('PIANOMOTION_FLOOR') or 'floor'                     # top of the floor; 0 without one
+BENCH_SEAT = os.environ.get('PIANOMOTION_BENCH') or 'bench_seat'
 # The seating script drops the leg IK constraints, so the IK target bones drive nothing. The legs are placed here
 # by an analytic two-bone solve that writes FK rotations straight onto the thigh/shin/foot bones; the mesh is
 # skinned to the matching 足D/ひざD/足首D bones, which follow those rotations through their own constraint chain.
@@ -35,9 +39,9 @@ def fit_bench(skin):
     """Lower the bench top to the lowest seated-body point over it behind the hip joints (the buttocks carry the
     weight; the thighs in front slope down to the knees and press into the front edge); the legs get shorter.
     Returns the drop (m)."""
-    if 'bench_seat' not in bpy.data.objects:
+    if BENCH_SEAT not in bpy.data.objects:
         return 0.
-    seat = bpy.data.objects['bench_seat']
+    seat = bpy.data.objects[BENCH_SEAT]
     coords, _ = mesh_world(skin)
     seated = {g.index for g in skin.vertex_groups if g.name in SEATED_BONES}
     bones = skin.find_armature().data.bones

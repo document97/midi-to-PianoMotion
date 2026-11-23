@@ -21,7 +21,7 @@ from pathlib import Path
 import sys
 import time
 
-# Windows spawn otherwise picks sys._base_executable. For a venv (ComfyUI here) that is the base Python, so the
+# Windows spawn otherwise picks sys._base_executable. For a virtualenv that is the base Python, so the
 # pool silently ran under a second interpreter without numba. Pin every worker to the interpreter running this
 # module: one Python for the parent, the planner and all workers.
 if sys.platform == 'win32':
@@ -70,7 +70,11 @@ LEGACY_RIG = 'rig_unscaled.json'   # runs whose report does not name its rig wer
 def run_rig(run):
     """The rig a run directory's motion was solved with (checks must measure a run on its own rig)."""
     report = json.loads((Path(run) / 'report.json').read_text(encoding='utf-8'))
-    return HERE / 'rig_cache' / report.get('rig', LEGACY_RIG)
+    name = report.get('rig', LEGACY_RIG)
+    for candidate in (HERE / 'rig_cache' / name, Path(run).parent / name):
+        if candidate.is_file():
+            return candidate
+    return HERE / 'rig_cache' / name
 FRAME_RATE = 60.                  # samples per second (written as fractional scene frames)
 # The second orientation pass (section 4.6: the hands re-aim at the forearms the elbows placed) is an A/B switch:
 # PIANOMOTION_REAIM=0 gives the single-pass behaviour, for comparing against an older run without editing code.
@@ -1171,6 +1175,10 @@ def _mark(name, t0, stages):
 
 
 def run(args):
+    from . import elbows_fast, elbows_render_fast, fast_settle
+    fast_settle.require()
+    elbows_fast.require()
+    elbows_render_fast.require()
     started = time.perf_counter()
     stages = {}
     workers = args.workers

@@ -7,9 +7,9 @@ An unofficial open-source recreation of the piano performance feature of **BSide
 Give it a MIDI file and a 3D character plays it on a piano in Blender:
 
 1. **Planning**: decides which hand and which finger plays each note, when each finger lets go of its key, and which notes have to be left out because the hand cannot reach them. The planner splits the notes between the hands itself; the score does not need to be separated into hands.
-2. **Motion**: animates the arms, wrists, fingers, the upper body, the right foot on the sustain pedal and every key, and writes it all into a `.blend` with preview audio.
+2. **Motion**: animates the arms, wrists, fingers, the upper body, subtle head/eye gaze tracking, the right foot on the sustain pedal and every key, and writes it all into a `.blend` with preview audio.
 
-No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything runs on the CPU in parallel processes, the most expensive solves compiled to machine code with numba. A 160-second piece (Daylight) takes about 8 minutes on 16 processes.
+No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything runs on the CPU in parallel processes, with all core solves compiled to machine code via `numba` (no GPU or pure-NumPy fallback). A 160-second piece (Daylight) takes about 8 minutes on 16 processes.
 
 > **Demo video:** https://www.bilibili.com/video/BV1QEnc6rECK/
 
@@ -25,8 +25,8 @@ So this project exists. I want to recreate that feature as faithfully as I can.
 
 - **Notes out of reach are left out, not forced.** Which keys one hand can hold together is measured on the character's own hand; keys at the far ends of the keyboard that stay out of reach after the upper body has leaned and slid along the bench are left out too. The top and bottom voices and the louder, longer notes are kept first. Daylight loses 15 of its 1049 notes; dense arrangements with wide spans lose many more (an extreme test piece of 3135 notes lost 18%).
 - **Crossed hands are not supported.**
-- **Playing motion only.** The upper body leans forward and sideways and slides along the bench, the shoulders come forward for a far reach, and the hands rest on the lap before and after the piece. There is no expressive movement with the music, clothes and hair are not handled, and nothing is rendered.
-- **Tuned on one character and one piano only** (see "The development character"), and run on Windows only.
+- **Playing motion only.** The upper body leans forward and sideways and slides along the bench, the shoulders come forward for a far reach, the hands automatically fit and rest on the character's thighs before and after the piece, and the head and eyes follow the active keyboard register with restrained micro-gaze (plus automatic blinking when a blink shape key is present). Facial expressions, clothes and hair physics, and video rendering are not handled.
+- **Multi-character adaptation supported.** Parameters were first tuned on the development character and now expose environment-variable overrides for custom characters (see below); primarily tested on Windows.
 
 ## What is in the repository
 
@@ -44,10 +44,10 @@ Only the algorithm. The character, piano and scene models used during developmen
 
 ## Requirements
 
-- **Python** with `numpy`, `scipy`, `mido` and `numba`. `numba` is required: the most expensive solves run compiled, about ten times faster than numpy, and without it the program stops and says to install it. The first run compiles, and the result stays on disk until the code changes.
-- **Blender**. Its own Python only reads and writes the scene; the solve runs in the Python above.
+- **Python** with `numpy`, `scipy`, `mido` and `numba`. **`numba` is strictly required** (GPU and pure-NumPy fallbacks have been removed): all core solves run compiled to machine code, and without `numba` the solver stops immediately at startup and tells you to run `pip install numba`. The first run compiles and caches the result on disk until the code changes.
+- **Blender**. Its own Python only reads and writes the scene (no `numba` needed inside Blender); the solve runs in the Python above.
 - **Preview audio** (`preview.wav` in the output folder; required: without it the solve stops at its last step, the audio): [FluidSynth](https://github.com/FluidSynth/fluidsynth/releases) (the Windows build unpacked into `tools/fluidsynth/`) and Dore Mark's Fazioli F308 SF2 (a Fazioli grand, converted by soundfonts4u; that site is gone, the [Hugging Face mirror](https://huggingface.co/datasets/projectlosangeles/soundfonts4u) has `Dore Mark's Fazioli F308-v2.6.sf2`, which goes into `tools/fazioli/`). If they are somewhere else, set `PIANOMOTION_FLUIDSYNTH` and `PIANOMOTION_SOUNDFONT`. The output is WAV with one uniform gain and nothing else.
-- Developed on Windows 11, Python 3.12 and Blender 5.2; other setups have not been tested. The listening measure in the report (how many dB each band lacks against the source) reads the General MIDI samples that come with Windows (`gm.dls`); on another system that has to be replaced (`SOUNDBANK` in `planner/audio.py`).
+- Developed on Windows 11, Python 3.12 and Blender 5.2. The listening measure in the report (how many dB each band lacks against the source) uses a General MIDI DLS bank: auto-detected on Windows (`gm.dls`) and macOS (`gs_instruments.dls`), or set via `PIANOMOTION_SOUNDBANK` on Linux / custom setups.
 
 ## Using your own character
 
@@ -96,8 +96,12 @@ Options and environment variables:
 | `--skip-solve` | no new solve: write the `.blend` again from the results already in the output folder |
 | `--workers N` | number of solver processes |
 | `inputs/<piece>/motion.json` | how high the hands lift in this piece, as a factor, e.g. `{"lift": 0.8}` |
-| `PIANOMOTION_PYTHON` | the Python that runs the solve (the one that has numba). Unset: the `python` found on `PATH` |
+| `PIANOMOTION_PYTHON` | the Python that runs the solve (must have `numba` installed). Unset: the `python` found on `PATH` |
 | `PIANOMOTION_RIG` | another exported skeleton instead of `performer/rig_cache/rig.json` |
+| `PIANOMOTION_HAND_CALIBRATION` | custom character hand calibration JSON (default `pianist/hand_calibration.json`) |
+| `PIANOMOTION_ENVELOPES` / `PIANOMOTION_RADII` | custom character finger ROM envelopes / conservative pad reach radii tables |
+| `PIANOMOTION_CHARACTER_SCALE` / `PIANOMOTION_HAND_SCALE` | override character overall scale / hand scale (must match between `rig_export.py` and `blender_main.py`) |
+| `PIANOMOTION_SOUNDBANK` | path to a General MIDI `.dls` bank for the fidelity metric (auto-detected on Windows/macOS) |
 
 By default the process count is every thread of the big cores of the CPU: on Intel hybrid (P-cores / E-cores) and Arm big.LITTLE only the performance cores, on a CPU with one kind of core every thread. The processes are pinned to those cores (Windows and Linux read the core types from the system; macOS only takes the number of performance cores, without pinning).
 

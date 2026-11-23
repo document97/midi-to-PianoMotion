@@ -190,12 +190,12 @@ class Trunk:
         return cls.from_dict(json.loads(Path(path).read_text(encoding='utf-8')))
 
     def _packed(self):
-        """The kernel's copies of the hull tables, built once (None without numba: the numpy path runs)."""
+        """The compiled kernel's copies of the hull tables, built once (requires numba)."""
         hit = self._fast
         if hit is None:
-            hit = elbows_fast.pack(self) if elbows_fast.available() else False
+            hit = elbows_fast.pack(self)
             self._fast = hit
-        return hit or None
+        return hit
 
     def _unit_rot(self, R):
         if not self.unit_frame:
@@ -223,28 +223,13 @@ class Trunk:
 
     def swing(self, shoulder, wrist, l1, l2, side, matrix, hand):
         """The arm's capsules' depth per swing angle (shoulder and wrist kept): (angles, depth, the elbow's rise
-        above the wrist). The free arcs are read off these by the caller (a clearance margin, or touching at all).
-        One sample: the compiled kernel takes it as a block of one (elbows_fast), the numpy body below is the
-        fallback where numba is missing and the reference the kernel is checked against."""
-        packed = self._packed()
-        if packed is not None:
-            m = np.asarray(matrix, float)
-            depth, rise, ok = self.swing_block(np.asarray(shoulder, float)[None], np.asarray(wrist, float)[None],
-                                               m[None, :3, :3], m[None, :3, 3], l1, l2, side, hand)
-            if not ok[0]:
-                raise ValueError('Arm target outside unstretched reach')
-            return TRUNK_ANG, depth[0], rise[0]
-        center, radius, t, q = elbow_circle(shoulder, wrist, l1, l2, side)
-        ang = np.radians(np.arange(-180., 180., ANGLE_STEP))
-        e = center + radius * (np.cos(ang)[:, None] * t + np.sin(ang)[:, None] * q)
-        s = np.asarray(shoulder, float)
-        w = np.asarray(wrist, float)
-        up = s + UP[:, None, None] * (e[None] - s)
-        fo = e[None] + FO[:, None, None] * (w - e)[None]
-        r_up, r_fo = self.radius[hand]
-        d_up = self.depth(up, matrix).reshape(len(UP), -1).max(0) + r_up
-        d_fo = self.depth(fo, matrix).reshape(len(FO), -1).max(0) + r_fo
-        return ang, np.maximum(d_up, d_fo), e[:, 2] - w[2]
+        above the wrist). Always runs compiled via elbows_fast (numba required)."""
+        m = np.asarray(matrix, float)
+        depth, rise, ok = self.swing_block(np.asarray(shoulder, float)[None], np.asarray(wrist, float)[None],
+                                           m[None, :3, :3], m[None, :3, 3], l1, l2, side, hand)
+        if not ok[0]:
+            raise ValueError('Arm target outside unstretched reach')
+        return TRUNK_ANG, depth[0], rise[0]
 
     def swing_block(self, S, W, R, O, l1, l2, side, hand):
         """``swing`` for a whole scan at once: (depth, rise, ok), each (n, angles) / (n,) -- the compiled kernel,
@@ -449,16 +434,14 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance, kin=None, moved
     mask = np.zeros(n, bool)
     mask[todo] = True
     # One pass of kinematics (shoulder, wrist, trunk matrix -- cheap), then the whole grid's hull tests in one
-    # block: the samples are independent, so the compiled kernel spreads them over the cores instead of the
-    # numpy path's per-sample temporaries. Without numba the block is skipped and the loop below swings one
-    # sample at a time, exactly as before.
+    # compiled block (numba required).
     S, W, M, have = _trace(torso, path, grid, label, kin, None if fresh else moved)
     st['have'][todo] = have[todo]
     reach = st['have'].copy()           # the traced reachability; the swing's verdict on top of it is this scan's
     for i in todo[reach[todo]]:
         ws[i] = W[i]
     ang = TRUNK_ANG
-    if trunk._packed() is not None and (reach & mask).any():
+    if (reach & mask).any():
         idx = np.flatnonzero(reach & mask)
         blk, ris, ok = trunk.swing_block(S[idx], W[idx], M[idx, :3, :3], M[idx, :3, 3],
                                          arm.l1, arm.l2, arm.side, hand)
@@ -516,7 +499,7 @@ def _scan(torso, path, grid, arm, label, hand, trunk, clearance, kin=None, moved
                         s, m_i = moved_s, torso.trunk_world(t, cap=float(share))
                         body_moved = True
                         break
-        if trunk._packed() is None or body_moved:
+        if body_moved:
             try:
                 _, deep_i, rise = trunk.swing(s, w, arm.l1, arm.l2, arm.side, m_i, hand)
                 tgt_i = closest_elbow_angle(s, w, arm.l1, arm.l2, arm.side)
@@ -796,17 +779,8 @@ def _rendered(torso, curve, times, path, h, arm, solver):
     from .arm import closest_elbow
     from . import elbows_render_fast as RF
     tq = np.atleast_1d(np.asarray(times, float))
-    # The curve's hermite is evaluated for every query frame. In the wrist ask this is called hundreds of
-    # times over the render-rate grid; the compiled batch does the pchip slopes and all frames in one kernel
-    # (identical formulas, ~0.8 ms instead of ~330 ms of Python loops). Blender has no numba: keep the
-    # original per-frame path there, byte-for-byte.
-    if RF.available():
-        phi_all = RF.eval_many(curve['times'], curve['angles'][:, None], tq)
-    else:
-        from .motion import pchip_slopes, hermite_eval
-        sl = pchip_slopes(curve['times'], curve['angles'][:, None])
-        phi_all = np.array([float(hermite_eval(curve['times'], curve['angles'][:, None], sl, float(x))[0])
-                            for x in tq])
+    # The curve's hermite is evaluated for every query frame via the compiled batch kernel (numba required).
+    phi_all = RF.eval_many(curve['times'], curve['angles'][:, None], tq)
     out = np.full(len(tq), np.nan)
     for k, t in enumerate(tq):
         try:

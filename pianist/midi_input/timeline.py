@@ -119,7 +119,7 @@ def load_midi(path,hand_map=None):
         for note in bank:
             diagnostics.append(dict(kind='unclosed_note',id=note['id'],source_event=note['source_event']))
     end_tick=max((event['tick'] for event in events),default=0)
-    return dict(schema='midi-musical-timeline',source=str(path),
+    return dict(schema='midi-musical-timeline',source=path.name,
         source_sha256=hashlib.sha256(payload).hexdigest(),midi_type=midi.type,
         ticks_per_quarter=midi.ticks_per_beat,duration=clock.seconds_at_tick(end_tick),
         tempo_events=tempo_events,tempo_map=clock.rows,tracks=names,events=events,

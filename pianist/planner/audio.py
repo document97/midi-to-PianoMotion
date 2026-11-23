@@ -5,8 +5,9 @@
 PEAK_DB), nothing else: no compression, EQ or effects (FluidSynth's reverb and chorus off). A note the planner shortens is let go at its key
 lift, so its sound stops where the source damper closes after it.
 
-``synthesize`` is the plainer in-house sampler (Windows GM samples, the envelope of lib/render_bound_piano_audio.py)
-the fidelity measure compares plans with: unnormalised, at one gain for two plans.
+``synthesize`` is the plainer in-house sampler (a General MIDI DLS bank, the envelope of lib/render_bound_piano_audio.py)
+the fidelity measure compares plans with: unnormalised, at one gain for two plans. Windows ships the bank it was
+developed against; elsewhere PIANOMOTION_SOUNDBANK names a DLS file.
 """
 import math
 import os
@@ -23,7 +24,7 @@ from midi_input.damper_open_tail import DamperClock
 from midi_input.preview_clock import selected_preview_clock
 
 TOOLS = Path(__file__).resolve().parents[1] / 'lib'
-SOUNDBANK = Path('C:/Windows/System32/drivers/gm.dls')
+SOUNDBANK_ENV = 'PIANOMOTION_SOUNDBANK'   # a General MIDI DLS bank for the in-house sampler
 RATE = 44100
 TOOLS_DIR = Path(__file__).resolve().parents[2] / 'tools'     # downloaded once, never committed (README)
 FLUIDSYNTH = Path(os.environ.get('PIANOMOTION_FLUIDSYNTH', TOOLS_DIR / 'fluidsynth' / 'bin' / 'fluidsynth.exe'))
@@ -34,10 +35,35 @@ PEAK_DB = -1.
 MIDI_TICKS_PER_SECOND = 2000          # the preview MIDI's clock (0.5 ms)
 
 
+def soundbank():
+    """The GM DLS bank ``synthesize`` reads: ``PIANOMOTION_SOUNDBANK`` first, then the platform's own.
+
+    Windows ships ``gm.dls``; macOS ships the CoreAudio DLS bank. Other systems have no fixed location, so a
+    Linux run must set the variable. The parser in lib/render_bound_piano_audio.py reads DLS, not SF2.
+    """
+    configured = os.environ.get(SOUNDBANK_ENV)
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f'{SOUNDBANK_ENV}={configured} is not a file')
+        return path
+    candidates = []
+    if sys.platform == 'win32':
+        candidates.append(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'drivers' / 'gm.dls')
+    elif sys.platform == 'darwin':
+        candidates.append(Path('/System/Library/Components/CoreAudio.component/Contents/Resources/gs_instruments.dls'))
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f'no General MIDI DLS bank for the fidelity preview; set {SOUNDBANK_ENV} to a .dls file '
+        '(Windows: %SystemRoot%\\System32\\drivers\\gm.dls)')
+
+
 def _regions():
     sys.path.insert(0, str(TOOLS))
     from render_bound_piano_audio import piano_regions
-    return piano_regions(SOUNDBANK)
+    return piano_regions(soundbank())
 
 
 def render(timeline, note_ids, path, duration=None, cut_releases=None, lead=0.):

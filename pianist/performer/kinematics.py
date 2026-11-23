@@ -78,8 +78,8 @@ SWING_LATERAL = {1: 50., 5: 32.}
 # calibration's working bound allows 5 deg, which reads as a stiff, straight tip).
 LAST_JOINT_MIN = 14.
 # The web between neighbouring fingers: how far apart two neighbours may open (deg, the angle of their first phalanges
-# seen on the palm), each swinging sideways on its own up to SWING_LATERAL / the rig's bounds. From a pianist's right
-# hand (references/analysis/for_elise_060: index-middle p95 17 / p99 20, middle-ring 13 / 20, ring-little 52 / 66,
+# seen on the palm), each swinging sideways on its own up to SWING_LATERAL / the rig's bounds. From a reference
+# pianist's right hand (index-middle p95 17 / p99 20, middle-ring 13 / 20, ring-little 52 / 66,
 # measured from a hand whose little finger rests ~22 deg further out than this rig's), the opening beyond which a
 # shape strains (free) and its limit (hard). Thumb to index: not measured; an estimate of the web's reach.
 WEB_FREE = {1: 55., 2: 15., 3: 11., 4: 30.}      # gap after digit d (d, d + 1)

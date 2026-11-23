@@ -3,6 +3,9 @@ __pycache__/
 # per-character data: made from your own character, never committed
 pianist/hand_calibration.json
 pianist/performer/rig_cache/
+# generated per-piece MIDI inputs: keep only the instrument tables and builder script
+pianist/inputs/*/
+!pianist/inputs/instrument/
 output/
 *.blend
 *.blend1

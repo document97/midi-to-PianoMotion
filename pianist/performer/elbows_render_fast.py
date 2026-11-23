@@ -6,27 +6,27 @@ and then evaluated it one frame at a time in another Python loop (~190 ms). Thos
 loops are ~330 ms of the ~350 ms the renderer spends per call, 558 calls per piece.
 
 This module compiles both loops. Results are bit-for-bit the same formulas as
-motion.pchip_slopes / motion.hermite_eval (Fritsch-Carlson slopes, cubic Hermite),
-so enabling it changes no animation. numba is optional: available() is False under
-Blender's Python and _rendered keeps its original path there.
-PIANOMOTION_FAST_RENDER=0 forces the numpy path for A/B cross-checking.
+motion.pchip_slopes / motion.hermite_eval (Fritsch-Carlson slopes, cubic Hermite).
+numba is required for the solver (``require()`` raises ImportError if missing).
 """
-import os
-
 import numpy as np
 
-OPTED_OUT = os.environ.get('PIANOMOTION_FAST_RENDER', '1') == '0'
 njit = None
-if not OPTED_OUT:
-    try:
-        from numba import njit as _njit
-        njit = _njit
-    except ImportError:
-        njit = None
+try:
+    from numba import njit as _njit
+    njit = _njit
+except ImportError:
+    njit = None
 
 
 def available():
     return njit is not None
+
+
+def require():
+    if njit is None:
+        raise ImportError('numba is required (pip install numba): elbows_render_fast runs compiled with no numpy fallback.')
+    return True
 
 
 if njit is not None:
@@ -88,12 +88,14 @@ if njit is not None:
 
 def slopes(times, values):
     """Compiled pchip_slopes; values (n, k)."""
+    require()
     return _slopes(np.ascontiguousarray(times, dtype=np.float64),
                    np.ascontiguousarray(values, dtype=np.float64))
 
 
 def eval_many(times, values, t_query):
     """Compiled batched hermite evaluation of a pchip curve at 1-d query times."""
+    require()
     t = np.ascontiguousarray(times, dtype=np.float64)
     v = np.ascontiguousarray(values, dtype=np.float64).reshape(len(t), -1)
     q = np.ascontiguousarray(np.atleast_1d(t_query), dtype=np.float64)

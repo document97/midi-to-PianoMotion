@@ -13,28 +13,31 @@ larger than a scalar. The per-sample result is identical to Trunk.swing's by con
 elbow_circle (including its two ``1e-4`` reach guards, reported as ``ok`` instead of raised), the same
 nearest-slice rule (searchsorted then the nearer of the two neighbours), the same padded hull rows.
 
-numba is optional: without it ``available()`` is False and Trunk falls back to the numpy path, which is
-what runs under Blender's Python as well. PIANOMOTION_FAST_ELBOWS=0 forces the numpy path for
-cross-checking. The compiled code is cached on disk and rebuilt only when this file changes.
+numba is required for the solver (``require()`` raises ImportError if missing; importing this module still works
+under Blender's Python, which does not run the solver). The compiled code is cached on disk and rebuilt only when
+this file changes.
 """
 import math
-import os
 
 import numpy as np
 
-OPTED_OUT = os.environ.get('PIANOMOTION_FAST_ELBOWS', '1') == '0'
 njit = None
 prange = range
-if not OPTED_OUT:
-    try:
-        from numba import njit, prange as _prange
-        prange = _prange
-    except ImportError:
-        njit = None
+try:
+    from numba import njit, prange as _prange
+    prange = _prange
+except ImportError:
+    njit = None
 
 
 def available():
     return njit is not None
+
+
+def require():
+    if njit is None:
+        raise ImportError('numba is required (pip install numba): elbows_fast runs compiled with no numpy fallback.')
+    return True
 
 
 if njit is not None:
@@ -134,6 +137,7 @@ if njit is not None:
 
 def pack(trunk):
     """The outline's arrays for the kernel, built once per Trunk (the owner keeps it)."""
+    require()
     return dict(keys=np.ascontiguousarray(trunk.keys, dtype=np.int64),
                 origin=np.ascontiguousarray(trunk.origin, dtype=np.float64),
                 normal=np.ascontiguousarray(trunk.normal, dtype=np.float64),
@@ -142,6 +146,7 @@ def pack(trunk):
 
 def swing_block(packed, S, W, R, O, l1, l2, side, rup, rfo, cosv, sinv, up, fo):
     """(depth, rise, ok) for every sample: depth (n, angles), rise (n, angles), the elbow's rise above the wrist."""
+    require()
     S = np.ascontiguousarray(S, dtype=np.float64)
     W = np.ascontiguousarray(W, dtype=np.float64)
     R = np.ascontiguousarray(R, dtype=np.float64)

@@ -1,8 +1,12 @@
 """Measured seating correction and slow torso assistance, in world space."""
 import math
+import os
 import bpy
 import numpy as np
 from mathutils import Matrix, Quaternion, Vector
+
+BENCH_SEAT = os.environ.get('PIANOMOTION_BENCH') or 'bench_seat'
+BENCH_LEGS = tuple(os.environ.get('PIANOMOTION_BENCH_LEGS', 'bench_leg,bench_leg.001').split(','))
 
 
 def apply_seating(arm, cal):
@@ -13,10 +17,10 @@ def apply_seating(arm, cal):
             raise ValueError('Scene already has a different seating correction')
         return
     world=root.matrix_world.copy();world.translation+=offset;root.matrix_world=world
-    seat=bpy.data.objects.get('bench_seat')
+    seat=bpy.data.objects.get(BENCH_SEAT)
     if seat:
         world=seat.matrix_world.copy();world.translation+=offset;seat.matrix_world=world
-    for name in ('bench_leg','bench_leg.001'):
+    for name in BENCH_LEGS:
         leg=bpy.data.objects.get(name)
         if leg is None or leg.type!='MESH':continue
         leg.data=leg.data.copy();world=leg.matrix_world.copy();inverse=world.inverted()

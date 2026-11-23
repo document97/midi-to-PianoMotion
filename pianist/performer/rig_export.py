@@ -259,7 +259,7 @@ def clean_performer_hierarchy(arm, skin):
     for child in list(arm.children):
         if child.type == 'EMPTY' and not child.children:
             bpy.data.objects.remove(child, do_unlink=True)
-    # 2. Unparent armature from any wrapper Empty (e.g. 芙宁娜·春日手信) while preserving matrix_world & scale stamps
+    # 2. Unparent armature from any wrapper Empty (e.g. an MMD root Empty) while preserving matrix_world & scale stamps
     parent = arm.parent
     if parent is not None and parent.type == 'EMPTY':
         mw = arm.matrix_world.copy()
@@ -288,7 +288,7 @@ def clean_performer_hierarchy(arm, skin):
         skin.name = 'performer_skin'
         skin.data.name = 'performer_skin'
     # 4. Sync armature data-block name to the armature object name (fixes mod templates where internal data
-    # still carries another character's name such as 星穹铁道—流萤·春日手信.001 on 芙宁娜·春日手信_arm).
+    # still carries another character's leftover data-block name).
     arm.data.name = arm.name
     bpy.context.view_layer.update()
 
@@ -631,10 +631,9 @@ def write_trunk(out, trunk):
         raise SystemExit(f'trunk.json needs the rig it describes: {out} is missing (export the rig first)')
     trunk = dict(trunk, rig_sha256=hashlib.sha256(out.read_bytes()).hexdigest())
     text = json.dumps(trunk)
-    # Named after its rig: several seats exported into one directory (output/clips/seat_rigs holds base/left10/
-    # left15) used to share a single trunk.json, so every rig but the one it was traced from read a stale outline
-    # and silently lost its swing. The unsuffixed name is still written for rig.json, which is the single-rig cache
-    # every existing run and every older loader looks for.
+    # Named after its rig: several seats exported into one directory used to share a single trunk.json, so every rig
+    # but the one it was traced from read a stale outline and silently lost its swing. The unsuffixed name is still
+    # written for rig.json, which is the single-rig cache every existing run and every older loader looks for.
     path = out.parent / (out.stem + '.trunk.json')
     path.write_text(text, encoding='utf-8')
     if out.stem == 'rig':
@@ -700,9 +699,9 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rig), encoding='utf-8')
     # Stage the feet/legs identically to blender_main.py before fitting the lap rest, because place_feet
-    # pitches the thighs down to meet the floor/pedals (~45 mm on Furina). Running it AFTER neutral_bones,
-    # hands and trunk are already exported keeps the rig and pair-table cache unchanged while ensuring the
-    # fitted lap_pose matches the final baked thigh surface to the millimetre.
+    # pitches the thighs down to meet the floor/pedals (some tens of mm, depending on the body). Running it AFTER
+    # neutral_bones, hands and trunk are already exported keeps the rig and pair-table cache unchanged while
+    # ensuring the fitted lap_pose matches the final baked thigh surface to the millimetre.
     from performer.kinematics import Rig as _Rig
     from performer.lap_contact import fit_lap_poses
     from performer.staging import place_feet

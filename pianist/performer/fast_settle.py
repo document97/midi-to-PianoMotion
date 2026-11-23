@@ -1,13 +1,12 @@
 """coherence.settle's solve compiled (numba): the same residuals, bounds, start and bounded Levenberg-Marquardt, the
 whole solve of one problem in machine code instead of some hundred small numpy calls per residual evaluation.
 
-numba is required: without it the first settle stops with how to install it (``require``; importing this module
-works anywhere, Blender's Python included). PIANOMOTION_FAST_SETTLE=0 runs coherence.settle's
-numpy solve instead (about ten times slower; for checking the compiled solve against it). The rig's tables are packed once per solver (``pack``); a problem is a tuple of small arrays (``problem``).
-The compiled code is kept on disk (numba cache) and only rebuilt when this file changes.
+numba is required: without it the first solve stops immediately with how to install it (``require``; importing this
+module still works inside Blender's Python, which only writes curves and never runs the solver). The rig's tables are
+packed once per solver (``pack``); a problem is a tuple of small arrays (``problem``). The compiled code is kept on
+disk (numba cache) and only rebuilt when this file changes.
 """
 import math
-import os
 
 import numpy as np
 
@@ -17,13 +16,11 @@ from .motion import FLOOR_SCALE, PAD_PITCH_MAX, PAD_PITCH_SCALE, KeyFloor, KeySu
 from .pose import (CLEARANCE_SCALE, CONTACT_TOLERANCE, NARROW_TRANSITION, PAD_SOFTMIN_METRES, STEP_TOLERANCE, VALUE_SCALE,
                    WEB_SCALE, WRIST_SCALE)
 
-OPTED_OUT = os.environ.get('PIANOMOTION_FAST_SETTLE', '1') == '0'
 njit = None
-if not OPTED_OUT:
-    try:
-        from numba import njit
-    except ImportError:
-        pass
+try:
+    from numba import njit
+except ImportError:
+    pass
 _jit = njit(cache=True, fastmath=False, nogil=True) if njit is not None else (lambda f: f)
 
 F = np.float64
@@ -36,13 +33,10 @@ def available():
 
 
 def require():
-    """True for the compiled solve; False only when opted out (PIANOMOTION_FAST_SETTLE=0); without numba: stops."""
+    """Ensure numba is installed; raise ImportError otherwise (no slow numpy fallback)."""
     if njit is not None:
         return True
-    if OPTED_OUT:
-        return False
-    raise ImportError('numba is required (pip install numba): the wrist path solve runs compiled. '
-                      'PIANOMOTION_FAST_SETTLE=0 runs it in numpy instead, about ten times slower.')
+    raise ImportError('numba is required (pip install numba): the solver runs compiled with no numpy fallback.')
 
 
 # ---------------------------------------------------------------- packing (python, once per solver / problem)

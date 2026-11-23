@@ -56,7 +56,7 @@ ARC_RATIO, ARC_MAX = .15, .04    # wrist rises by this fraction of the travel (m
 LIFT_RATE = .3                   # m/s: a hurried leap lifts only between the release and the next touch, at most
                                  # this times that time (a hop, not a slide over the keys)
 ARC_MIN_DISTANCE = .02
-# Strike or crawl, per chord of a hand (measured on the reference pianist, references/data/for_elise_060):
+# Strike or crawl, per chord of a hand (measured on a reference pianist recording):
 # the hand crawls (fingers walk, the wrist stays level) while a key stays held or the notes join legato;
 # it lifts and drops into the next chord when the same finger plays again, on a chord, on a position change
 # or after a rest. How high is set by the time the hand is free (release .. next touch), not the reason.
@@ -67,9 +67,9 @@ STRIKE_SHIFT = .025              # wrist travel (m) that counts as a position ch
 LIFT_WINDOWS = (.12, .25, .40, .7, 1.)         # free time (s) ...
 # P3 ("多敲", chosen 2026-11-20): the short end rises enough to read as a strike at 8 mm, and the gate lets a
 # 0.24 s free window lift at all, so fast passages get some. P0 was (0., .0062, .0135, .04, .065) with a 0.30 s
-# gate; the ladder lives in output/strike_presets.py.
+# gate.
 LIFT_HEIGHTS = (.0045, .011, .022, .048, .068)   # ... and the wrist's rise (m) at a middle loudness
-# The ladder (output/strike_presets.py) is runnable without editing: PIANOMOTION_LIFT="h0,h1,h2,h3,h4" and
+# The lift ladder is configurable without editing: PIANOMOTION_LIFT="h0,h1,h2,h3,h4" and
 # PIANOMOTION_STRIKE_REST=0.24 override the two knobs that decide how much of the playing is struck.
 if os.environ.get('PIANOMOTION_LIFT'):
     LIFT_HEIGHTS = tuple(float(x) for x in os.environ['PIANOMOTION_LIFT'].split(','))
@@ -232,13 +232,14 @@ LAP_TUCK = {1: np.array([0., 0., 12., 24.], dtype=FLOAT),
             4: np.array([0., 0., 16., 40.], dtype=FLOAT),
             5: np.array([0., 0., 16., 40.], dtype=FLOAT)}
 LAP_TUCK_SECONDS = .30           # the group curl is in during the crisp lift (it starts at the draw's end)
-LAP_TUCK_MIN_LIFT = .075         # m: the curl waits until the wrist has risen this far off the lap. Curling while
+LAP_TUCK_MIN_LIFT = float(os.environ.get('PIANOMOTION_LAP_TUCK_LIFT') or .075)
+                                 # m: the curl waits until the wrist has risen this far off the lap. Curling while
                                  # the palm still lies on the thigh drives the fingertips down into the leg (measured
-                                 # on canonpd: a full curl at 5 mm lift sank the pads 7.4 mm; at ~30 mm it cleared).
-                                 # Geometric, not a clock: any hand leaving any lap must clear it before it folds.
-                                 # Raised to 75 mm for the Furina body: its fingers are ~40 % longer than canonpd's,
-                                 # so a 40 deg curl drops the thumb tip that much further -- 28 mm still buried the
-                                 # opening right thumb 13.7 mm into the thigh (measured on the 6 s slice).
+                                 # on the development hand: a full curl at 5 mm lift sank the pads 7.4 mm; at ~30 mm
+                                 # it cleared). Geometric, not a clock: any hand leaving any lap must clear it before
+                                 # it folds. A model with longer fingers needs more: the shipped 75 mm came from a
+                                 # body whose fingers are ~40 % longer than the development hand's, where 28 mm still
+                                 # buried the opening thumb 13.7 mm into the thigh. Override per model.
 FLOOR_RAMP = .015                # the key floor phases in over a stroke: lowered this much at the key (m)
 SPACING_SHARE = .85              # free fingers keep this share of the relaxed fingertip spacing from their neighbours
 SPACING_SOFTNESS = .002          # smooth maximum width (m)
@@ -1934,32 +1935,15 @@ class FingerIK:
         seed = np.asarray(seed, FLOAT)
         front = self.solver.regions.keys[own_pitch]['bounds_min'][1] + RIDE_FRONT_KEEP
 
-        def residual(v):
-            values[digit] = v
-            point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
-            skin = (palm @ self.solver.local_clearance(digit, values))[:3].T
-            below = self.surface.clearance(skin, depths, own_pitch, brush=brush) / FLOOR_SCALE
-            steady = (v - start) / RIDE_STEADY if start is not None else np.zeros(0, dtype=FLOAT)
-            off = point - target
-            slip = off[1] < 0.             # toward the key's front: the pad holds the key all along its length
-            along = off[1] / (RIDE_SLIP if slip else .0002)
-            posture = posture_residual(v, digit)
-            return np.r_[off[0] / .0002, along, off[2] / .0002, max(0., front - point[1]) / .0002,
-                         (v - seed) / IK_VALUE_SCALE, below, pad_residual(self.solver, digit, v, palm), steady, posture]
-
         from . import fast_settle       # (late: it reads this module's tables)
-        fast = fast_settle.require()
+        fast_settle.require()
         lower, upper = self.bounds(digit)
 
         def run(x0):
-            if fast:
-                x, _ = fast_settle.ride(fast_settle.pack(self.solver), digit, palm, target, seed, depths, own_pitch,
-                                        x0, start, brush, front, lower, upper,
-                                        IK_ITERATIONS, (IK_VALUE_SCALE, RIDE_SLIP, RIDE_STEADY, PIP_POSTURE_SCALE) + posture_flat(digit))
-                x = np.asarray(x, FLOAT)
-            else:
-                x, _ = PoseSolver._levenberg_marquardt(residual, np.clip(x0, lower, upper),
-                                                       lower, upper, np.full(4, 1e-2, dtype=FLOAT), IK_ITERATIONS)
+            x, _ = fast_settle.ride(fast_settle.pack(self.solver), digit, palm, target, seed, depths, own_pitch,
+                                    x0, start, brush, front, lower, upper,
+                                    IK_ITERATIONS, (IK_VALUE_SCALE, RIDE_SLIP, RIDE_STEADY, PIP_POSTURE_SCALE) + posture_flat(digit))
+            x = np.asarray(x, FLOAT)
             values[digit] = x
             point = self.solver.contact_point(self.solver.pad_world(digit, values, palm))
             off = point - target
