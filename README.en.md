@@ -9,7 +9,7 @@ Give it a MIDI file and a 3D character plays it on a piano in Blender:
 1. **Planning**: decides which hand and which finger plays each note, when each finger lets go of its key, and which notes have to be left out because the hand cannot reach them. The planner splits the notes between the hands itself; the score does not need to be separated into hands. It also enforces measured finger-web limits and runs two-round chord-shape replanning by measured awkwardness.
 2. **Motion**: animates the arms, wrists, fingers, the upper body, subtle head/eye gaze tracking, the right foot on the sustain pedal and every key, and writes it all into a `.blend` with preview audio.
 
-No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything runs on the CPU in parallel processes in fp32, with all core solves compiled to machine code via `numba` (GPU and pure-NumPy fallbacks have been removed). On 16 processes, a ~260-second piece (1,400+ notes) solves in about 11 minutes.
+No training data and no neural network: this is a fairly lightweight, purely algorithmic approach. Planning is a beam search; motion is inverse kinematics solved on the character's own skeleton and skin. Everything runs on the CPU in parallel processes in fp32, with all core solves compiled to machine code via `numba` (GPU and pure-NumPy fallbacks have been removed). At 4.2 GHz all-core on 16 threads, a ~260-second piece (1,400+ notes) solves in about 11 minutes.
 
 > **Demo video (v1 algorithm / `main` branch):** https://www.bilibili.com/video/BV1QEnc6rECK/
 >
