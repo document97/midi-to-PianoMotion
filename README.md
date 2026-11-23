@@ -6,12 +6,14 @@
 
 算法可实现输入 MIDI 文件，让三维角色在 Blender 里把它在钢琴上弹出来：
 
-1. **规划**：决定每个音由哪只手、哪根手指弹，每根手指什么时候抬起，以及哪些音因为手够不着只能省略。左右手由规划器自己分配，不需要分好手的谱子。
+1. **规划**：决定每个音由哪只手、哪根手指弹，每根手指什么时候抬起，以及哪些音因为手够不着只能省略。左右手由规划器自己分配，不需要分好手的谱子；并按角色实测的指蹼张角与和弦手型别扭度做两轮重规划。
 2. **动作**：生成手臂、手腕、手指、上身、头部与眼部微扫视、右脚踩延音踏板和每个琴键的动画，写进带试听音频的 `.blend`。
 
-不用训练数据，也没有神经网络，我做的是较轻量化的纯粹算法。规划是束搜索，动作是用角色自己的骨架和皮肤做反向运动学求解。全部在 CPU 上多进程运行，核心求解全部用 numba 编译成机器码（无 GPU 或纯 numpy 回退）。一首 160 秒的曲子（Daylight），在 16 个进程上约 8 分钟解完。
+不用训练数据，也没有神经网络，我做的是较轻量化的纯粹算法。规划是束搜索，动作是用角色自己的骨架和皮肤做反向运动学求解。全部在 CPU 上多进程运行，核心求解全部采用 fp32 并用 `numba` 编译成机器码（已移除 GPU 与纯 numpy 慢速回退）。在 16 进程下，一首 260 秒左右的曲子（1,400+ 音）约 11 分钟解完。
 
-> **演示视频：** https://www.bilibili.com/video/BV1QEnc6rECK/
+> **演示视频（第一版算法 / `main` 分支）：** https://www.bilibili.com/video/BV1QEnc6rECK/
+>
+> **分支说明：** 当前默认展示分支为 **`fp32-numba`**（最新算法：含躯干三维避让与肘部求解、起手/收手腿面自动贴合、手腕二次重瞄与阻尼平滑、头部/眼部微扫视、全量 Numba 编译与多角色环境变量适配）。原第一版算法完整保留在 `main` 分支。
 
 ## 初衷
 
@@ -23,24 +25,25 @@
 
 ## 效果和局限
 
-- **够不着的音会省略，不硬够。** 一只手能同时按住哪些键，是在角色自己的手上量出来的；键盘最两端的键，上身倾斜、在琴凳上挪动之后仍够不到的，也会省略。省略时优先保住最高和最低的声部，以及更响、更长的音。Daylight 的 1049 个音省略了 15 个；音很密、跨度很大的编曲会省略得多（一首 3135 个音的极端测试曲省略了 18%）。
+- **够不着的音会省略，不硬够。** 一只手能同时按住哪些键、相邻手指指蹼能张开多大，都是在角色自己的手上量出来的；键盘最两端的键，上身倾斜、在琴凳上挪动之后仍够不到的，也会省略。省略时优先保住最高和最低的声部，以及更响、更长的音。编曲跨度合理时可达全曲 0 漏音；音极密、跨度极大的编曲会按规则省略（早期 3,135 音的极端测试曲省略了 18%）。
+- **自然的演奏姿态与过渡。** 手型随按住的跨度在拱手与展平间连续过渡，并按空窗时长区分击键抬手阶梯；曲子前后具备完整的起手抬离与收手回落动作，静置手位会在导出骨架时自动贴合角色大腿曲面（`lap_contact.py`）；躯干三维凸包碰撞会约束肘部与上臂不穿进肋骨，需要时上身自动协同让位（`elbows.py`）；头部与眼球会随演奏音区做克制的微扫视与前庭补偿，模型含眨眼形态键时自动眨眼（`eyes.py`）。
 - **不支持双手交叉的弹法。**
-- **只做演奏动作。** 上身会前倾、侧倾、在琴凳上挪动，肩膀会前送，曲子前后双手自动贴合角色大腿静置，头部与眼球会随演奏音区做克制的微扫视（模型含眨眼形态键时自动眨眼）；但不做随音乐起伏的表情、衣服和头发物理，也不渲染视频。
-- **支持多角色适配。** 参数最初在开发角色上调校，后续已补齐多角色通用适配开关（见下方环境变量），主要在 Windows 上验证过。
+- **只做演奏动作。** 不做随音乐起伏的面部表情、衣服和头发物理，也不渲染视频。
+- **支持多角色适配。** 参数最初在开发角色上调校，现已通过环境变量支持多角色复用（无需改源码）；主要在 Windows 上验证过。
 
 ## 仓库里有什么
 
 只有算法。开发时用的角色、钢琴和场景模型受限于协议无法公开。算法适配模型对使用者来说有一定的难度，建议使用 AI 工具辅助您。
 
-| 文件夹 | 内容 |
+| 文件夹 / 模块 | 内容 |
 |---|---|
-| `pianist/planner/` | 指法规划：按同时起音的音组做束搜索，决定用哪只手、哪根手指、何时抬键、省略哪些音。附独立校验和听感保真度指标 |
+| `pianist/planner/` | 指法规划：按同时起音的音组做束搜索，决定用哪只手、哪根手指、何时抬键、省略哪些音。含指蹼与别扭度定价、独立校验、跨平台听感保真度评估与试听音频合成 |
 | `pianist/global_planning/` | 规划时用来筛选的手型规则（够得着的跨度、固定手掌时的转动范围、手腕移动） |
-| `pianist/midi_input/` | MIDI 时钟、延音踏板（CC64；没有踏板的 MIDI 会按低音的变化补上）、持音要求 |
-| `pianist/performer/` | 动作：每次触键的姿势、连贯的手型、手腕路径、手指击键、逐帧手指 IK、手臂、上身、踏板。`pipeline.py` 是求解入口，`blender_main.py` 把结果写进 Blender |
+| `pianist/midi_input/` | MIDI 时钟、延音踏板（CC64；没有踏板的 MIDI 会按低音的变化补上，保留原谱踏板变化）、持音要求 |
+| `pianist/performer/` | 核心动作管线：`pipeline.py` 为求解入口，`blender_main.py` 写入 Blender；含 `pose.py` / `coherence.py` / `motion.py`（触键、和弦手型、手腕路径与逐帧手指 IK）、`fast_settle.py`（Numba 核心求解内核）、`elbows.py` / `elbows_fast.py` / `elbows_render_fast.py`（躯干切片凸包避让与肘部曲线）、`attitude.py`（手腕二次重瞄与阻尼平滑）、`torso.py`（上身前倾/侧倾/琴凳平移与肩部前送）、`lap_contact.py`（大腿静置手位自动拟合）、`eyes.py`（头眼微扫视与眨眼）、`staging.py`（琴凳降高、解析双脚着地与踏板联动）、`cores.py` / `codekey.py`（大小核绑定与源码指纹缓存） |
 | `pianist/lib/` | Blender 端的手臂、拇指和身体驱动，琴键几何，曲线写入 |
 | `pianist/checks/` | `blend_audit.py`：核对写出的 `.blend`，每个琴键、踏板的动画是否和求解结果一致，有没有残留的旧动画，播放设置是否正确（在 Blender 里运行） |
-| `pianist/inputs/` | `build_piece.py`（从 MIDI 生成规划输入）、键盘布局和手指可达范围表 |
+| `pianist/inputs/` | `build_piece.py`（从 MIDI 生成规划输入，仅记录文件名不写本机路径）、键盘布局和手指可达范围表 |
 
 ## 依赖
 
@@ -54,20 +57,20 @@
 动作是针对具体模型求解的。开发精力有限，还望使用者见谅。如果使用其他的 MMD 模型，需要准备：
 
 - **Blender 场景**，包含：
-  - 一个使用 MMD（日文）骨骼名的骨架（如 `左手首`、`右ひじ`、`左親指０`、`上半身`、`右足ＩＫ`），以及它驱动的网格。场景里只能有一个这样的骨架；
+  - 一个使用 MMD（日文）骨骼名的坐姿绑定骨架（如 `左手首`、`右ひじ`、`左親指０`、`上半身`、`右足`、`右ひざ`、`右足首`，以及可选的 `頭`、`左目`、`右目`），以及它驱动的网格。场景里只能有一个这样的骨架（腿部已改用解析两骨 FK 驱动，不再依赖 `足ＩＫ`；导出和烘焙时还会自动剔除裙底无用的站姿根骨与足部 IK 骨，并清理多余的 MMD Empty 层级与骨架数据块命名）；
   - 88 个琴键对象，命名为 `key_21` … `key_108`（MIDI 音高）；
   - 琴凳对象 `bench_seat`（凳腿 `bench_leg*`）、钢琴的延音踏板对象（名字写在 `performer/staging.py` 的 `PIANO_DAMPER`）、地板对象 `floor`（没有时地面高度按 0）。
-- **`pianist/hand_calibration.json`**：每根手指的骨骼名、关节轴和方向、中性姿态、关节活动范围，以及指腹上的接触区域（`schema: all-digit-calibration`，由 `performer/kinematics.py`、`performer/rig_export.py` 和 `performer/blender_main.py` 读取）。仓库里没有生成它的工具，需要按自己的模型填写。
-- **`pianist/inputs/instrument/` 里的两张表**：`keyboard.json` 是开发场景那台钢琴的琴键位置；`pad_reach_conservative.json` 是每根手指的指腹离手腕最远能到多远，规划时用来判断够不够得着，仓库里的是开发模型放大后的数值。换钢琴、换模型都要按自己的场景重新量，仓库里同样没有生成工具。
-- **`performer/rig_export.py` 开头的三个量**：座位 `DEFAULT_SEATING`、整体放大 `CHARACTER_SCALE`、手的放大 `HAND_SCALE`。它们是按开发模型调的，见“开发用的角色模型”。
+- **手部标定 JSON**（默认 `pianist/hand_calibration.json`，可通过 `PIANOMOTION_HAND_CALIBRATION` 指向自定义文件）：每根手指的骨骼名、关节轴和方向、中性姿态、关节活动范围，以及指腹上的接触区域（`schema: all-digit-calibration`）。仓库里没有生成它的工具，需要按自己的模型生成或填写。
+- **手指包络与触键半径表**（默认 `pianist/inputs/instrument/`，可通过 `PIANOMOTION_ENVELOPES` / `PIANOMOTION_RADII` 覆盖）：`keyboard.json` 是开发场景钢琴的琴键位置；`pad_reach_conservative.json` 是每根手指指腹离手腕的保守可达半径；包络表可由 `python -m performer.hand_ranges` 直接从导出的 rig 采样生成。
+- **座位与缩放**：默认使用 `performer/rig_export.py` 中的 `DEFAULT_SEATING`、`CHARACTER_SCALE`、`HAND_SCALE`，换角色时可直接用环境变量 `PIANOMOTION_SEAT`、`PIANOMOTION_CHARACTER_SCALE`、`PIANOMOTION_HAND_SCALE` 覆盖，无需改动源码（导出 rig 与烘焙 `.blend` 时需保持一致）。
 
 然后运行：
 
 ```bash
 cd pianist
-# 导出骨架、皮肤点和键盘，供求解使用
+# 导出骨架、皮肤点、键盘，并自动生成带指纹的躯干碰撞轮廓 (<rig>.trunk.json)、腿面静置手位与眼部信息
 blender -b your_scene.blend --python performer/rig_export.py -- --output performer/rig_cache/rig.json
-# 从这个骨架采样规划器用的手指范围
+# 从这个骨架采样规划器用的手指活动包络表
 python -m performer.hand_ranges
 # 从 MIDI 生成一首曲子的规划输入
 python inputs/build_piece.py path/to/your_piece.mid your_piece
@@ -85,7 +88,7 @@ blender -b ../output/your_piece/performer.blend --python checks/blend_audit.py -
 | `performer.blend` | 写好动画的场景，带试听音频，按音频同步播放 |
 | `preview.wav` | 实际弹出来的声音：省略和提前抬起的音都按规划结果 |
 | `plan.json` | 每个音的手、手指、抬键时间，以及省略了哪些音 |
-| `report.json` | 省略和缩短的音数、各音区的缺失、动作统计、各阶段耗时 |
+| `report.json` | 省略和缩短的音数、各音区的缺失、动作/肘部/眼部统计、各阶段耗时 |
 | `motion.npz` | 全部动画曲线（每秒 60 个采样） |
 
 常用选项和环境变量：
@@ -99,19 +102,21 @@ blender -b ../output/your_piece/performer.blend --python checks/blend_audit.py -
 | `PIANOMOTION_PYTHON` | 求解用的 Python（必须装有 `numba`）。不设时用 `PATH` 上找到的 `python` |
 | `PIANOMOTION_RIG` | 用另一份导出的骨架，默认 `performer/rig_cache/rig.json` |
 | `PIANOMOTION_HAND_CALIBRATION` | 指定自定义角色的手部标定 JSON，默认 `pianist/hand_calibration.json` |
-| `PIANOMOTION_ENVELOPES` / `PIANOMOTION_RADII` | 指定自定义角色的手指活动包络表 / 保守触键半径表 |
+| `PIANOMOTION_ENVELOPES` / `PIANOMOTION_ENVELOPES_OUT` | 指定规划器读取的包络表路径 / `hand_ranges` 的输出路径 |
+| `PIANOMOTION_RADII` | 指定自定义角色的保守触键半径表 |
 | `PIANOMOTION_CHARACTER_SCALE` / `PIANOMOTION_HAND_SCALE` | 覆盖角色整体缩放 / 手部缩放（导出 rig 与烘焙 `.blend` 时需保持一致） |
+| `PIANOMOTION_SEAT` | 自定义座位偏移 `x,y,z`（米），默认沿用 `DEFAULT_SEATING` |
 | `PIANOMOTION_SOUNDBANK` | 指定听感保真度评估使用的 `.dls` 音色库路径（Win/macOS 默认自动查找） |
 
 进程数默认取 CPU 大核的全部线程：Intel 大小核（P 核 / E 核）和 Arm big.LITTLE 只用性能核，所有核都相同时就用全部线程。进程会绑定到这些核上（Windows、Linux 读系统的核类型信息；macOS 只取性能核数量，不绑定）。
 
-第一次运行时会为这个骨架计算手指配对表（哪两根手指能同时按住哪两个键，`performer/reach_table.py`），16 进程约 20 秒，缓存在 `performer/rig_cache/`，骨架或求解代码变了才重算。
+第一次运行时会为这个骨架计算手指配对表（哪两根手指能同时按住哪两个键，`performer/reach_table.py`），16 进程约 20–30 秒，缓存在 rig 旁或 `performer/rig_cache/`，骨架或求解代码指纹变化时自动重算。
 
 ## 开发用的角色模型
 
-为了方便，开发时直接用了《原神》官方发布的 MMD 模型【芙宁娜】，算法的参数都是在她身上调校和验证的。模型受协议限制，不随仓库提供，需要自己获取。
+为了方便，开发时直接用了《原神》官方发布的 MMD 模型【芙宁娜】，算法最初的参数都是在她身上调校和验证的。模型受协议限制，不随仓库提供，需要自己获取。
 
-对算法做些适配后，也可以换成自定义的人物模型，但身材会直接影响能弹什么。开发中遇到过这几个问题：
+对算法做些适配后，也可以换成其他自定义 MMD 角色（例如 1.65 m 左右比例正常的模型只需通过环境变量将缩放设在 `1.0` 附近即可，无需改动代码），但身材和手长会直接影响能弹什么。在默认开发模型上遇到过这几个问题：
 
 - **人太小**：原模型赤脚约 1.52 m，黑键八度差 3.4 mm 够不到。整个角色放大到 1.05 倍（约 1.60 m，`CHARACTER_SCALE`）。放大要以琴凳面中心为基点，否则人会整体升高，大腿顶进琴键底板。
 - **手偏小**：放大后手腕到中指尖只有 15 cm（真人约 17 cm），白键八度会落在键的边上。两只手再单独放大到 1.12 倍（`HAND_SCALE`）。
