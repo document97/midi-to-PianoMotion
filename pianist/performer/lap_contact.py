@@ -180,11 +180,22 @@ def fit_lap_poses(arm, skin, rig):
     def build_hand_skin(h):
         wb = rig.wrist_bone[h]
         finger_bones = {d: list(rig.fingers[h][d].names) for d in DIGITS}
+        finger_set = {b for bnames in finger_bones.values() for b in bnames}
         bone_to_part = {wb: 'palm'}
+        # Rigid palm/metacarpal children of the wrist (e.g. 人指０/中指０/薬指０/小指０) move with wb
+        palm_rigid = {wb}
+        stack = list(arm.data.bones[wb].children)
+        while stack:
+            cb = stack.pop()
+            if cb.name not in finger_set:
+                bone_to_part[cb.name] = 'palm'
+                palm_rigid.add(cb.name)
+                stack.extend(cb.children)
         for d, bnames in finger_bones.items():
             for b in bnames:
                 bone_to_part[b] = d
-        nb_inv = {b: np.linalg.inv(np.array(arm.pose.bones[b].matrix, float)) for b in bone_to_part}
+        active_bones = {wb} | finger_set
+        nb_inv = {b: np.linalg.inv(np.array(arm.pose.bones[b].matrix, float)) for b in active_bones}
         rows = {'palm': [], 1: [], 2: [], 3: [], 4: [], 5: []}
         tip_rows = {1: [], 2: [], 3: [], 4: [], 5: []}
         for v in verts:
@@ -193,9 +204,10 @@ def fit_lap_poses(arm, skin, rig):
             for g in v.groups:
                 nm = names.get(g.group, '')
                 if nm in bone_to_part and g.weight > 1e-4:
-                    bw[nm] = g.weight
-                    if g.weight > dom_w:
-                        dom_b, dom_w = nm, g.weight
+                    key = wb if nm in palm_rigid else nm
+                    bw[key] = bw.get(key, 0.) + g.weight
+                    if bw[key] > dom_w:
+                        dom_b, dom_w = key, bw[key]
             if dom_b is None or dom_w < 0.25 or sum(bw.values()) < 0.5:
                 continue
             p_world = np.array(mw @ mesh_ev.vertices[v.index].co, float)
