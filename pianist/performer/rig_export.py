@@ -281,6 +281,15 @@ def clean_performer_hierarchy(arm, skin):
         if (skin.matrix_world.translation - target_origin).length > 0.05:
             local_target = skin.matrix_world.inverted() @ target_origin
             skin.data.transform(Matrix.Translation(-local_target))
+            if skin.data.shape_keys:
+                # Mesh.transform() leaves shape_keys untouched; shift all key_blocks to match the new origin
+                n_v = len(skin.data.vertices)
+                buf = np.empty(n_v * 3, dtype=np.float32)
+                shift = np.array([-local_target.x, -local_target.y, -local_target.z], dtype=np.float32)
+                for kb in skin.data.shape_keys.key_blocks:
+                    kb.data.foreach_get('co', buf)
+                    (buf.reshape(-1, 3)).__iadd__(shift)
+                    kb.data.foreach_set('co', buf)
             skin.data.update()
             mw_new = skin.matrix_world.copy()
             mw_new.translation = target_origin

@@ -20,40 +20,42 @@ from .torso import HEAD_STEADY, _about, _gauss_time, _half, spine_transforms
 
 # ---------- Attention & fixation parameters ----------
 LOOKAHEAD_S = 0.34          # s eyes anticipate an upcoming leap or hand entry
-LEAP_DIST_M = 0.12          # m horizontal shift that triggers an anticipatory gaze shift
-CLOSE_SPAN_M = 0.42         # m: when hands are within this span, gaze stays calmly near their center
-MIN_DWELL_S = 2.40          # s minimum hold before switching fixation between hands (calm, no darting)
-SWITCH_MARGIN = 0.38        # salience margin needed to switch fixation to the other hand
-SACCADE_TAU_S = 0.22        # s Gaussian smoothing for calm attention transitions
-SACCADE_MAX_DEG_S = 45.0    # deg/s angular speed cap on gaze transitions
-REST_DRIFT_S = 1.8          # s of musical silence before eyes drift softly upward/forward
+LEAP_DIST_M = 0.10          # m horizontal shift that triggers an anticipatory gaze shift
+CLOSE_SPAN_M = 0.18         # m: only merge hands when practically adjacent (<1 octave), so lyrical passages still alternate gaze
+MIN_DWELL_S = 1.35          # s minimum hold before switching fixation between hands
+SWITCH_MARGIN = 0.18        # salience margin needed to switch fixation to the other hand
+SACCADE_TAU_S = 0.18        # s Gaussian smoothing for crisp, organic attention transitions
+SACCADE_MAX_DEG_S = 65.0    # deg/s angular speed cap on gaze transitions
+REST_DRIFT_S = 1.25         # s since last note strike (onset) before eyes softly lift to listen to resonance
 
 # ---------- Head-eye coordination parameters ----------
-# Subtle, restrained head & eyeball motion: gentle multi-second head follow (+/-4.5 deg yaw,
-# -5..+1.5 deg pitch) paired with delicate eyeball micro-glances (+/-4.2 deg yaw, -2.2..+1.5 deg
-# pitch) so the character feels alive without busy head bobbing or extreme eye rolling.
-HEAD_YAW_SHARE = 0.14       # fraction of horizontal gaze yaw carried by the head bone
-HEAD_PITCH_SHARE = 0.12     # fraction of vertical gaze pitch carried by the head bone
-HEAD_ROLL_PER_YAW = 0.06    # subtle natural head tilt accompanying lateral gaze
-HEAD_YAW_LIMIT = 4.5        # deg max head yaw (+ left / - right)
-HEAD_PITCH_MIN = -5.0       # deg max downward head nod
-HEAD_PITCH_MAX = 1.5        # deg max upward head tilt
-HEAD_ROLL_LIMIT = 1.0       # deg max expressive head roll
-HEAD_TAU_S = 0.90           # s head smoothing time constant (slow, calm phrase-level motion)
-HEAD_MAX_DEG_S = 8.0        # deg/s head angular velocity cap
+HEAD_YAW_SHARE = 0.20       # fraction of horizontal gaze yaw carried by the head bone
+HEAD_PITCH_SHARE = 0.15     # fraction of vertical gaze pitch carried by the head bone
+HEAD_ROLL_PER_YAW = 0.07    # subtle natural head tilt accompanying lateral gaze
+HEAD_YAW_LIMIT = 6.0        # deg max head yaw (+ left / - right)
+HEAD_PITCH_MIN = -5.5       # deg max downward head nod
+HEAD_PITCH_MAX = 2.0        # deg max upward head tilt
+HEAD_ROLL_LIMIT = 1.2       # deg max expressive head roll
+HEAD_TAU_S = 0.85           # s head smoothing time constant (slow, calm phrase-level motion)
+HEAD_MAX_DEG_S = 10.0       # deg/s head angular velocity cap
 
-# ---------- Physiological / stylized-safe eyeball limits ----------
-EYE_YAW_SHARE = 0.24        # horizontal residual yaw scale (delicate micro-gaze, never corner-rolling)
-EYE_YAW_LIMIT = 4.2         # deg max horizontal eye turn inside head socket
-EYE_PITCH_SHARE = 0.08      # vertical residual pitch scale
-EYE_PITCH_MIN = -2.2        # deg max downward eye pitch inside head socket
-EYE_PITCH_MAX = 1.5         # deg max upward eye pitch inside head socket
-EYE_TAU_S = 0.16            # s eye smoothing time constant
+# ---------- Physiological / stylized-safe eyeball parameters ----------
+# Pitch is measured relative to the natural seated keyboard gaze baseline (EYE_PITCH_REF_DEG ~ -46 deg)
+# with a clear downward resting bias (EYE_PITCH_BASE_DEG = -6.8 deg) so from side & 3/4 views the
+# pianist's pupils unmistakably gaze down toward her hands on the keyboard without clipping eyelids.
+EYE_YAW_SHARE = 0.46        # horizontal residual yaw scale (clear, expressive pupil glances)
+EYE_YAW_LIMIT = 7.5         # deg soft-tanh horizontal eye limit inside head socket
+EYE_PITCH_REF_DEG = -46.0   # deg neutral downward gaze angle from seated eyes to keyboard
+EYE_PITCH_BASE_DEG = -6.8   # deg clear downward eyeball offset looking toward the hands
+EYE_PITCH_SHARE = 0.24      # vertical pitch deviation scale around EYE_PITCH_REF_DEG
+EYE_PITCH_MIN = -10.2       # deg max downward eye pitch inside head socket
+EYE_PITCH_MAX = -1.5        # deg max upward eye pitch (even on chord lifts, gaze stays softly downward)
+EYE_TAU_S = 0.13            # s eye smoothing time constant
 
 # ---------- Natural blinking parameters ----------
-BLINK_MEAN_S = 3.9          # average interval between blinks (~15 blinks/min)
-BLINK_MIN_S = 1.8           # refractory period between blinks (except rare double-blinks)
-BLINK_MAX_S = 6.2           # maximum interval before forcing a blink
+BLINK_MEAN_S = 3.2          # average interval between blinks (~18 blinks/min, expressive & alive)
+BLINK_MIN_S = 1.5           # refractory period between blinks (except rare double-blinks)
+BLINK_MAX_S = 5.0           # maximum interval before forcing a blink
 BLINK_CLOSE_S = 0.065       # fast upper-eyelid closure
 BLINK_HOLD_S = 0.025        # brief closed dwell
 BLINK_OPEN_S = 0.135        # smoother eyelid opening
@@ -216,6 +218,7 @@ def compute_attention_targets(times, frames, notes, paths, rig):
 
     # Precompute per-frame salience and look-ahead target for each hand
     salience = {'L': np.zeros(n, dtype=float), 'R': np.zeros(n, dtype=float)}
+    onset_pulse = np.zeros(n, dtype=bool)  # tracks actual new note strikes (so held pedal chords allow reflective gaze lift!)
     hand_target = {h: tip_pos[h].copy() for h in 'LR'}
     active_any = np.zeros(n, dtype=bool)
 
@@ -224,9 +227,15 @@ def compute_attention_targets(times, frames, notes, paths, rig):
         # Slight melodic bias for right hand when both hands are equally busy
         melody_bias = 0.14 if h == 'R' else 0.0
         for onset, rel, x, y, z, vel, is_leap, jump in evs:
-            # Activity window
-            i0 = max(0, int(np.searchsorted(times, onset - 0.15)))
-            i1 = min(n, int(np.searchsorted(times, rel + 0.20)))
+            # Strike impulse window (only around the attack, NOT across 8-second sustained ring-outs!)
+            p0 = max(0, int(np.searchsorted(times, onset - 0.15)))
+            p1 = min(n, int(np.searchsorted(times, onset + 0.35)))
+            if p1 > p0:
+                onset_pulse[p0:p1] = True
+            # Salience decays after 0.9s on long held notes so the other moving hand or reflective drift can win
+            eff_end = min(rel, onset + 0.90)
+            i0 = max(0, int(np.searchsorted(times, onset - 0.12)))
+            i1 = min(n, int(np.searchsorted(times, eff_end + 0.15)))
             if i1 > i0:
                 active_any[i0:i1] = True
                 salience[h][i0:i1] += (0.55 + 0.45 * vel + melody_bias)
@@ -283,18 +292,25 @@ def compute_attention_targets(times, frames, notes, paths, rig):
             w = float(_smoothstep((t - (outro_start + 0.20)) / max(outro_land - (outro_start + 0.20), 0.5)))
             if outro_anchor is None:
                 outro_anchor = raw_target[i - 1].copy() if i > 0 else kb_ref.copy()
-            raw_target[i] = (1.0 - w) * outro_anchor + w * outro_rest_tgt
+            # Gentle living post-outro micro-breathing gaze so eyeballs never freeze into a statue during ring-out
+            drift = np.array([
+                0.045 * math.sin(0.85 * t) + 0.025 * math.sin(1.9 * t + 0.7),
+                0.04 * math.sin(0.65 * t + 0.4),
+                0.06 * (0.5 + 0.5 * math.sin(0.55 * t)),
+            ], dtype=float)
+            raw_target[i] = (1.0 - w) * outro_anchor + w * (outro_rest_tgt + drift)
             continue
 
-        # Active playing region
+        # Active playing region (use onset_pulse so long held chords > REST_DRIFT_S trigger natural listening lift!)
         sL, sR = float(salience['L'][i]), float(salience['R'][i])
-        if active_any[i] or max(sL, sR) > 0.35:
+        if onset_pulse[i]:
             silent_since = t
-        if t - silent_since > REST_DRIFT_S and max(sL, sR) < 0.25:
-            # Long musical pause: drift gently toward expressive soft focus
-            w = float(_smoothstep((t - silent_since - REST_DRIFT_S) / 0.8))
+        if t - silent_since > REST_DRIFT_S:
+            # Sustained chord ring-out or musical breath: eyes softly lift toward fallboard/room to listen
+            w = float(_smoothstep((t - silent_since - REST_DRIFT_S) / 0.9))
             base = 0.5 * (hand_target['L'][i] + hand_target['R'][i])
-            raw_target[i] = (1.0 - w) * base + w * music_desk_tgt
+            breath = np.array([0.04 * math.sin(0.9 * t), 0.0, 0.03 * math.sin(0.6 * t)], dtype=float)
+            raw_target[i] = (1.0 - w) * base + w * (music_desk_tgt + breath)
             mode = 'REST'
             continue
 
@@ -537,8 +553,14 @@ def solve(times, frames, notes, paths, rig, torso):
             rh = t_head[i, :3, :3]
             p_eye = (t_head[i] @ np.r_[e_pivot, 1.0])[:3]
             yaw_i, pitch_i = _aim_yaw_pitch(p_eye, target[i], rh @ right0, rh @ fwd0, rh @ up0)
-            ey[i] = float(np.clip(yaw_i * EYE_YAW_SHARE, -EYE_YAW_LIMIT, EYE_YAW_LIMIT))
-            ep[i] = float(np.clip(pitch_i * EYE_PITCH_SHARE, EYE_PITCH_MIN, EYE_PITCH_MAX))
+            # Soft-tanh saturation prevents hard flat-wall freezing in high treble / low bass registers
+            ey[i] = float(EYE_YAW_LIMIT * math.tanh((yaw_i * EYE_YAW_SHARE) / EYE_YAW_LIMIT))
+            # Measure pitch relative to seated keyboard baseline (~-38 deg) so vertical eye gaze never pins at min!
+            dpitch = (pitch_i - EYE_PITCH_REF_DEG) * EYE_PITCH_SHARE
+            raw_ep = EYE_PITCH_BASE_DEG + dpitch
+            ep_mid = 0.5 * (EYE_PITCH_MIN + EYE_PITCH_MAX)
+            ep_half = 0.5 * (EYE_PITCH_MAX - EYE_PITCH_MIN)
+            ep[i] = float(ep_mid + ep_half * math.tanh((raw_ep - ep_mid) / ep_half))
 
         ey = np.clip(_smooth_series(ey, dt, EYE_TAU_S, SACCADE_MAX_DEG_S), -EYE_YAW_LIMIT, EYE_YAW_LIMIT)
         ep = np.clip(_smooth_series(ep, dt, EYE_TAU_S, SACCADE_MAX_DEG_S), EYE_PITCH_MIN, EYE_PITCH_MAX)
