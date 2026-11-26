@@ -13,9 +13,9 @@ This is a fairly lightweight pure-Python algorithmic solver (no training data, n
 
 > **Demo video (v2 algorithm / `fp32-numba` branch):** https://www.bilibili.com/video/BV1pr1jzEEHk/
 >
-> **Demo video (v1 algorithm / `main` branch):** https://www.bilibili.com/video/BV1QEnc6rECK/
+> **Demo video (v1 algorithm / `fp64` branch):** https://www.bilibili.com/video/BV1QEnc6rECK/
 >
-> **Branches:** The default branch is now **`fp32-numba`** (current algorithm: 3D trunk-hull collision & elbow swing solver, automatic lap-rest fitting with opening/closing gestures, two-pass wrist re-aim & damped attitude smoothing, subtle head/eye micro-gaze, mandatory Numba compilation, and multi-character env-var overrides). The original v1 algorithm is preserved intact on `main`.
+> **Branches:** The default branch is now **`fp32-numba`** (current algorithm: 3D trunk-hull collision & elbow swing solver, automatic lap-rest fitting with opening/closing gestures, two-pass wrist re-aim & damped attitude smoothing, subtle head/eye micro-gaze, mandatory Numba compilation, and multi-character env-var overrides). The original v1 algorithm is preserved intact on `fp64`.
 
 ## Inspiration
 
