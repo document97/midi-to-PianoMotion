@@ -1842,7 +1842,11 @@ def run(args):
     final_rows = [dict(r, physical_release=sounding[r['id']], key_release=notes[r['id']].release) for r in rows]
     shortened = [(r, score.audible_shortening(r['index'], r['physical_release'])) for r in final_rows]
     shortened = [(r, s) for r, s in shortened if s > 1e-9]
-    fidelity, _ = compare(raw['timeline'], sorted(played), cuts, source_ids=[n['id'] for n in source])
+    try:
+        fidelity, _ = compare(raw['timeline'], sorted(played), cuts, source_ids=[n['id'] for n in source])
+    except FileNotFoundError as exc:
+        print(f'[fidelity] skipped: {exc}', flush=True)
+        fidelity = None
     report = dict(
         rig=RIG.name,
         listening=dict(source_notes=len(source), played=len(played), omitted=len(source) - len(played),
