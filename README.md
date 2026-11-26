@@ -13,7 +13,7 @@
 
 > **演示视频（第 2 代算法 / `fp32-numba` 分支）：** https://www.bilibili.com/video/BV1pr1jzEEHk/
 >
-> **演示视频（第 1 代算法 / `main` 分支）：** https://www.bilibili.com/video/BV1QEnc6rECK/
+> **演示视频（第 1 代算法 / `fp64` 分支）：** https://www.bilibili.com/video/BV1QEnc6rECK/
 >
 > **分支说明：** 当前默认展示分支为 **`fp32-numba`**（最新算法：含躯干三维避让与肘部求解、起手/收手腿面自动贴合、手腕二次重瞄与阻尼平滑、头部/眼部微扫视、全量 Numba 编译与多角色环境变量适配）。原第 1 代算法完整保留在 `fp64` 分支。
 
